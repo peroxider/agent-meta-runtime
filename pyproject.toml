@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling==1.30.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-meta-runtime"
+# Version is single-sourced from `src/agent_meta_runtime/__init__.py` (`__version__`).
+dynamic = ["version"]
+description = "Placeholder package reserving the agent-meta-runtime name on PyPI. Real implementation tracked in docs/Agent_Meta_Runtime_Seed_Harness_Requirements_Design_v0.1.md."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["agent", "runtime", "placeholder", "agent-meta-runtime"]
+
+[tool.hatch.version]
+path = "src/agent_meta_runtime/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_meta_runtime"]
