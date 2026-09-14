@@ -1,5 +1,5 @@
 # Reflective + Evolvable Agent Meta-Runtime
-## 面向外部 Agent Harness 的白盒自我模型、因果历史与后继式自我演化需求与架构设计
+## 面向可独立部署外部 Agent Harness 的白盒自我模型、因果历史与后继式自我演化需求与架构设计
 
 > **版本**：v0.1-r11  
 > **日期**：2026-09-14  
@@ -1814,7 +1814,7 @@ Meta-Runtime 的 Composition / Artifact / Fact / Evolution ontology 对三个 Ba
 | **Managed** | 本地 AgentOS Kernel | Realm isolation、ResourceLease、Supervisor、Credential Broker、hard quota/recovery |
 | **Distributed** | AgentOS cluster / remote Kernel | placement、distributed lease、cross-node channel、cluster recovery |
 
-Portable 模式的目标是**不要求安装本设计的 AgentOS Kernel**即可开发和运行 Meta-Runtime/Seed Harness；它不是重新实现一套完整 Python AgentOS。
+Portable 模式的目标是**不要求安装本设计的 AgentOS Kernel**即可开发和运行 Meta-Runtime，并允许外部 Harness 通过公共协议接入；它不是重新实现一套完整 Python AgentOS。
 
 ### 37.0.2 Backend Capability Profile
 
@@ -1899,7 +1899,7 @@ Meta Fact / Causal Graph
 ## 37.3 Managed Backend 依赖方向
 
 ```text
-Seed Harness
+External Seed Harness project
   ↓
 Meta-Runtime
   ↓
@@ -2030,10 +2030,10 @@ NumPy / pandas
 Adapter的v0.1范围固定为：
 
 ```text
-IPython / ipykernel    → Required Scratch Execution + Object Reflection
-python-cordis         → Optional Capability Lifecycle / Service Composition
-Fake Model Provider   → Required release/E2E provider
-real LLM providers    → Optional provider adapters
+IPython / ipykernel    → Required Runtime Scratch Adapter
+python-cordis         → Optional Runtime Capability Lifecycle Adapter
+Conformance Provider  → tests-only Runtime fixture
+Model Providers       → external Harness-owned adapters
 ```
 
 因此 Core package 不应直接 `import IPython` 或假设 `Cordis Fiber` 就是 `Capability` ontology。
@@ -2153,16 +2153,16 @@ agent-meta-runtime-ipython
 agent-meta-runtime-cordis
     └─ depends on core
 
-agent-seed-harness
-    └─ depends on public Meta-Runtime API
+agent-meta-seed-harness             separate repository/distribution
+    └─ depends on agent_meta_runtime.sdk / public local RPC
 ```
 
-当前可以放在一个 monorepo 中，但 package dependency 应按上述方向建立。
+Seed不得放入Runtime monorepo的产品source、wheel或extras；本地工作区可以并列checkout，但两者独立version/release。
 
 
 ## 39.7 Portable Execution Backend
 
-为了让 Meta-Runtime / Seed Harness 在普通开发机上直接运行，首版应提供轻量 Portable Backend：
+为了让Meta-Runtime及任意外部Harness在普通开发机上直接运行，首版提供轻量Portable Backend：
 
 ```text
 PortableLinuxBackend
@@ -2231,7 +2231,7 @@ Host Machine
 │   ├─ Fact / Causal Graph
 │   ├─ Cordis adapter
 │   ├─ Evolution
-│   └─ Seed Harness
+│   └─ Generic Harness Host
 │
 └─ AgentOS-managed Workers
     ├─ ipykernel                     Python
@@ -2315,7 +2315,7 @@ remote            → RemoteCapabilityHandle / RPC
 | Capability 来源 | 默认 placement |
 |---|---|
 | Meta-Runtime 内建且经过发布签名 | `in_process` |
-| 受信 Seed Capability | `in_process` 或 `isolated_process` |
+| 受信外部 Harness Capability | `in_process` 或 `isolated_process` |
 | 第三方 Capability | `isolated_process` |
 | Candidate / Evolved Capability | `isolated_process` |
 | 未知来源代码或高风险工具 | Managed Backend `isolated_realm` |
@@ -2336,7 +2336,7 @@ remote            → RemoteCapabilityHandle / RPC
 | Artifact store | local content-addressed filesystem | replaceable store |
 | Scratch | IPython/ipykernel | Required v0.1 Adapter |
 | Capability runtime | builtin SPI；python-cordis Optional | Adapter |
-| Model | Fake Required；real providers Optional | Seed Harness capability |
+| Model | Runtime只发布SPI/schema；具体Provider由外部Harness提供 | External capability |
 
 ## 39.13 概念模块结构
 
@@ -2382,14 +2382,10 @@ agent-meta-runtime/
 │   ├── transport/
 │   ├── handles/
 │   └── facts/
-└── seed_harness/
-    ├── model/
-    ├── task/
-    ├── minimal_loop/
-    ├── minimal_context/
-    ├── evaluation_v0/
-    ├── evolution_v0/
-    └── governance_v0/
+└── sdk/
+    ├── client/
+    ├── contracts/
+    └── manifest/
 ```
 
 上图仅表达概念归属；实际 v0.1 repository与package边界固定遵守41.59.5，不定义 Meta-Runtime ontology。
@@ -2582,6 +2578,7 @@ CI MUST 通过 import-linter 加 41.50 定义的 AST rule 检查依赖方向。�
 | Realm | `Realm` | meta revision、desired/serving/realized refs |
 | Composition | `CompositionRevision` | slot、wiring、contract、state/authority binding |
 | Capability Instance | `CapabilityInstance` | lifecycle 与 execution binding incarnation |
+| Harness Installation | `HarnessInstallation` | immutable package identity、contract fingerprint、lifecycle/history |
 | Managed State | `ManagedState` | revision chain、schema、migration |
 | Authority | `AuthorityGrant` | attenuation、scope、expiry、revocation |
 | Task Execution | `TaskRecord` | child Action/Invocation/EffectIntent、budget reservation/settlement、terminal state |
@@ -2618,6 +2615,7 @@ principal://<kind>/<uuidv7>
 grant://<uuidv7>
 composition://<uuidv7>
 capability://<stable-name>
+harness://<uuidv7>
 instance://<uuidv7>
 state://<uuidv7>
 state-revision://<uuidv7>
@@ -3013,6 +3011,7 @@ agent-meta reflect view [--revision N]
 agent-meta graph why <entity-id>
 agent-meta artifact put <path>
 agent-meta capability register <descriptor>
+agent-meta harness validate|install|list|inspect|activate|deactivate|uninstall ...
 agent-meta composition validate <file>
 agent-meta composition apply <file> --expected-revision N
 agent-meta state create|inspect|write ...
@@ -3037,9 +3036,9 @@ CLI 默认输出 human-readable table；`--output json` 提供稳定 machine-rea
 
 产品模式 MUST 启用 local-only daemon API：Unix Domain Socket（Windows 使用 Named Pipe）+ versioned Protobuf RPC；JSON 只作为 CLI/diagnostics 的规范映射输出。CLI/SDK 不得直接写 Meta Store。默认不得监听公网地址。远程 API、认证代理与 Web UI 另立 deployment profile，不进入 Core。Embedded API 仅用于测试、Notebook 与单进程开发。Windows transport fallback 受 41.26 约束。
 
-## 41.11 Seed Harness 精确执行循环
+## 41.11 External Harness Loop Conformance Algorithm
 
-Minimal Loop 必须是可替换 Capability，但 v0.1 默认实现遵循以下流程：
+Minimal Loop必须是外部项目中的可替换Capability。以下算法定义`harness-contract/v1` conformance profile与test vectors；Meta-Runtime只负责host enforcement和test-only fixture，不在产品source提供默认Loop：
 
 ```python
 async def run_turn(task: TaskEnvelope, runtime: TaskRuntime) -> TurnResult:
@@ -3159,7 +3158,7 @@ class ModelProvider(Protocol):
     async def invoke(self, request: ModelRequest, cancel: CancelToken) -> ModelResponse: ...
 ```
 
-Provider Adapter MUST 规范化 usage、finish reason、rate limit、retry-after、stream cancellation 与 tool call；不得将 provider-specific response 直接传播到 Seed Loop。
+Provider Adapter MUST 规范化 usage、finish reason、rate limit、retry-after、stream cancellation 与 tool call；不得将 provider-specific response 直接传播到外部 Harness Loop。
 
 ### 41.13.3 Scratch Adapter
 
@@ -3256,6 +3255,9 @@ Backend 必须在 durable terminal result 被 Meta-Runtime 记录前保留 dedup
 | `REVISION_CONFLICT` | 重新读取后 | CAS 失败 |
 | `IDEMPOTENCY_CONFLICT` | 否 | 相同 command_id 对应不同请求 |
 | `FEATURE_UNAVAILABLE` | 视 policy | Backend 不满足 required feature |
+| `NO_SERVING_COMPOSITION` | 否 | core ready但尚无已激活Harness/serving Composition |
+| `SERVING_NOT_READY` | 是 | serving transition存在但尚未安全收敛 |
+| `CONTRACT_INCOMPATIBLE` | 否 | 外部Harness声明的公共Contract范围与Runtime不相交 |
 | `RESOURCE_EXHAUSTED` | 是 | 临时资源不足，返回 retry hint |
 | `DEADLINE_EXCEEDED` | 视 effect | deadline 到期，结果可能未知 |
 | `BACKEND_UNAVAILABLE` | 是 | 连接/daemon 暂时不可用 |
@@ -3293,7 +3295,7 @@ Reconciler 是单独 Application Service，可同进程运行，但具有独立 
 | projection checkpoint 落后 | 从下一 Fact seq 重建 |
 | CAS Artifact 损坏 | `INTEGRITY_ERROR`；禁止激活并尝试从可信副本修复 |
 
-启动阶段顺序固定为：store integrity check → schema compatibility → Artifact root check → Backend negotiation → outbox recovery → reconciliation → readiness。未达到 readiness 时允许 reflect/diagnostics，不接受新的普通 task。
+启动阶段顺序固定为：store integrity check → schema compatibility → Artifact root check → Backend negotiation → outbox recovery → reconciliation → readiness。未达到`core_ready`时只允许只读反射、诊断与显式恢复；达到`core_ready`但未达到`serving_ready`时允许管理面与Harness lifecycle，但不接受新的普通Task。
 
 ## 41.16 Authority 与安全执行细节
 
@@ -3529,7 +3531,7 @@ v0.1 只有同时满足以下条件才可视为可产品化基线：
 - Portable 与 AgentOS fake backend 通过同一 contract suite；
 - DB、Fact payload、public API、Backend protocol 都有显式版本；
 - `doctor`、readiness、diagnostics 与升级/备份说明可用；
-- 第 41.33/41.58 追踪矩阵列入 v0.1 的 Acceptance Criteria（AC-M01～M09B、M12～M53）全部自动化，并由 traceability CI 验证无遗漏。
+- 第41.33/41.58追踪矩阵列入Runtime Required的Acceptance Criteria（AC-M01～M09B、M12～M16、M18～M47、M49～M54）全部自动化；AC-M17/M48由外部Seed项目验收且不阻塞Runtime。
 
 ## 41.23 已采纳的 ADR 实现决策
 
@@ -3566,6 +3568,7 @@ v0.1 只有同时满足以下条件才可视为可产品化基线：
 | ADR-027 | Evolution v0 使用 typed ChangeSet 与 ALL_REQUIRED_PASS evaluator | 引入统计/学习型 evaluator policy |
 | ADR-028 | Raw encryption 使用 AES-256-GCM envelope encryption，Root identity 使用 Ed25519 | crypto policy/平台合规要求调整 |
 | ADR-029 | Surface/Health/State cutover/Outbox clock 使用41.59的race-closed语义 | 引入多writer或分布式lease profile |
+| ADR-030 | Seed Harness是独立项目；Runtime仅拥有公共Contract/SDK、Generic Host与test-only Conformance Harness | Harness Contract major或部署边界发生变化 |
 
 ---
 
@@ -3669,6 +3672,7 @@ Daemon 默认最多 64 个 local connection、每连接最多 32 个 in-flight r
 Runtime.GetInfo / GetView / Doctor / GetMetrics
 Task.Submit / Get / Wait / Cancel
 Artifact.Put / GetManifest / Verify
+Harness.ValidatePackage / Install / Get / List / Activate / Deactivate / Uninstall
 Composition.Validate / Commit / GetRefs
 Evolution.Propose / RunExperiment / Promote / Rollback
 Graph.Why / Lineage
@@ -3717,6 +3721,7 @@ model.invoke
 artifact.put / artifact.read.restricted / artifact.verify
 composition.validate / composition.commit / composition.promote / composition.rollback
 capability.invoke / capability.inspect
+harness.install / harness.activate / harness.deactivate / harness.uninstall
 state.read / state.write / state.migrate
 authority.inspect / authority.grant / authority.delegate / authority.revoke
 experiment.run / evaluation.record
@@ -3729,7 +3734,7 @@ effect.execute.irreversible
 
 Scope 是 Realm、Capability、Artifact kind、Task、Experiment 或 Effect kind 的 typed union，不是任意字符串。授权顺序固定为：grant status/epoch → subject → permission → scope → constraints/expiry → revocation。Delegation 的 permission、scope、expiry、budget 与 delegable depth 必须逐维不扩大；未知 permission/scope fail closed。
 
-Scope v1 schema 是 `{realm_id, targets:[{type,id}]}`。`type` 仅为 `REALM_ALL/CAPABILITY/ARTIFACT_KIND/TASK/EXPERIMENT/EFFECT_KIND`；除 `REALM_ALL` 外 id 必须精确相等，不支持 glob、prefix、regex 或隐式 parent。一次 check 的 resource必须提供 realm和一个 concrete target；grant含同 realm `REALM_ALL` 或 exact target才匹配。多 target 是 OR，permissions 是显式 set。Constraint v1 只有 `epoch_id, not_before_us, expires_at_us, max_uses, resource_ceiling, delegation_depth_remaining`；不同维度是 AND。Delegation containment：child permissions/targets为 parent子集；child time interval在 parent内；每个 numeric ceiling ≤ parent；depth减少 1；parent max_uses 的每次成功 delegate和实际 use都通过原子 counter reservation计算。缺失 parent ceiling不代表无限扩大：child可以保持缺失或设更小显式值；Root Grant才可声明 `unbounded=true`。
+Scope v1 schema 是 `{realm_id, targets:[{type,id}]}`。`type` 仅为 `REALM_ALL/CAPABILITY/HARNESS/ARTIFACT_KIND/TASK/EXPERIMENT/EFFECT_KIND`；除 `REALM_ALL` 外 id 必须精确相等，不支持 glob、prefix、regex 或隐式 parent。一次 check 的 resource必须提供 realm和一个 concrete target；grant含同 realm `REALM_ALL` 或 exact target才匹配。多 target 是 OR，permissions 是显式 set。Constraint v1 只有 `epoch_id, not_before_us, expires_at_us, max_uses, resource_ceiling, delegation_depth_remaining`；不同维度是 AND。Delegation containment：child permissions/targets为 parent子集；child time interval在 parent内；每个 numeric ceiling ≤ parent；depth减少 1；parent max_uses 的每次成功 delegate和实际 use都通过原子 counter reservation计算。缺失 parent ceiling不代表无限扩大：child可以保持缺失或设更小显式值；Root Grant才可声明 `unbounded=true`。
 
 Authority check 与 Action/Effect reservation在同一 Meta Store transaction 写 `authority_uses(grant_id, action_id, use_kind, amount, meta_revision)`，`UNIQUE(grant_id, action_id, use_kind)` 防重；撤销与并发使用由 writer序列化，先提交者生效。检查时 wall time来自 injectable Clock，过期 grant可以惰性把 current status改 EXPIRED并写 history/Fact，但拒绝本次命令。
 
@@ -3803,23 +3808,22 @@ v0.1 Portable Candidate E2E/AC-M18 使用 `trusted_candidate`，验证 process/w
 
 Linux Portable 使用 process group、独立 workspace、最小 environment 和可用的 rlimit；Windows 使用 Job Object、独立 workspace、restricted handle inheritance 和最小 environment。二者均不声称提供多租户文件系统或 credential strong isolation。
 
-## 41.33 Seed 默认 Artifact 与需求追踪
+## 41.33 Runtime 内建 Artifact 与需求追踪
 
-v0.1 发行物必须包含以下可替换、可版本化的默认 Artifact：
+v0.1 Runtime发行物只包含以下可版本化的基础Artifact/Contract；它们定义安全边界与互操作语义，不实现Model、Loop、Context、tool dispatch或Seed策略：
 
 ```text
-seed-model-policy/v1       fake provider by default; real provider opt-in
-seed-task-policy/v1        single-task FIFO; bounded queue
-seed-context-policy/v1     provenance + redaction + deterministic budget
-seed-loop-policy/v1        max 32 turns / 128 steps / 64 model calls
-seed-retry-policy/v1       retry only declared idempotent transient failures
-seed-tool-command/v1       strict tagged command schema; unknown kind rejected
-seed-evaluation/v1         explicit pass/fail assertions + recorded metrics
-seed-degradation/v1        critical capability failure rejects new Task
-seed-retention/v1          Raw off; redacted/diagnostic bounded retention
+runtime-constitution/v1       admission principles and invariants
+harness-package-contract/v1   external package manifest and lifecycle
+harness-loop-contract/v1      terminal Model response and typed tool-call DTOs
+task-budget-contract/v1       host-enforced hard ceilings and accounting
+authority-permissions/v1      permission/scope registry and delegation rules
+redaction-policy/v1           structured allowlist and secret handling
+retention-policy/v1           Raw off; redacted/diagnostic bounded retention
+compatibility-report/v1       deterministic validation result and plan hash
 ```
 
-配置可覆盖 budget，但覆盖结果必须形成 effective policy fingerprint 并进入 Task/Invocation provenance。默认 Artifact 不拥有隐式 Authority。
+Runtime可配置Host hard ceiling；外部Harness可以在其范围内声明更严格budget/policy。有效结果必须形成fingerprint并进入Task/Invocation provenance。内建Artifact与外部Harness均不拥有隐式Authority。
 
 首版最低追踪矩阵：
 
@@ -3829,14 +3833,14 @@ seed-retention/v1          Raw off; redacted/diagnostic bounded retention
 | 2 Fact/Action/View | FR-MFACT-001~006、NFR-M06/07/52 | AC-M02、AC-M12、AC-M35、AC-M52 |
 | 3 Composition/State/Authority | FR-MCAP-001~008、FR-MSTATE-001~005、FR-MAUTH-001~005 | AC-M05、AC-M21、AC-M25、AC-M29、AC-M38 |
 | 4 Execution Backends | FR-MOS-001~011、FR-MSEC-002、FR-MEFFECT-001~002、NFR-M18/20/27 | AC-M09A、AC-M09B、AC-M22、AC-M30、AC-M34、AC-M39、AC-M43 |
-| 5 Seed/Task Loop | FR-MRUN-001~008、FR-MTASK-001~003、FR-MAPI-001~004 | AC-M17、AC-M20、AC-M31、AC-M41、AC-M47、AC-M48、AC-M51 |
+| 5 Harness Host/Task | FR-MRUN-001~006/008、FR-MTASK-001~003、FR-MAPI-001~004 | AC-M20、AC-M31、AC-M41、AC-M47、AC-M51、AC-M54；FR-MRUN-007与AC-M17/M48为External-Seed |
 | 6 Invocation/Why | FR-MINV-001、FR-MCTX-001~004、FR-MSEC-001 | AC-M03、AC-M26、AC-M32、AC-M37 |
 | 7 Reconcile/Recovery | FR-MSTORE-005~010、FR-MTASK-002~003、FR-MOPS-004、NFR-M23/24/28 | AC-M16、AC-M21、AC-M23、AC-M33、AC-M40 |
 | 8 Scratch | FR-MREF-001~006 | AC-M08、AC-M19、AC-M36、AC-M49 |
 | 9 Evolution/Promotion | FR-MEVO-001~006、FR-MRUN-005、FR-MSTATE-004、FR-MSEC-002 | AC-M06、AC-M18、AC-M34、AC-M42 |
 | 10 AgentOS contract | FR-MOS-001~011、FR-MAPI-003~004 | AC-M09、AC-M22、AC-M30、AC-M41、AC-M43、AC-M47 |
 | Cross-cutting Security | FR-MSEC-001~004、FR-MAUTH-001~005 | AC-M19、AC-M26、AC-M29、AC-M32、AC-M34、AC-M44、AC-M50 |
-| Cross-cutting Architecture | FR-MARCH-001~005、FR-MSPEC-001 | AC-M07、AC-M13、AC-M27、AC-M45 |
+| Cross-cutting Architecture | FR-MARCH-001~006、FR-MSPEC-001 | AC-M07、AC-M13、AC-M27、AC-M45、AC-M54 |
 | Cross-cutting Operations | FR-MOPS-001~005、NFR-M28/40/46 | AC-M20、AC-M23、AC-M40、AC-M46 |
 
 完整 `docs/spec/v0.1-scope-and-traceability.md` 必须逐条列出每个 FR/NFR 的 owner Slice、schema/proto、test id 与状态。CI 至少校验所有 MUST FR 有测试映射、所有 v0.1 AC 有自动化测试、Deferred 项没有被误标为已交付。
@@ -4008,6 +4012,8 @@ CREATE TABLE harness_installations (
   status TEXT NOT NULL CHECK(status IN ('INSTALLED','ACTIVE','INACTIVE','UNINSTALLED')),
   active_composition_id TEXT, installed_by TEXT NOT NULL,
   installed_at_us INTEGER NOT NULL, updated_at_us INTEGER NOT NULL,
+  CHECK((status='ACTIVE' AND active_composition_id IS NOT NULL)
+     OR (status<>'ACTIVE' AND active_composition_id IS NULL)),
   UNIQUE(realm_id, package_name, package_version),
   FOREIGN KEY(realm_id) REFERENCES realms(realm_id),
   FOREIGN KEY(package_artifact_id) REFERENCES artifacts(artifact_id),
@@ -4353,8 +4359,22 @@ BEGIN SELECT RAISE(ABORT, 'HARNESS_IDENTITY_IMMUTABLE'); END;
 CREATE TRIGGER harness_uninstalled_terminal BEFORE UPDATE ON harness_installations
 WHEN OLD.status='UNINSTALLED' AND NEW.status IS NOT OLD.status
 BEGIN SELECT RAISE(ABORT, 'HARNESS_UNINSTALLED_TERMINAL'); END;
+CREATE TRIGGER harness_status_transition BEFORE UPDATE OF status ON harness_installations
+WHEN NOT (
+  OLD.status=NEW.status
+  OR (OLD.status='INSTALLED' AND NEW.status IN ('ACTIVE','UNINSTALLED'))
+  OR (OLD.status='INACTIVE' AND NEW.status IN ('ACTIVE','UNINSTALLED'))
+  OR (OLD.status='ACTIVE' AND NEW.status='INACTIVE')
+)
+BEGIN SELECT RAISE(ABORT, 'INVALID_HARNESS_STATUS_TRANSITION'); END;
 CREATE TRIGGER harness_no_delete BEFORE DELETE ON harness_installations BEGIN
   SELECT RAISE(ABORT, 'HARNESS_HISTORY_REQUIRED');
+END;
+CREATE TRIGGER harness_history_no_update BEFORE UPDATE ON harness_installation_history BEGIN
+  SELECT RAISE(ABORT, 'HARNESS_HISTORY_IMMUTABLE');
+END;
+CREATE TRIGGER harness_history_no_delete BEFORE DELETE ON harness_installation_history BEGIN
+  SELECT RAISE(ABORT, 'HARNESS_HISTORY_IMMUTABLE');
 END;
 CREATE TRIGGER worlds_no_update BEFORE UPDATE ON worlds BEGIN
   SELECT RAISE(ABORT, 'WORLD_IMMUTABLE');
@@ -4468,6 +4488,7 @@ v0.1 canonical event type 不允许 Adapter 自创；新增类型必须先加入
 | Runtime/Realm | `runtime_initialized`、`runtime_started`、`runtime_stopping`、`readiness_changed`、`epoch_created` |
 | Artifact | `artifact_registered`、`artifact_verified`、`artifact_corrupt_observed`、`artifact_accessed_restricted`、`artifact_crypto_erased` |
 | Capability | `capability_defined`、`capability_validated`、`instance_transitioned`、`instance_degraded` |
+| Harness | `harness_installed`、`harness_activated`、`harness_deactivated`、`harness_uninstalled`、`harness_contract_rejected` |
 | Composition | `composition_committed`、`reconcile_started`、`serving_switched`、`realization_completed`、`reconcile_failed`、`composition_rolled_back` |
 | State | `state_revision_created`、`migration_started`、`migration_completed`、`migration_failed` |
 | Authority | `grant_created`、`grant_delegated`、`grant_revoked`、`authority_denied`、`root_recovery_performed` |
@@ -4530,7 +4551,7 @@ class ModelResponse:
     finish_reason: str
 ```
 
-`parameters` v1 允许 `temperature`、`top_p`、`seed`、`stop`；未知参数由 Provider profile 声明后才能使用。Fake Provider 必须按 request Artifact 中的 fixture key 返回确定性 response/usage，不访问网络。真实 Provider 默认视为非幂等：连接中断且无 durable provider request lookup 时返回 `EXTERNAL_EFFECT_UNKNOWN`，Retry Policy 不自动重复调用。
+`parameters` v1 允许 `temperature`、`top_p`、`seed`、`stop`；未知参数由 Provider profile 声明后才能使用。Runtime test-only Conformance Provider必须按request Artifact中的fixture key返回确定性response/usage，不访问网络且不进入wheel。外部Harness的真实Provider默认视为非幂等：连接中断且无durable provider request lookup时返回`EXTERNAL_EFFECT_UNKNOWN`，Retry Policy不自动重复调用。
 
 ### 41.36.3 Tool command schema
 
@@ -4543,7 +4564,7 @@ arguments: {}
 expected_contract_version: string
 ```
 
-Dispatcher 固定顺序：解析 JSON → 校验唯一 call_id → 查冻结 capability surface → 比较 contract version → input schema validation → Authority → Task/effect budget → Backend feature → 创建 child Action/Invocation → invoke。任一前置失败都不得进入 Adapter。并行 tool calls 在 v0.1 按响应顺序串行执行；一个失败不自动跳过剩余调用，由 `seed-loop-policy/v1` 的 `stop_on_tool_error=true` 决定。Tool output 先验证 output schema，再生成 Redacted Artifact；违反 schema 返回 `INVALID_RESULT` 并将 Invocation 标记 FAILED。
+Dispatcher 固定顺序：解析 JSON → 校验唯一 call_id → 查冻结 capability surface → 比较 contract version → input schema validation → Authority → Task/effect budget → Backend feature → 创建 child Action/Invocation → invoke。任一前置失败都不得进入 Adapter。并行 tool calls 在 v0.1 按响应顺序串行执行；一个失败后是否继续由外部Harness manifest中显式、带fingerprint的`stop_on_tool_error`策略决定，缺省为`true`。Tool output 先验证 output schema，再生成 Redacted Artifact；违反 schema 返回 `INVALID_RESULT` 并将 Invocation 标记 FAILED。
 
 ### 41.36.4 Capability adapter terminal semantics
 
@@ -4625,7 +4646,7 @@ Graceful shutdown 顺序：停止 Task ingress → 等待 running Task 最多 `s
 
 ### 41.39.3 Python package 与 dependency policy
 
-发行一个 `agent-meta-runtime` wheel，要求 CPython 3.12。Python源码根目录固定为`src/agent_meta_runtime/`，公共import namespace固定为`agent_meta_runtime`，console script固定为`agent-meta`；不得同时安装兼容别名`agent_meta`，避免与泛化的metadata模块冲突。语言中立Protobuf package继续使用`agent_meta.transport.v1`、`agent_meta.public.v1`和`agent_meta.execution_backend.v1`，其名称不等于Python import namespace；生成的Python代码必须置于`agent_meta_runtime.protocols.*`下。extras 固定为 `[ipython]`、`[providers]`、`[otel]`、`[dev]`；Core/SQLite/InMemory/Fake Provider 不依赖 extras。所有发布 wheel 使用 hash-locked dependency file、SBOM 和 provenance；CI 在 Linux/Windows 从空环境安装 wheel 后运行 smoke E2E。禁止启动时自动 `pip install`；Capability dependency 必须在 staging/build 阶段解析为独立 environment Artifact。
+发行一个 `agent-meta-runtime` wheel，要求 CPython 3.12。Python源码根目录固定为`src/agent_meta_runtime/`，公共import namespace固定为`agent_meta_runtime`，console script固定为`agent-meta`；不得同时安装兼容别名`agent_meta`，避免与泛化的metadata模块冲突。语言中立Protobuf package继续使用`agent_meta.transport.v1`、`agent_meta.public.v1`和`agent_meta.execution_backend.v1`，其名称不等于Python import namespace；生成的Python代码必须置于`agent_meta_runtime.protocols.*`下。Runtime extras固定为`[ipython]`、`[otel]`、`[dev]`，不得提供依赖Seed或具体Model Provider的`[seed]`/`[providers]` extra；Core/SQLite/InMemory不依赖extras，Conformance Provider只存在于test fixture。所有发布wheel使用hash-locked dependency file、SBOM和provenance；CI在Linux/Windows从空环境安装wheel后运行smoke E2E。禁止启动时自动`pip install`；Capability dependency必须在staging/build阶段解析为独立environment Artifact。
 
 版本采用 SemVer：0.x minor 可改变实验 API，但 `public-api/v1`、Fact schema v1 与 Backend protocol v1 在同一 minor 支持周期内不得 breaking。数据库升级只允许相邻版本逐步 forward migration；启动发现 DB 新于 runtime 时只读 diagnostics，readiness false。
 
@@ -4664,7 +4685,7 @@ backend.after_create_before_response
 
 SQLite transaction 内的 injection 通过进程终止验证原子性；不能只抛 Python exception。Windows 使用强制终止进程，Linux 使用 SIGKILL。每个恢复测试使用独立 absolute temp data directory，测试结束只删除已验证位于 test root 内的目录。
 
-Release 判定必须同时满足：所有 blocking CI；第 41.33 traceability 检查；AC-M01～M09B、M12～M53；安装/升级/备份/恢复演练；性能基线无未批准回退。AC-M10/M11 Root Succession 以及 M4～M6 的高级策略实现标为 Deferred，不得宣传为 v0.1 已交付。
+Runtime Release判定必须同时满足：所有blocking CI；第41.33 traceability检查；AC-M01～M09B、M12～M16、M18～M47、M49～M54；安装/升级/备份/恢复演练；性能基线无未批准回退。AC-M10/M11为Deferred；AC-M17/M48为External-Seed，不得计入Runtime release成功或失败。
 
 ## 41.41 Protobuf Envelope 与 v1 Field Registry
 
@@ -4809,6 +4830,13 @@ agent_meta.public.v1.Artifact.Verify
 agent_meta.public.v1.Capability.Register
 agent_meta.public.v1.Capability.Get
 agent_meta.public.v1.Capability.List
+agent_meta.public.v1.Harness.ValidatePackage
+agent_meta.public.v1.Harness.Install
+agent_meta.public.v1.Harness.Get
+agent_meta.public.v1.Harness.List
+agent_meta.public.v1.Harness.Activate
+agent_meta.public.v1.Harness.Deactivate
+agent_meta.public.v1.Harness.Uninstall
 agent_meta.public.v1.Composition.Validate
 agent_meta.public.v1.Composition.Commit
 agent_meta.public.v1.Composition.GetRefs
@@ -4952,6 +4980,9 @@ Compatibility algorithm 顺序固定：
 | `ALREADY_RUNNING` | 否 | data directory 已有 daemon owner |
 | `FAILED_PRECONDITION` | 修复后 | 当前 lifecycle/readiness 不允许操作 |
 | `COMPATIBILITY_UNKNOWN` | 否 | 无法证明 contract compatibility |
+| `CONTRACT_INCOMPATIBLE` | 否 | Harness声明的协议范围与Runtime不相交 |
+| `NO_SERVING_COMPOSITION` | 否 | 尚未激活任何Harness Composition |
+| `SERVING_NOT_READY` | 是 | desired/serving/realized尚未安全收敛 |
 | `KEY_UNAVAILABLE` | 修复 key 后 | Restricted Artifact key 无法取得 |
 | `DATA_LOSS` | 否 | durable content 缺失或无法恢复 |
 | `INTERNAL` | 视 details | 已脱敏的未分类实现错误 |
@@ -4974,7 +5005,7 @@ Evaluation: id, experiment_id, evaluator_artifact_id, evidence_ids[], assertion_
 
 ChangeSet operation 是 tagged union：`ADD_SLOT/REMOVE_SLOT/REPLACE_ARTIFACT/REWIRE/BIND_STATE/BIND_AUTHORITY/SET_POLICY`；每项带 target path、expected old value hash 与 new value。应用操作前按 path 排序但保留 author order 用于审计；同一路径多次写入拒绝。ChangeSet 只生成新 Composition，不修改 baseline。
 
-`seed-evaluation/v1` criteria 使用 assertions：
+Runtime的deterministic evolution baseline使用`deterministic-evaluation/v1` assertions：
 
 ```yaml
 assertions:
@@ -5021,7 +5052,7 @@ capability_surface_revision + artifact id
 state_revision_bindings
 authority_summary_artifact_id
 backend_profile_hash / session id / observed_at
-readiness / degradation reasons
+core_ready / serving_ready / core_reasons / serving_reasons
 projection checkpoints
 ```
 
@@ -5085,6 +5116,10 @@ Filesystem target 必须在 workspace root 下通过 handle-relative/openat 类�
 | `task.cancel/v1` | `task_id, mode(GRACEFUL|FORCE), reason_code` |
 | `artifact.put/v1` | `kind, media_type, expected_sha256, expected_size, source_staging_handle, parents[]` |
 | `capability.register/v1` | `capability_id, descriptor_artifact_id, expected_descriptor_revision` |
+| `harness.install/v1` | `manifest_artifact_id, package_artifact_id, expected_meta_revision` |
+| `harness.activate/v1` | `harness_id, composition_body_artifact_id, grant_requests_artifact_id, expected_meta_revision, expected_serving_revision` |
+| `harness.deactivate/v1` | `harness_id, expected_meta_revision, expected_serving_revision, reason_code` |
+| `harness.uninstall/v1` | `harness_id, expected_meta_revision, expected_status, reason_code` |
 | `composition.commit/v1` | `composition_body_artifact_id, expected_meta_revision, expected_desired_revision` |
 | `state.create/v1` | `state_id, owner_id, schema_id, content_artifact_id` |
 | `state.write/v1` | `state_id, expected_state_revision_id, content_artifact_id, schema_id` |
@@ -5250,7 +5285,7 @@ Diagnostics bundle 使用 allowlist 构造，包含 version/feature/config finge
 
 每个 `agent_meta_runtime.{domain,application,ports,adapters,interfaces,sdk,protocols}` Python package 必须在 `architecture.toml` 声明 layer、allowed imports、forbidden imports、primary principle、最多两个 secondary principles、owner Slice。CI 固定使用 import-linter，并额外用AST rule禁止所有`src/agent_meta_runtime/**` import `agent_meta_seed_harness`或任何`seed_harness`产品module；禁止`tests/fixtures/conformance_harness`和第三方Capability import `agent_meta_runtime.adapters.*`、private repository/UoW、Root succession或credential implementation。Conformance fixture只能import`agent_meta_runtime.sdk`、公开DTO和标准库。
 
-每个 Core subsystem admission record 使用 schema：`id, mechanism, primary_principle, secondary_principles[], O1..O5{claim,evidence_artifact_id,reviewer,decision}, alternatives[], accepted_at`。缺字段、secondary 超 2、decision 非 ACCEPT 或 evidence 不存在时 lint fail。新 intelligent policy 不得放 domain Core；Evaluator/Evolution/Retry/Context/Governance 必须能通过 Composition 删除/替换，并由 AC-M07/AC-M13 验证 Seed ordinary task 仍运行。
+每个 Core subsystem admission record 使用 schema：`id, mechanism, primary_principle, secondary_principles[], O1..O5{claim,evidence_artifact_id,reviewer,decision}, alternatives[], accepted_at`。缺字段、secondary 超 2、decision 非 ACCEPT 或 evidence 不存在时 lint fail。新 intelligent policy 不得放 domain Core；Evaluator/Evolution/Retry/Context/Governance 必须能通过 Composition 删除/替换，并由 AC-M07/AC-M13 使用Conformance Harness验证普通Task仍运行。
 
 Replaceability contract：Adapter 只通过 Port 注册，关闭后不得遗留 global monkey patch、atexit owner、隐式 singleton 或未追踪 thread/process；`release` 后 RuntimeView 无 ACTIVE binding，重复 release 幂等。替换 Context/Retry/Evaluator 时历史 Invocation/Evaluation 仍按旧 ArtifactId 可解释，不能将旧记录重新解释为当前 policy。
 
@@ -5260,9 +5295,9 @@ Replaceability contract：Adapter 只通过 Port 注册，关闭后不得遗留 
 
 `serving_ready = core_ready AND serving_revision > 0 AND serving/realized对全部required instance可解释 AND active Composition critical Artifact/Surface hash正常`。兼容字段`ready`固定等于`core_ready`，不得随Harness安装而改变含义。`Task.Submit`要求`serving_ready=true`，否则返回`NO_SERVING_COMPOSITION`（没有serving）或`SERVING_NOT_READY`（存在但未收敛）；Artifact、Capability、Composition、Authority、RuntimeView、Doctor、backup/restore/upgrade和Harness lifecycle在`core_ready=true`时保持可用。两种readiness分别产生`core_readiness_changed`与`serving_readiness_changed` Fact和稳定reason list。
 
-Readiness reason 使用稳定 code：`STORE_UNAVAILABLE/SCHEMA_INCOMPATIBLE/ARTIFACT_MISSING/ARTIFACT_CORRUPT/KEY_UNAVAILABLE/BACKEND_UNAVAILABLE/FEATURE_UNAVAILABLE/RECONCILE_UNKNOWN/CRITICAL_DEAD_LETTER/DISK_LOW/ROOT_AUTH_UNAVAILABLE`。未 ready 时只允许 GetInfo/GetView/Doctor/Graph read/Artifact verify/diagnostics 和显式 recovery API；Task、Composition mutation、State write、Experiment/Promotion 返回 `FAILED_PRECONDITION`。
+Readiness reason 使用稳定 code：`STORE_UNAVAILABLE/SCHEMA_INCOMPATIBLE/ARTIFACT_MISSING/ARTIFACT_CORRUPT/KEY_UNAVAILABLE/BACKEND_UNAVAILABLE/FEATURE_UNAVAILABLE/RECONCILE_UNKNOWN/CRITICAL_DEAD_LETTER/DISK_LOW/ROOT_AUTH_UNAVAILABLE`。`core_ready=false`时只允许GetInfo/GetView/Doctor/Graph read/Artifact verify/diagnostics和显式recovery API；Task、Composition mutation、Harness lifecycle、State write、Experiment/Promotion返回`FAILED_PRECONDITION`。
 
-Backpressure 阈值：pending Task 1000、outbox pending 10000、projection lag 100000 Facts、SQLite WAL 1 GiB、free disk 上述阈值。Task/outbox 超阈值拒绝新增对应写；projection lag 不拒绝 Task，但 `why` 标记 incomplete；WAL 超阈值尝试 PASSIVE checkpoint，仍超限则 readiness false；disk low 立即停止 Artifact/upload/effect，保留 read/diagnostics/cancel。
+Backpressure 阈值：pending Task 1000、outbox pending 10000、projection lag 100000 Facts、SQLite WAL 1 GiB、free disk 上述阈值。Task/outbox 超阈值拒绝新增对应写；projection lag 不拒绝 Task，但 `why` 标记 incomplete；WAL 超阈值尝试 PASSIVE checkpoint，仍超限则`core_ready=false`；disk low立即停止Artifact/upload/effect并使`core_ready=false`，保留read/diagnostics/cancel。
 
 `doctor` 每个 check 返回 `id,status(PASS|WARN|FAIL),observed,expected,repair_code`，不得自动修复。v0.1 repair 命令只有：`outbox retry <id>`、`artifact restore <id> --from-backup`、`projection rebuild <name>`、`backend reconcile`、`wal checkpoint`、`staging gc --plan`。每个 repair 默认 `--dry-run`，实际执行使用 CommandEnvelope/Authority/Fact。`force serving`、直接 SQL、删除 Fact、忽略 hash 或把 UNKNOWN 标成功不属于支持的 repair。
 
@@ -5272,6 +5307,17 @@ Public API command message 不重复定义领域字段，而是封装 canonical 
 
 ```proto
 package agent_meta.public.v1;
+message RuntimeInfo {
+  bool live = 1;
+  bool core_ready = 2;
+  bool serving_ready = 3;
+  bool ready = 4;                    // v1 alias，必须等于core_ready
+  repeated string core_reasons = 5;
+  repeated string serving_reasons = 6;
+  uint64 desired_revision = 7;
+  uint64 serving_revision = 8;
+  uint64 realized_revision = 9;
+}
 message CommandRequest { bytes command_envelope_jcs = 1; }
 message MutationResponse { bytes receipt_jcs = 1; bytes resource_jcs = 2; }
 message QueryPage { bytes items_jcs = 1; string next_cursor = 2; uint64 snapshot_revision = 3; }
@@ -5280,6 +5326,9 @@ message GetTaskRequest { string task_id = 1; }
 message WaitTaskRequest { string task_id = 1; int64 wait_deadline_at_us = 2; }
 message GetArtifactRequest { string artifact_id = 1; }
 message VerifyArtifactRequest { string artifact_id = 1; }
+message ValidateHarnessPackageRequest { string manifest_artifact_id = 1; }
+message GetHarnessRequest { string harness_id = 1; }
+message ListHarnessRequest { string realm_id = 1; string status = 2; uint32 limit = 3; string cursor = 4; }
 message ValidateCompositionRequest { string body_artifact_id = 1; string baseline_id = 2; }
 message GetRefsRequest { string realm_id = 1; }
 message WhyRequest { string entity_id = 1; uint32 max_depth = 2; uint32 max_nodes = 3; uint32 max_bytes = 4; string cursor = 5; }
@@ -5290,7 +5339,7 @@ message PutChunkRequest { string staging_handle = 1; uint64 offset = 2; bytes da
 message PutChunkResponse { uint64 committed_offset = 1; }
 ```
 
-所有 resource JCS 的 `resource_type` 固定：`task-handle/v1`、`task-result/v1`、`artifact-manifest/v1`、`capability-descriptor/v1`、`composition-commit/v1`、`state-revision/v1`、`authority-grant/v1`、`proposal-result/v1`、`candidate-result/v1`、`experiment-handle/v1`、`promotion-result/v1`、`scratch-session/v1`、`scratch-execution/v1`、`operation-handle/v1`、`action-result/v1`。Reader 使用 `schema_version`，未知 optional field 忽略并 round-trip；未知 required semantic 通过 schema major 失败。
+所有 resource JCS 的 `resource_type` 固定：`task-handle/v1`、`task-result/v1`、`artifact-manifest/v1`、`capability-descriptor/v1`、`harness-validation/v1`、`harness-installation/v1`、`composition-commit/v1`、`state-revision/v1`、`authority-grant/v1`、`proposal-result/v1`、`candidate-result/v1`、`experiment-handle/v1`、`promotion-result/v1`、`scratch-session/v1`、`scratch-execution/v1`、`operation-handle/v1`、`action-result/v1`。Reader 使用 `schema_version`，未知 optional field 忽略并 round-trip；未知 required semantic 通过 schema major 失败。
 
 Backup、GC apply、projection rebuild、forced reconcile 和 Experiment 是异步 operation：mutation response 返回 `operation-handle/v1`/`experiment-handle/v1`；`Operations.Get/Wait` 或 `Evolution.GetExperiment/WaitExperiment` 读取 terminal。Operation ACCEPTED row、Action、Fact/outbox先原子提交，外部工作在 transaction外执行，terminal row + Fact再原子提交。Wait timeout不取消 operation；v0.1只有明确支持 cancellation的 Task/Scratch execute暴露 Cancel。
 
@@ -5330,7 +5379,7 @@ if max_turns/max_steps/model_calls exhausted: fail RESOURCE_EXHAUSTED
 
 单次 response 最多16个 tool_call part，call_id在整个 Task内唯一。含 tool_call时可以同时含 text/json/artifact part；这些非工具 part作为assistant turn-history Artifact保留但不作为Task terminal result，随后仍执行 tool并进入下一turn。无 tool_call时 tool_result part非法。Provider返回多个 text part按原顺序保存，不隐式拼接后重新解析；Task result Artifact是完整 ContentPart array。
 
-v0.1 公共 Model SPI 是非 streaming terminal response。Provider Adapter 可以在内部消费 provider stream，但不得在 terminal commit 前把部分内容交给 Loop/Tool dispatcher；取消时丢弃未完成 partial raw，仅记录受 policy 允许的 redacted diagnostic。真实 Provider Adapter 是 Optional；release gate 只要求 Fake Provider。Provider rate limit 映射 `RESOURCE_EXHAUSTED` + retry_after，只有尚未确认 provider 接受 request 且 Retry Policy 允许时自动重试；否则按 unknown/non-idempotent 规则处理。
+v0.1公共Model SPI是非streaming terminal response。外部Provider Adapter可以在内部消费provider stream，但不得在terminal commit前把部分内容交给Loop/Tool dispatcher；取消时丢弃未完成partial raw，仅记录受policy允许的redacted diagnostic。Runtime release gate只要求test-only Conformance Provider通过Host Contract，不要求或发布真实/Fake Seed Provider。Provider rate limit映射`RESOURCE_EXHAUSTED`+retry_after，只有尚未确认provider接受request且Retry Policy允许时自动重试；否则按unknown/non-idempotent规则处理。
 
 Task timeout 包含 durable queue 等待；`deadline_at_us` 是从接纳起生效的绝对 wall deadline。Scheduler 取到已过 deadline 的 ACCEPTED Task，直接原子提交 TIMED_OUT，不创建 Model Invocation。每次外部 await 使用 `min(task deadline, operation deadline)`。
 
@@ -5419,16 +5468,18 @@ Root Grant为同Realm `REALM_ALL + unbounded`。Service Grant不含Root recovery
 
 ## 41.58 v0.1 Scope Closure
 
-“v0.1 可完整实现并验收”严格表示：实现 Phase M0～M3 的单机 Portable 产品切片、AgentOS ABI client/fake provider contract、Architecture lint 以及本节列为 Required 的要求；不表示生产 Rust AgentOS Kernel、自动 Root Succession 或分布式能力已经实现。
+“v0.1 可完整实现并验收”严格表示：独立实现Meta-Runtime单机Portable产品切片、公共Harness Contract/SDK、test-only Conformance Harness、AgentOS ABI client/fake contract、Architecture lint以及本节列为Runtime Required的要求；不要求checkout、构建、安装或执行外部Seed项目。
 
 | Item | v0.1 applicability | Evidence |
 |---|---|---|
-| FR-MID/MREF/MFACT/MCAP/MSTATE/MAUTH/MCTX/MINV/MSTORE/MRUN/MAPI/MOPS 及 43.14 | Required | traceability + automated tests |
+| FR-MID/MREF/MFACT/MCAP/MSTATE/MAUTH/MCTX/MINV/MSTORE/MAPI/MOPS/MARCH及43.14新增Runtime项 | Runtime Required | traceability + automated tests |
+| FR-MRUN-001～009 | Runtime Required（通用Task/Host schema、golden与enforcement） | conformance fixture tests；其中Seed实现符合性另由外部CI证明 |
 | FR-MOS-001～010 | Required for InMemory/Portable；AgentOS 侧以 client + fake provider 验证 | shared provider/consumer contract |
 | FR-MEVO-001～005 | Required deterministic v0 baseline | Candidate E2E |
 | FR-MSUC-001～005 | Schema/API reservation Required；automatic execution Deferred | schema lint；不计功能完成 |
-| AC-M01～M09B、M12～M53 | Required，按 v0.1 Backend/profile 解释 | blocking CI |
+| AC-M01～M09B、M12～M16、M18～M47、M49～M54 | Runtime Required，按v0.1 Backend/profile解释 | blocking Runtime CI |
 | AC-M10/M11 | Deferred to M5 | 不得标绿或宣传已支持 |
+| AC-M17/M48 | External-Seed | 不阻塞Runtime release；阻塞Seed release |
 | Rust `agentosd` production behavior | External/Deferred | fake provider only in v0.1 |
 | Cordis Adapter | Optional extra | 不阻塞 release |
 | IPython Scratch Adapter | Required | integration/security tests |
@@ -5436,6 +5487,7 @@ Root Grant为同Realm `REALM_ALL + unbounded`。Service Grant不含Root recovery
 | percentage traffic canary | Deferred | v0.1 仅做 isolated pre-serving probe + atomic cutover |
 | M4 evaluator/search evolution、peer/population | Deferred | schema 可保留 |
 | M6 distributed runtime | Deferred | 不进入 v0.1 API guarantee |
+| `agent-meta-seed-harness` repository/distribution | External independent consumer | 不得成为Runtime dependency或release input |
 
 Deferred 对象可以有 DTO/schema placeholder，但默认 CLI/API 必须返回 `FEATURE_UNAVAILABLE` 加 `deferred_until_phase`，不得返回假 Handle。README、version response 和 diagnostics 必须列出 compiled/available/deferred features。
 
@@ -5480,9 +5532,76 @@ Rollback也只提交新的 desired transition；Reconciler按上述规则完成�
 
 ### 41.59.5 实现交付物与允许裁量边界
 
-v0.1 repository必须包含：`src/agent_meta_runtime/{domain,application,ports,adapters,interfaces,seed_harness,protocols}`、Public/Backend `.proto`源、SQLite migration、JSON Schema、builtin AMPAK source与lock、golden fixtures、contract/integration/E2E/fault-injection tests、`architecture.toml`、SBOM/provenance生成配置、operator runbook、release manifest模板，以及 `docs/spec/v0.1-scope-and-traceability.md`。生成代码不得成为协议唯一来源；migration不得由 ORM模型反向生成后未经审查直接发布。
+v0.1 repository必须包含：`src/agent_meta_runtime/{domain,application,ports,adapters,interfaces,sdk,protocols}`、Public/Backend `.proto`源、SQLite migration、JSON Schema、Runtime builtin AMPAK source与lock、`tests/fixtures/conformance_harness`、golden fixtures、contract/integration/E2E/fault-injection tests、`architecture.toml`、SBOM/provenance生成配置、operator runbook、release manifest模板，以及`docs/spec/v0.1-scope-and-traceability.md`。产品source/wheel不得含`seed_harness`或`agent_meta_seed_harness`；生成代码不得成为协议唯一来源；migration不得由ORM模型反向生成后未经审查直接发布。
 
 实现者可以裁量私有函数拆分、变量名、等价索引优化、日志文案和UI排版；不得裁量ID/preimage、wire/storage schema、事务边界、状态机、Authority/effect判断、默认值、超时/重试、平台truthfulness、错误码、验收fixture或Required/Deferred范围。若实现发现规范内部冲突，必须先以ADR修订规范和traceability，不能在代码中选择一种解释后把另一种解释留给测试。
+
+## 41.60 External Harness Package 与跨项目生命周期
+
+### 41.60.1 项目和依赖边界
+
+外部Seed的推荐仓库/distribution/import分别为`agent-meta-seed-harness`、`agent-meta-seed-harness`、`agent_meta_seed_harness`。本地开发工具可以把`../agent-meta-seed-harness`作为默认checkout hint，但Runtime daemon、wheel、tests和release workflow不得读取该相对路径；显式cross-repository job通过CI input传入checkout path。Runtime的`pyproject.toml` dependencies、optional-dependencies、entry points和wheel RECORD中均不得出现Seed distribution/module。
+
+Seed可以在build/test环境依赖`agent-meta-runtime`的公开`agent_meta_runtime.sdk`，但产品安装物必须构建为AMPAK并通过local RPC导入。Runtime启动时禁止`pip install`、Python entry-point自动发现、扫描`sys.path`或联网取得Harness。协议依赖方向由architecture lint和wheel content test证明。
+
+### 41.60.2 Harness manifest v1
+
+Manifest是JCS Artifact，required字段固定为：
+
+```yaml
+schema: harness-package/v1
+package_name: org.example.harness
+package_version: 0.1.0
+package_artifact_id: artifact://sha256/...
+publisher_identity_artifact_id: artifact://sha256/...
+signature_artifact_id: artifact://sha256/...
+public_api_range: ">=1.0.0 <2.0.0"
+harness_contract_range: ">=1.0.0 <2.0.0"
+capability_contract_range: ">=1.0.0 <2.0.0"
+artifact_format: AMPAK1
+capability_descriptor_artifact_ids: []
+composition_template_artifact_id: artifact://sha256/...
+grant_requests_artifact_id: artifact://sha256/...
+loop_policy_artifact_id: artifact://sha256/...
+required_backend_features: []
+optional_backend_features: []
+build_provenance_artifact_id: artifact://sha256/...
+```
+
+字段不得省略或加入未知字段；数组按UTF-8 byte排序去重。`loop_policy_artifact_id`指向符合`harness-loop-policy/v1`的JCS，至少固定`stop_on_tool_error,max_turns,max_steps,max_model_calls`；Harness值不得放宽Host hard ceiling。`package_name`匹配`^[a-z0-9]+(?:[.-][a-z0-9]+)*$`，version使用41.42 SemVer profile。Signature preimage为`agent-meta-harness-manifest-v1\0`加除`signature_artifact_id`外manifest的JCS bytes；签名只证明publisher provenance，不自动提升trust class或Authority。`contract_fingerprint`是三个range、artifact format、loop policy hash、排序feature集合和Runtime所选具体contract versions的JCS SHA-256。
+
+### 41.60.3 Validate 与 Install
+
+`Harness.ValidatePackage`是纯query：验证AMPAK/hash/path、manifest/schema/signature、contract range、Capability descriptor、Composition template、loop policy、grant request、Backend feature和placement；返回排序issue、resolved contract versions、trust class、requested permissions/features和plan hash，不写DB/CAS或执行代码。`Harness.Get`按`harness_id`读取单个installation；`Harness.List`按`(package_name,package_version,harness_id)`升序、使用41.52 authenticated snapshot cursor分页，默认/最大limit为100/1000，空`status`表示全部，非空必须是状态枚举。
+
+`Harness.Install`要求`harness.install`，只接受已经由Artifact.Put进入staging/CAS的manifest/package Artifact。单一事务登记Artifact引用、immutable Capability descriptors、`harness_installations(status=INSTALLED)`、history、Action/Fact；`harness_id`为`harness://<uuidv7>`。Install不得创建Grant、Composition revision、Instance、Task或Backend request，不运行package entrypoint。相同command幂等重放；同Realm相同package name/version但不同hash返回`IDEMPOTENCY_CONFLICT`。安装成功不改变serving readiness。
+
+### 41.60.4 Activate 与 Deactivate
+
+`Harness.Activate`要求`harness.activate`以及grant request中每项permission的签发权。事务前重跑Validate并生成CompatibilityReport；operator必须签署包含plan hash、grant request hash、expected meta/serving revision的CommandEnvelope。v0.1每个由Harness提交的Composition只能引用该installation提供的Capability与Runtime builtin；跨多个外部package拼装同一Composition延期。事务创建显式scoped Grants、immutable Composition revision、desired CAS、Harness activation Operation/Action/Fact/outbox；不直接改变serving。Reconciler成功切换后，在同一terminal事务把新installation标`ACTIVE`，把先前ACTIVE installation标`INACTIVE`并撤销其scoped Grants，然后写双方history和`harness_activated`；切换前新installation保持`INSTALLED/INACTIVE`。失败时撤销本次所有activation-scoped Grants（已发生的use审计历史保留）、保持旧serving，installation状态不变。
+
+`Harness.Deactivate`要求`harness.deactivate`。只有该Harness对应当前serving Composition时才把desired CAS到revision 0 sentinel并排队drain；Reconciler原子使serving/realized收敛到0后，状态改`INACTIVE`、清空`active_composition_id`并撤销Harness scoped Grants。切换失败保持旧serving和`ACTIVE`。一个Realm只有一个serving Composition和至多一个`ACTIVE` Harness installation。
+
+### 41.60.5 Uninstall、升级与保留
+
+`Harness.Uninstall`要求`harness.uninstall`，仅允许`INSTALLED/INACTIVE`且不存在desired/serving/realized Composition、non-terminal Task、active Instance、State owner或unsettled Effect引用。事务撤销残余Grant、标`UNINSTALLED`、写history/Fact；不删除Artifact、Fact、Composition、Evidence或历史row。GC以后按41.47 retention决定不可达bytes。UNINSTALLED是terminal；v0.1同一Realm不得重新安装相同`package_name + package_version`，必须发布新版本并获得新`harness_id`，历史不复活。
+
+升级固定为install新version → validate/experiment → activate新Composition → drain旧version → uninstall旧installation；禁止原地改package/hash/version。回滚只切换到仍installed且Artifact可读的旧Composition/State，遵守41.59.3。
+
+### 41.60.6 CLI、跨仓库CI与失败隔离
+
+CLI固定提供：
+
+```text
+agent-meta harness validate <manifest-artifact-id>
+agent-meta harness install <manifest-artifact-id> --expected-revision N
+agent-meta harness list|inspect ...
+agent-meta harness activate <harness-id> --expected-revision N --expected-serving N
+agent-meta harness deactivate <harness-id> --expected-revision N --expected-serving N
+agent-meta harness uninstall <harness-id> --expected-revision N
+```
+
+Runtime blocking CI只使用`tests/fixtures/conformance_harness`，并设置network deny和不存在的Seed checkout path，证明无隐藏依赖。Seed项目CI自行checkout/pin Runtime版本，并对每个声明支持的Runtime minor执行SDK compile、manifest golden、install/activate/task/deactivate/uninstall contract suite。外部Seed CI失败、仓库不可达或版本尚未发布不得改变Runtime release结论；Runtime只对公开Contract兼容负责。
 
 ---
 
@@ -5540,10 +5659,10 @@ Meta Reconciler
 EffectIntent → AgentOS mapping
 ```
 
-## Phase M3 — Seed + Evolvable Harness
+## Phase M3 — Harness Contract + Evolvable Composition
 
 ```text
-Minimal Seed Harness
+External Harness Contract + test-only Conformance Harness
 Proposal / ChangeSet
 Experiment
 World
@@ -5680,7 +5799,7 @@ Meta-Runtime 不得假定任一 backend native/process handle 永久有效；长
 Execution Backend facts 必须可进入 Meta causal projection；AgentOS KernelFact 是 Managed Backend 的标准实现。
 
 ### FR-MOS-005
-Meta-Runtime / Seed Harness 必须能够在不启动本设计 AgentOS Kernel daemon 的普通 Linux/Windows/macOS 上，以 Portable profile 运行基本 task/model/loop/context/scratch workflow。
+Meta-Runtime必须在未安装AgentOS Kernel或外部Seed的普通Linux/Windows/macOS上以Portable profile运行core workflow；test-only Conformance Harness验证task/invocation/context/capability/scratch Host Contract，外部Harness可在相同Contract上运行。
 
 ### FR-MOS-006
 Backend 必须暴露 machine-readable Capability Profile；Meta-Runtime 不得把 partial Portable semantics 宣称为完整 AgentOS guarantees。
@@ -5788,7 +5907,7 @@ Artifact Store 必须按内容寻址，发布前完成 hash/size 校验并使用
 外部 Backend 调用不得在持有 Meta Store write transaction 时执行；跨边界一致性通过 transactional outbox 与 idempotent reconciliation 实现。
 
 ### FR-MSTORE-006
-启动恢复必须依次完成 store/schema/Artifact 检查、Backend negotiation、outbox replay 与 desired/serving/realized reconciliation，达到 readiness 后才接受新任务。
+启动恢复必须依次完成 store/schema/Artifact 检查、Backend negotiation、outbox replay 与 desired/serving/realized reconciliation；达到`core_ready`后开放管理面，达到`serving_ready`后才接受新任务。
 
 ### FR-MSTORE-007
 Artifact、Composition、Managed State、Authority/Realm refs 与 Fact Ledger 的权威范围必须按 41.6 明确区分；RuntimeView/Causal Graph 等 projection 不得成为隐藏的第二写入源。
@@ -5796,10 +5915,10 @@ Artifact、Composition、Managed State、Authority/Realm refs 与 Fact Ledger �
 ### FR-MSTORE-008
 Capability Code Artifact 必须包含依赖锁、entrypoint、Contract、runtime constraint 与 build provenance，确保相同 ArtifactId 不隐式解析为不同执行环境。
 
-## 43.13 Seed Execution / API / Operations
+## 43.13 Task Host / External Harness Contract / API / Operations
 
 ### FR-MRUN-001
-Seed Loop 必须实施 turn、wall-time、model-call 与 effect budget，并将 cancellation 传播到 Model、Capability 与 Execution Backend。
+Harness Host必须强制执行Task声明的turn、wall-time、model-call与effect budget，并将cancellation传播到外部Harness Invocation、Capability与Execution Backend；外部Loop不能绕过这些ceiling。
 
 ### FR-MRUN-002
 Model/Tool/Capability Invocation 必须记录 input/output Artifact、Context Projection、attempt、usage、latency、terminal status 与 sanitized error。
@@ -5817,7 +5936,7 @@ Promotion 必须通过独立 Gate 与 Meta Transaction，至少检查 Evidence�
 公共 mutating API 必须返回 `command_id`、`action_id` 与 committed `meta_revision`，并使用稳定 error code。
 
 ### FR-MOPS-001
-实现必须提供 liveness、readiness、doctor、structured log 与 redacted diagnostics；未 ready 时仍允许 reflection 与 diagnostics。
+实现必须提供liveness、`core_ready`、`serving_ready`、doctor、structured log与redacted diagnostics；`core_ready=false`时仍允许只读reflection与diagnostics。
 
 ### FR-MOPS-002
 desired、serving 与 realized Composition revision 必须分别可查询，不得以 desired ref 冒充任务已经开始使用或 live realization 已收敛。
@@ -5873,7 +5992,7 @@ Local API 与 Backend ABI 必须使用 41.26/41.41 的 framed Protobuf、固定 
 Composition compatibility 必须按 41.42 保守算法执行；无法证明 schema compatibility 时返回 `COMPATIBILITY_UNKNOWN`，不得人工忽略后激活。
 
 ### FR-MRUN-006
-Task ingress、Model normalization 与 Tool dispatch 必须遵守 41.36 的 durable FIFO、严格 schema/Authority/budget 顺序、串行 tool call 和 terminal commit ownership。
+通用Task ingress、Model ContentPart normalization contract与Capability dispatch必须遵守41.36的durable FIFO、严格schema/Authority/budget顺序、调用次序和terminal commit ownership；具体Loop/Provider由外部Harness实现。
 
 ### FR-MSTORE-010
 Reconciler 必须使用 stable reconcile/request id 和 41.38 的提交点；serving CAS 后的恢复不得把新 Task 路由回旧 serving，也不得提前更新 realized。
@@ -5882,7 +6001,7 @@ Reconciler 必须使用 stable reconcile/request id 和 41.38 的提交点；ser
 Safe Reflection 不得调用用户可覆盖的 repr/str/len/iter/getattr/descriptor/property，并必须对 depth/item/byte/time budget fail bounded。
 
 ### FR-MCTX-004
-Seed Context Projection 必须按 41.44.4 的确定性选择、redact-before-rank、exact tokenizer 与 provenance manifest 生成。
+Runtime提供的Context Projection Contract/conformance implementation必须按41.44.4的确定性选择、redact-before-rank、exact tokenizer与provenance manifest生成；外部Harness可提供其他versioned policy但不得绕过redaction/provenance。
 
 ### FR-MSTATE-005
 Managed State 必须使用 immutable revision + mutable CAS ref；Task 冻结读取 revision，写冲突不自动 merge，Experiment 不得写 production state id。
@@ -5915,7 +6034,7 @@ Readiness、backpressure、doctor 与 repair 必须遵守 41.51 的 AND gate、�
 Public query/upload/CLI 必须遵守 41.52 的 Protobuf field、resource schema、authenticated cursor、exit code、JSON stdout 与 side-effect-free dry-run contract。
 
 ### FR-MRUN-007
-Seed Loop 必须遵守 41.53 的 terminal-only Model response、tool-call-only effect path、step accounting、terminal result和 timeout 语义；不得从自由文本解析 effect command。
+Runtime必须发布41.53的External Harness Loop schema/golden和Host enforcement，并用test-only Conformance Harness证明自由文本不能触发effect、只有typed tool call可进入dispatch。外部Seed实现符合性由其自身CI证明，不进入Runtime源码或release gate。
 
 ### FR-MREF-006
 Required IPython Scratch Adapter 必须遵守 41.54 的独立 kernel、disabled history/cache/profile/magics、bounded output、non-restored live heap 与 source-only Candidate export。
@@ -5924,10 +6043,10 @@ Required IPython Scratch Adapter 必须遵守 41.54 的独立 kernel、disabled 
 Platform credential storage、handle lifecycle、rotation 与 SQLite runtime check 必须遵守 41.55；Linux headless 无外部 master key必须拒绝产品启动。
 
 ### FR-MRUN-008
-Init、builtin registry、Composition revision 1、Fake Provider fixture 与 initial grants 必须遵守 41.57；重复 init不得创建或泄露第二组 Root/recovery material。
+Core init、Runtime builtin boundary、refs revision 0、test-only Conformance Harness与initial Root/Service grants必须遵守41.57；重复init不得创建或泄露第二组Root/recovery material，且不得探测或安装外部Seed。
 
 ### FR-MFACT-006
-Fact Ledger 必须按 41.35 构造 per-Realm continuous hash chain、持久 head和可验证 checkpoint；任意 gap/hash/head mismatch使 readiness false。
+Fact Ledger必须按41.35构造per-Realm continuous hash chain、持久head和可验证checkpoint；任意gap/hash/head mismatch使`core_ready=false`。
 
 ### FR-MCAP-009
 Capability Surface 必须按 41.59.1 的 Composition/Authority/Backend cache key确定生成与复用；权限变化不得改写旧 Surface，且每次实际调用必须重新授权。
@@ -5937,6 +6056,9 @@ State migration产物必须保持未绑定，直到与 serving Composition在同
 
 ### FR-MRUN-009
 Capability health probe与Outbox lease必须遵守41.59.2/41.59.4的固定结果、timeout/retry、monotonic deadline、restart takeover和clock instability语义。
+
+### FR-MARCH-006
+Meta-Runtime不得依赖Seed Harness的distribution、module、checkout path、Artifact或release状态；必须通过41.60公共Contract支持外部Harness独立install/activate/deactivate/uninstall。
 
 ---
 
@@ -5972,7 +6094,7 @@ Capability health probe与Outbox lease必须遵守41.59.2/41.59.4的固定结果
 | NFR-M26 | DB schema、Fact payload、public API 与 Backend protocol 独立版本化 |
 | NFR-M27 | Portable Linux 与 Windows 必须运行相同 Backend contract suite |
 | NFR-M28 | 正常本地环境中 outbox/reconcile 应在 5 秒内最终收敛；偏离需可观测 |
-| NFR-M29 | Seed Harness 只依赖受限 façade，不得通过 MetaRuntime Service Locator 获得任意高权限服务 |
+| NFR-M29 | 外部Harness只依赖public SDK/local RPC受限façade，不得通过MetaRuntime Service Locator或Python private import获得高权限服务 |
 | NFR-M30 | Capability 与 Execution 调用方必须依赖最小 Port；高级强语义不得伪装为所有 Backend 都能替换的基础接口 |
 | NFR-M31 | 同一 Capability Artifact 在相同声明平台上必须使用锁定依赖与 runtime constraint 可重复解析 |
 | NFR-M32 | Task 在重启、重试与 serving 切换期间保持冻结的 Composition/capability surface，不发生语义漂移 |
@@ -5989,14 +6111,15 @@ Capability health probe与Outbox lease必须遵守41.59.2/41.59.4的固定结果
 | NFR-M43 | Portable daemon 在 spawn 前后 crash 与响应丢失时，同一 request 最多只有一个 worker claim 可进入 Capability/effect 执行 |
 | NFR-M44 | Secret/redaction/logging 对相同结构化输入行为确定，恶意异常和 Provider body 不得绕过 allowlist |
 | NFR-M45 | Architecture boundary 与 policy replaceability 必须由静态 lint 加动态卸载测试共同证明 |
-| NFR-M46 | 非 ready/低磁盘/critical dead-letter 状态必须在 1 秒内拒绝新增危险工作，同时保留诊断和取消能力 |
+| NFR-M46 | `core_ready=false`、低磁盘或critical dead-letter状态必须在1秒内拒绝新增危险工作；`serving_ready=false`必须拒绝新Task，同时保留相应诊断和取消能力 |
 | NFR-M47 | Public query pagination 在同一 snapshot 上稳定且 cursor 不可伪造；dry-run 与失败 validation 不产生持久或外部副作用 |
-| NFR-M48 | Seed Loop 对相同 fake Model terminal responses、snapshot 与 budget 产生相同 Action/Invocation/Fact 状态序列 |
+| NFR-M48 | 外部Seed Loop对相同fake Model terminal responses、snapshot与budget产生相同Action/Invocation/Fact状态序列；由Seed项目验收，不阻塞Runtime release |
 | NFR-M49 | Scratch kernel 崩溃或 daemon restart 后 live handle 必须失效，且不能通过 pickle/closure 将 hidden consequential state 晋升 |
 | NFR-M50 | Root/KEK/Provider secret 的 product storage 不得依赖 data directory 文件权限之外的未声明保护，并可审计轮换依赖 |
-| NFR-M51 | 从空目录 init 到 serving/realized revision 1 的结果必须确定、可重试、无重复 identity/grant，并可用 fake fixture离线验收 |
+| NFR-M51 | 从空目录init到revision 0的core bootstrap，以及随后用test-only Conformance Harness达到serving/realized revision 1，均必须确定、可重试、无重复identity/grant并可离线验收 |
 | NFR-M52 | Fact chain 从任意 trusted checkpoint重算至 head必须产生唯一相同 hash，旧 row/seq/payload任何变化均可检测 |
 | NFR-M53 | Authority/Backend变化、state migration并发写、daemon restart与wall-clock跳变均不得造成陈旧授权、混合schema/composition、重复delivery terminal commit或无限lease |
+| NFR-M54 | 在Seed repository不存在且network deny的环境中，Runtime必须可独立build/install/init/start/doctor/backup/upgrade；外部Harness失败不得改变Runtime release结论 |
 
 ---
 
@@ -6058,7 +6181,7 @@ Evaluator v2 可重新评价 v1 使用过的历史 Evidence，Evidence 不变化
 
 ## AC-M07：Evolution Capability Removal
 
-卸载 Evaluation/Evolution/Governance 后，Seed Loop 仍可通过 AgentOS 完成普通 task execution。
+卸载 Evaluation/Evolution/Governance 后，test-only Conformance Harness仍可通过Backend完成普通Task execution；外部Seed项目可复用同一contract test证明该性质。
 
 ## AC-M08：Scratch Promotion
 
@@ -6081,7 +6204,7 @@ observe
 
 ## AC-M09A：Portable Linux/Windows 运行
 
-在未安装/未运行 AgentOS Kernel daemon 的普通 Linux 与 Windows 环境中，使用 Portable Backend 启动同一 Seed Harness；Model/Task/Minimal Loop/Minimal Context 与基本 Scratch workflow 可运行。缺失 hard quota / distributed lease 等能力必须通过 capability profile 显式报告，而不是失败后才暴露隐藏依赖。
+在未安装/未运行AgentOS Kernel daemon且不存在外部Seed checkout/distribution的普通Linux与Windows环境中，使用Portable Backend启动Runtime并完成core/conformance workflow；随后可仅通过public API安装任意测试Harness。缺失hard quota/distributed lease等能力必须通过capability profile显式报告，而不是失败后才暴露隐藏依赖。
 
 ## AC-M09B：Backend Switch without Harness Rewrite
 
@@ -6125,7 +6248,7 @@ native/external state 无法 introspect 时返回 opaque + impact，而非伪造
 
 在 task、invocation、composition reconcile 与 experiment 各阶段 kill Meta-Runtime；重启后能够重放 outbox、续接或标记失效 handle、隔离 orphan workload，并使 desired/serving/realized 状态收敛或显式进入 `DEGRADED/UNKNOWN`。
 
-## AC-M17：Seed Loop E2E
+## AC-M17：External Seed Loop E2E（Seed项目阻塞项）
 
 使用 fake Model Provider 与 InMemory Backend 完成：
 
@@ -6139,7 +6262,7 @@ task
 → task completion
 ```
 
-链路中每个对象均可通过 `action_id` 或 causal edge 关联。
+链路中每个对象均可通过`action_id`或causal edge关联。本项由`agent-meta-seed-harness`项目对声明支持的Runtime版本执行，不是Meta-Runtime release gate。
 
 ## AC-M18：Candidate Isolation / Promotion
 
@@ -6151,7 +6274,7 @@ unsafe `repr/property`、path escape、过度 delegation、过期 grant、未满
 
 ## AC-M20：Operational Readiness
 
-store、Artifact 或 Backend 未通过启动检查时 readiness 为 false、普通 task 被拒绝，而 reflect/doctor/diagnostics 仍可使用；恢复完成后无需重启进程即可转为 ready。
+store、Artifact或Backend未通过启动检查时`core_ready=false`、普通Task和管理mutation被拒绝，而只读reflect/doctor/diagnostics仍可使用；核心恢复后无需重启转为`core_ready=true`。没有serving Composition时`serving_ready=false`且Task返回`NO_SERVING_COMPOSITION`；激活并收敛后无需重启转为`serving_ready=true`。
 
 ## AC-M21：Three-revision Composition Cutover
 
@@ -6179,7 +6302,7 @@ daemon 持有 data directory 时，第二个 daemon 或 embedded writer 启动�
 
 ## AC-M27：Restricted Harness Façade
 
-Seed/第三方 Capability 的依赖注入对象中不存在 repository、raw transaction、grant、force activation 或 Root Succession 接口；静态依赖测试阻止其 import private application/store module。
+外部Harness/第三方Capability的依赖注入对象中不存在repository、raw transaction、grant、force activation或Root Succession接口；静态依赖测试阻止其import private application/store module。
 
 ## AC-M28：Artifact Canonicalization
 
@@ -6251,7 +6374,7 @@ Typed ChangeSet 重复路径、stale old-value hash、缺 Evidence、unknown ass
 
 ## AC-M45：Architecture Lint 与 Policy Replaceability
 
-逐个注入 Domain→Adapter、Seed→Repository、Capability→Credential/Root API 等非法 import，CI lint 必须失败。卸载 Context/Retry/Evaluation/Evolution/Governance 后普通 fake Task 仍可执行；换入新版本后历史行为仍解析到旧 Artifact，release 后无残留 ACTIVE binding/thread/process。
+逐个注入Domain→Adapter、External Harness→Repository、Capability→Credential/Root API等非法import，CI lint必须失败。卸载Context/Retry/Evaluation/Evolution/Governance后Conformance fake Task仍可执行；换入新版本后历史行为仍解析到旧Artifact，release后无残留ACTIVE binding/thread/process。
 
 ## AC-M46：Readiness 与 Backpressure
 
@@ -6261,9 +6384,9 @@ Typed ChangeSet 重复路径、stale old-value hash、缺 Evidence、unknown ass
 
 分页期间并发写入不会改变当前 cursor snapshot 的结果或产生重复/遗漏；篡改/过期/跨 query cursor 被拒绝。Artifact chunk 重放幂等且乱序/冲突失败。每类稳定错误映射到规定 CLI exit code；JSON 模式 stdout 可由 schema 解析且无额外文本。对所有 mutating CLI 执行 dry-run 后，DB/CAS/outbox/Backend hash 与调用前一致。
 
-## AC-M48：Seed Loop Determinism 与文本无副作用
+## AC-M48：External Seed Loop Determinism 与文本无副作用（Seed项目阻塞项）
 
-Fake Provider 分别返回 text、LENGTH、单/多 tool call、重复 call id、空 response、错误 finish reason和 budget exhaustion；状态序列符合 41.53。向纯文本注入看似 tool/JSON/shell 的指令不得触发任何 Capability/Backend effect。相同 fixture 重放产生等价 causal graph 与同内容 ArtifactId。
+Seed项目的Fake Provider分别返回text、LENGTH、单/多tool call、重复call id、空response、错误finish reason和budget exhaustion；状态序列符合41.53。向纯文本注入看似tool/JSON/shell的指令不得触发任何Capability/Backend effect。相同fixture重放产生等价causal graph与同内容ArtifactId。本项不要求Runtime仓库包含Seed实现。
 
 ## AC-M49：IPython Scratch Lifecycle 与 Export
 
@@ -6275,7 +6398,7 @@ Windows DPAPI、Linux Secret Service/headless key-file 必须在对应 blocking 
 
 ## AC-M51：Empty-directory Bootstrap E2E
 
-在 Linux/Windows 空目录执行 init，验证 schema/builtin/grant/Composition 1、desired=serving=realized=1 和 READY；运行默认 fake fixture得到两个 Model Invocation、一个 echo Tool Invocation和 SUCCEEDED Task。分别在 credential/CAS/DB commit/reconcile 阶段 kill后重试，不产生重复 Root/grant/recovery code；已提交 bootstrap的重复 init不再次显示 recovery secret。
+在Linux/Windows、network deny且外部Seed checkout/distribution不存在的空目录执行init，验证Runtime schema/builtin/Root-Service grant、desired=serving=realized=0、core_ready=true和serving_ready=false；Task.Submit返回NO_SERVING_COMPOSITION，而doctor/backup/upgrade可用。分别在credential/CAS/DB commit阶段kill后重试，不产生重复Root/grant/recovery code；已提交bootstrap的重复init不再次显示recovery secret。随后仅用test-only Conformance Harness经公共API完成install/activate/task/deactivate/uninstall，最终refs回0且core仍ready。
 
 ## AC-M52：Fact Hash Chain Integrity
 
@@ -6284,6 +6407,10 @@ Windows DPAPI、Linux Secret Service/headless key-file 必须在对应 blocking 
 ## AC-M53：Surface、Migration 与 Lease Race Closure
 
 并发执行以下矩阵：Task接纳时grant revoke/expire/use耗尽与Backend profile变化；旧 serving Task写State时新Composition migration/cutover；两种rollback strategy；Outbox持有lease时daemon crash/restart、旧owner迟到commit以及wall clock正负1小时跳变。断言新Task只复用匹配完整cache key的Surface、每次调用重新授权、cutover不会出现混合Composition/schema或覆盖并发写、rollback不会隐式回退State、每个Outbox item只有当前owner可terminal commit，且CLOCK_UNSTABLE期间readiness false并停止新lease。required/preferred health probe还必须覆盖READY/DEGRADED/UNHEALTHY、timeout、重复response和pre-serving routing隔离。
+
+## AC-M54：Cross-project Harness Decoupling
+
+Runtime wheel metadata/RECORD/SBOM/source import graph不含`agent-meta-seed-harness`、`agent_meta_seed_harness`或`seed_harness`产品module；把Seed checkout path设为不存在并禁止network后，Runtime仍完成build/install/AC-M51。使用两个由test fixture独立构建、package name不同的Harness依次执行Validate/Install/Activate/Task/Deactivate/Uninstall，均只通过public SDK/local RPC；任一fixture注入private import、越权grant request、不兼容contract、失败health或残留引用时fail closed且旧serving/core readiness正确。外部Seed CI结果不得出现在Runtime release gate输入中。
 
 ---
 
@@ -6318,8 +6445,9 @@ Windows DPAPI、Linux Secret Service/headless key-file 必须在对应 blocking 
 | Recovery | semantic rebuild on new process/kernel backend |
 | Transaction | atomic commit / idempotency / outbox duplicate delivery |
 | Reconciliation | desired/serving/realized diff / orphan / renewed handle / eventual convergence |
-| Seed Loop | terminal-only model response / text no-effect / tool order / budget / cancellation / terminal fact visibility |
-| Bootstrap | empty-dir init / builtin registry / initial grants / Composition 1 / kill-retry / fake fixture |
+| External Seed Contract | terminal-only response / text no-effect / tool order；在Seed项目执行，不阻塞Runtime |
+| Bootstrap | empty-dir core init / refs 0 / core-serving readiness / kill-retry / no Seed discovery |
+| Harness Lifecycle | two independent packages / validate-install-activate-deactivate-uninstall / contract mismatch / reference safety |
 | API/CLI | stable error code / JSON schema / dry-run |
 | Operations | liveness/readiness / doctor / redacted diagnostics |
 | Backpressure | task/outbox/projection/WAL/disk threshold / safe-operation allowlist |
@@ -6357,8 +6485,9 @@ Self-Governance / Commitment
 Trust Epoch
 Witness / Peer / Archive
 Semantic Recovery
-Seed Harness
 ```
+
+Seed Harness不从v0.4“保留进”Runtime，而是迁移为独立项目，通过41.60公共Harness Contract接入。
 
 ## 47.2 下沉到 AgentOS Kernel
 
@@ -6426,9 +6555,11 @@ AgentOS Kernel
 
 > 一个建立在稳定 Execution Backend Contract 之上的反射式、版本化、因果可追踪且可自演化的 Agent/Harness 元运行时。它维护 Agent 的 Self-Model、Self-History 与 Self-Transformation，把 Composition、Capability、Artifact、State、Context、Authority、Fact、Evidence、Evaluation 与 Successor 作为一等对象。Portable Backend 使其可直接运行在普通 Linux/Windows/macOS；完整 AgentOS Kernel Backend 则提供强隔离、资源仲裁、监督、凭据和恢复等 production-grade 语义。
 
-本设计中的 **Seed Harness** 定义为：
+本设计中的 **Seed Harness** 定义为一个外部项目：
 
-> 一组足以让 Meta-Runtime 从启动时产生有用 Agent 行为的最小可替换 Capability，包括 Model、Task/Event、Minimal Loop 与 Minimal Context；当前可附带 Evaluation/Evolution/Governance v0 作为 bootstrap scaffolding，但这些都不拥有永久特权。
+> 一组通过公共Harness Contract安装到Meta-Runtime、足以产生有用Agent行为的最小可替换Capability，包括Model、Task/Event、Minimal Loop与Minimal Context；它可以附带Evaluation/Evolution/Governance scaffolding，但不拥有永久特权，也不是Runtime bootstrap、源码、依赖或发布门禁的一部分。
+
+因此“Seed”描述的是外部参考实现的初始策略，而不是Runtime内部层。Runtime在Seed项目完全不存在时仍可独立build/install/init/start/doctor/backup/upgrade；Seed只单向依赖`agent_meta_runtime.sdk`和local RPC，并可在任意仓库路径独立版本化、测试与发布。
 
 最终核心哲学：
 
