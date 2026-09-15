@@ -69,7 +69,7 @@ agent-meta --data-dir /srv/amrt harness uninstall <harness_id>
 ```
 
 Install is idempotent per (name, version); re-install of an identical package
-succeeds without a new revision (proof: `tests/trace/test_harness_lifecycle*.py`).
+succeeds without a new revision (proof: `tests/trace/test_fr_mrun_001.py`).
 Activation uses optimistic serving/revision guards — exit 5 means another
 operator moved the composition first; re-read with `view --revision` and retry.
 
@@ -120,31 +120,31 @@ by hand — exit 8 from `doctor` afterwards is expected and means real damage.
 
 - **Upgrade preflight**: the store freezes `application_id = 0x414D5254`
   ("AMRT") and `user_version = 1`. On startup a writer with mismatched
-  identity is rejected (`tests/trace/test_upgrade_preflight*.py`). To upgrade,
+  identity is rejected (`tests/trace/test_nfr_m54.py`). To upgrade,
   run `doctor` in the new version and follow its migration preflight output;
   never edit the store in place across schema versions.
 - **Suspected tamper** (exit 8, or `doctor` reports fact-chain/CAS mismatch):
   stop writers, capture `doctor --output json` output, restore from the last
   sealed backup (§4), and quarantine-and-inspect. Tamper detection proofs:
-  `tests/trace/test_fact_chain_integrity*.py`, `tests/trace/test_cas_roundtrip*.py`,
+  `tests/trace/test_fr_mfact_003.py`, `tests/trace/test_nfr_m05.py`,
   `tests/acceptance/test_ac_m04.py`.
 
 ## 7. Adversarial matrix → standing proofs
 
 | Scenario | Behavior / guard | Proof module(s) |
 |---|---|---|
-| Process crash mid-command | UoW commit is atomic; journal replay on reopen; restart yields same revision | `tests/trace/test_conformance_bootstrap_offline*.py`, `tests/trace/test_state_lifecycle*.py`, `tests/acceptance/test_ac_m29.py` |
-| Concurrent/racing writers | Optimistic meta-revision guards; stale writes rejected | `tests/trace/test_state_lifecycle*.py`, `tests/trace/test_nfr_m15.py`, `tests/trace/test_nfr_m53.py` |
-| Clock jump / NTP step | Deadlines/stamps use monotonic-stable µs; misalignment detected | `tests/trace/test_clock_stability*.py` |
+| Process crash mid-command | UoW commit is atomic; journal replay on reopen; restart yields same revision | `tests/trace/test_fr_mrun_008.py`, `tests/trace/test_fr_mstate_002.py`, `tests/acceptance/test_ac_m29.py` |
+| Concurrent/racing writers | Optimistic meta-revision guards; stale writes rejected | `tests/trace/test_fr_mstate_002.py`, `tests/trace/test_nfr_m15.py`, `tests/trace/test_nfr_m53.py` |
+| Clock jump / NTP step | Deadlines/stamps use monotonic-stable µs; misalignment detected | `tests/trace/scenarios.py` (`clock_stability` scenario; not a v0.1 traceability ID) |
 | Late result after terminal state | Recorded, never reverses terminal state | `tests/trace/test_nfr_m07.py`, `test_nfr_m24.py` |
-| Low disk / partial write | Doctor detects CAS/hash mismatch; restore quarantines bad facts | `tests/trace/test_cas_roundtrip*.py`, `tests/trace/test_operations_backup_restore*.py`, `tests/acceptance/test_ac_m16.py` |
-| Credential loss / authority abuse | Delegation containment, frozen permissions, hash-bound tokens | `tests/trace/test_authority_domain*.py`, `tests/acceptance/test_ac_m05.py`, `test_ac_m21.py`, `test_ac_m38.py` |
-| Store tamper (fact/CAS) | Append-only triggers + hash chain detection | `tests/trace/test_fact_chain_integrity*.py`, `tests/trace/test_nfr_m04.py`, `tests/acceptance/test_ac_m12.py` |
-| Cursor/session tampering | MAC'd cursor codec rejects forgery | `tests/trace/test_cursor_stability*.py`, `tests/trace/test_nfr_m47.py` |
-| Secret leakage in logs/config | Redaction deterministic on load and render | `tests/trace/test_config_redaction*.py`, `tests/trace/test_nfr_m16.py` |
-| Outbox duplicate dispatch | Dedupe keys bound to (kind, realm, entity, transition, payload) | `tests/trace/test_outbox_dispatch*.py`, `tests/trace/test_nfr_m23.py`, `test_nfr_m43.py` |
-| Oversized/malformed frames | Wire codec caps and rejects | `tests/trace/test_wire_codec_and_registry*.py`, `tests/acceptance/test_ac_m22.py` |
-| Accidental artifact deletion | DB triggers block DELETE/UPDATE on artifacts | `tests/trace/test_cas_roundtrip*.py`, `tests/trace/test_nfr_m05.py` |
+| Low disk / partial write | Doctor detects CAS/hash mismatch; restore quarantines bad facts | `tests/trace/test_fr_mops_001.py`, `test_fr_mops_002.py`, `tests/acceptance/test_ac_m16.py` |
+| Credential loss / authority abuse | Delegation containment, frozen permissions, hash-bound tokens | `tests/trace/test_fr_mauth_001.py`, `tests/acceptance/test_ac_m05.py`, `test_ac_m21.py`, `test_ac_m38.py` |
+| Store tamper (fact/CAS) | Append-only triggers + hash chain detection | `tests/trace/test_fr_mfact_001.py`, `tests/trace/test_nfr_m04.py`, `tests/acceptance/test_ac_m12.py` |
+| Cursor/session tampering | MAC'd cursor codec rejects forgery | `tests/acceptance/test_ac_m47.py`, `tests/trace/test_nfr_m47.py` |
+| Secret leakage in logs/config | Redaction deterministic on load and render | `tests/trace/test_fr_msec_001.py`, `tests/trace/test_nfr_m16.py` |
+| Outbox duplicate dispatch | Dedupe keys bound to (kind, realm, entity, transition, payload) | `tests/trace/test_fr_mrun_009.py`, `tests/trace/test_nfr_m23.py`, `test_nfr_m43.py` |
+| Oversized/malformed frames | Wire codec caps and rejects | `tests/trace/test_fr_mos_001.py`, `tests/acceptance/test_ac_m22.py` |
+| Accidental artifact deletion | DB triggers block DELETE/UPDATE on artifacts | `tests/trace/test_nfr_m05.py`, `tests/trace/test_nfr_m05.py` |
 
 ## 8. Known limitations
 
