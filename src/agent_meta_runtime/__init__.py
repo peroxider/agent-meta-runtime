@@ -1,10 +1,11 @@
-"""agent-meta-runtime: placeholder package reserving the name on PyPI.
+"""agent-meta-runtime: reflective + evolvable agent meta-runtime.
 
-The real runtime is designed in `docs/Agent_Meta_Runtime_Requirements_Design_v0.1.md`
-and will ship under subsequent versions. This 0.0.1 wheel exists only to claim
-the distribution name so it cannot be squatted between now and the v0.1 release.
+Normative baseline: ``docs/Agent_Meta_Runtime_Requirements_Design_v0.1.md`` (v0.1-r11).
+Layering (§41.3): domain -> ports -> application; adapters/interfaces/sdk are
+configured at the edge. Domain never imports adapters, sqlite3, IPython or grpc.
 """
 
 from __future__ import annotations
 
 __version__ = "0.0.1"
+

@@ -6,14 +6,32 @@ build-backend = "hatchling.build"
 name = "agent-meta-runtime"
 # Version is single-sourced from `src/agent_meta_runtime/__init__.py` (`__version__`).
 dynamic = ["version"]
-description = "Placeholder package reserving the agent-meta-runtime name on PyPI. Real implementation tracked in docs/Agent_Meta_Runtime_Requirements_Design_v0.1.md."
+description = "Reflective + evolvable agent meta-runtime: white-box self-model, causal history and composition control plane."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "MIT"
-keywords = ["agent", "runtime", "placeholder", "agent-meta-runtime"]
+keywords = ["agent", "runtime", "meta-runtime", "agent-meta-runtime"]
+dependencies = []
+
+[project.optional-dependencies]
+ipython = ["ipykernel>=6"]
+otel = []
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "cryptography>=43",
+  "protobuf>=5",
+]
+
+[project.scripts]
+agent-meta = "agent_meta_runtime.interfaces.cli:main"
 
 [tool.hatch.version]
 path = "src/agent_meta_runtime/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_meta_runtime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
