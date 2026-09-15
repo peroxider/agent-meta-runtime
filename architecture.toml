@@ -1,0 +1,118 @@
+# Architecture declaration (§41.50). Consumed by scripts/arch_lint.py.
+# Each package declares its layer, allowed/forbidden imports, a primary
+# principle, at most two secondary principles and the owning slice.
+
+[[package]]
+name = "agent_meta_runtime.domain"
+layer = "domain"
+allowed = ["agent_meta_runtime.domain", "stdlib"]
+forbidden = [
+  "sqlite3",
+  "IPython",
+  "grpc",
+  "agent_meta_runtime.adapters",
+  "agent_meta_runtime.application",
+  "agent_meta_runtime.interfaces",
+  "agent_meta_runtime.sdk",
+  "agent_meta_seed_harness",
+  "seed_harness",
+]
+primary_principle = "Pure domain invariants with no I/O or framework dependencies"
+secondary_principles = []
+owner_slice = "M0"
+
+[[package]]
+name = "agent_meta_runtime.ports"
+layer = "ports"
+allowed = ["agent_meta_runtime.domain", "stdlib"]
+forbidden = [
+  "agent_meta_runtime.adapters",
+  "agent_meta_runtime.application",
+  "agent_meta_runtime.interfaces",
+  "agent_meta_seed_harness",
+  "seed_harness",
+]
+primary_principle = "Ports define the only edges adapters may implement"
+secondary_principles = []
+owner_slice = "M0"
+
+[[package]]
+name = "agent_meta_runtime.application"
+layer = "application"
+allowed = [
+  "agent_meta_runtime.domain",
+  "agent_meta_runtime.ports",
+  "stdlib",
+]
+forbidden = [
+  "agent_meta_runtime.adapters",
+  "agent_meta_runtime.interfaces",
+  "agent_meta_seed_harness",
+  "seed_harness",
+]
+primary_principle = "Application owns transaction and use-case orchestration"
+secondary_principles = ["Authority checked before every effect"]
+owner_slice = "M0"
+
+[[package]]
+name = "agent_meta_runtime.adapters"
+layer = "adapters"
+allowed = ["agent_meta_runtime.domain", "agent_meta_runtime.ports", "stdlib", "external"]
+forbidden = [
+  "agent_meta_runtime.interfaces",
+  "agent_meta_runtime.sdk",
+  "agent_meta_seed_harness",
+  "seed_harness",
+]
+primary_principle = "Adapters implement ports; they never define domain semantics"
+secondary_principles = []
+owner_slice = "M0"
+
+[[package]]
+name = "agent_meta_runtime.interfaces"
+layer = "interfaces"
+allowed = [
+  "agent_meta_runtime.domain",
+  "agent_meta_runtime.ports",
+  "agent_meta_runtime.application",
+  "agent_meta_runtime.adapters",
+  "stdlib",
+]
+forbidden = [
+  "agent_meta_seed_harness",
+  "seed_harness",
+]
+primary_principle = "CLI and local API reuse application services only"
+secondary_principles = []
+owner_slice = "M0"
+
+[[package]]
+name = "agent_meta_runtime.sdk"
+layer = "sdk"
+allowed = ["agent_meta_runtime.domain", "stdlib"]
+forbidden = [
+  "agent_meta_runtime.adapters",
+  "agent_meta_runtime.application",
+  "agent_meta_runtime.interfaces",
+  "agent_meta_seed_harness",
+  "seed_harness",
+]
+primary_principle = "Public typed surface only; no repository/UoW/credential leakage"
+secondary_principles = []
+owner_slice = "M0"
+
+[[package]]
+name = "agent_meta_runtime.protocols"
+layer = "protocols"
+allowed = ["stdlib"]
+forbidden = [
+  "agent_meta_runtime.adapters",
+  "agent_meta_runtime.application",
+  "agent_meta_runtime.interfaces",
+  "agent_meta_runtime.sdk",
+  "agent_meta_seed_harness",
+  "seed_harness",
+]
+primary_principle = "Generated protocol code follows versioned proto sources"
+secondary_principles = []
+owner_slice = "M0"
