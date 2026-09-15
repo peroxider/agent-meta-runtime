@@ -144,7 +144,7 @@ by hand — exit 8 from `doctor` afterwards is expected and means real damage.
 | Secret leakage in logs/config | Redaction deterministic on load and render | `tests/trace/test_fr_msec_001.py`, `tests/trace/test_nfr_m16.py` |
 | Outbox duplicate dispatch | Dedupe keys bound to (kind, realm, entity, transition, payload) | `tests/trace/test_fr_mrun_009.py`, `tests/trace/test_nfr_m23.py`, `test_nfr_m43.py` |
 | Oversized/malformed frames | Wire codec caps and rejects | `tests/trace/test_fr_mos_001.py`, `tests/acceptance/test_ac_m22.py` |
-| Accidental artifact deletion | DB triggers block DELETE/UPDATE on artifacts | `tests/trace/test_nfr_m05.py`, `tests/trace/test_nfr_m05.py` |
+| Accidental artifact deletion | DB triggers block DELETE/UPDATE on artifacts | `tests/trace/test_nfr_m05.py`, `tests/acceptance/test_ac_m15.py` |
 
 ## 8. Known limitations
 
