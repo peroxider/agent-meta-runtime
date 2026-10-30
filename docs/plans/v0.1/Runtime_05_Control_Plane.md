@@ -8,6 +8,8 @@
 
 实现transactional outbox、Reconciler、health probe、原子serving切换和确定性恢复。
 
+> 注：backup/restore/upgrade/GC（§41.47）的完整实现在Step 09闭合；本步骤只实现recovery编排所依赖的最小语义。
+
 ## 实施顺序
 
 1. 实现outbox lease owner/generation、stable dedupe、retry/dead-letter和clock rollback保护。

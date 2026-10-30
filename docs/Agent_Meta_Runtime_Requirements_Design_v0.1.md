@@ -7,7 +7,7 @@
 > **目标读者**：Agent Runtime / Harness / Self-Evolution / Agent Infrastructure 开发者  
 > **设计目标**：让 Agent/Harness 自身成为 Agent 可以观察、解释、组合、实验、版本化、治理和演化的一等对象。  
 > **当前范围**：本仓库只实现 Agent Meta-Runtime、公共 Harness Contract/SDK 与测试专用 Conformance Harness。Seed Harness 是位于另一项目中的外部消费者，不进入本仓库源码、wheel、bootstrap 或发布门禁。  
-> **分步实施计划**：[`docs/plans/v0.1/README.md`](plans/v0.1/README.md)；Runtime按00～09实施，外部Seed按带`Seed_Harness_`前缀的S00～S03计划实施。
+> **分步实施计划**：[`docs/plans/v0.1/README.md`](plans/v0.1/README.md)；Runtime按00～09实施，外部Seed按带`Seed_Harness_`前缀的S00～S03计划实施（S00～S03为最小可发布闭环，S04～S07为后续能力波次，均独立于Runtime发布）。
 > **下层依赖**：Execution Backend Contract；完整 AgentOS Kernel 是提供 production-grade 语义的标准 Backend，但不是 Meta-Runtime 在普通 OS 上启动的必要前提。  
 > **参考实现**：Prime Agent、DeepSeek Harness、python-cordis、IPython/ipykernel 仅用于机制参考，不定义 Meta-Runtime ontology。
 > **首版实现决策**：采用 **CPython 3.12 Agent Meta-Runtime**。Managed profile 通过第 41.28 节冻结的 Protobuf v1 ABI 连接 AgentOS Kernel：Linux/macOS 使用 Unix Domain Socket，Windows 使用 Named Pipe；Portable profile 使用同一 Backend Contract 的本地实现。IPython 是 v0.1 Required Scratch Adapter，python-cordis 是 Optional Adapter，二者均不是 Meta-Runtime Core 硬依赖。

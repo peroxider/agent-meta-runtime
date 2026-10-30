@@ -35,14 +35,23 @@
 
 这些计划描述另一个项目的工作，不是本仓库产品实现范围：
 
+开发入口见[Seed开发交接](seed-harness/Seed_Harness_Development_Guide.md)，逐步骤证明见[Seed追踪计划](seed-harness/Seed_Harness_Traceability.md)。两者随本目录整体复制，引用的测试路径都属于未来Seed仓库，当前仍为PLANNED。
+
 | 顺序 | 计划 | 主要产物 |
 |---:|---|---|
 | S00 | [项目引导](seed-harness/Seed_Harness_00_Project_Bootstrap.md) | 独立仓库、包名和单向依赖 |
 | S01 | [Package Contract](seed-harness/Seed_Harness_01_Package_Contract.md) | AMPAK、manifest、grant和Composition模板 |
+| S01A | [Public Contract / Host Integration](seed-harness/Seed_Harness_01A_Public_Host_Contract.md) | 管理RPC/执行Host SPI映射、Runtime依赖台账、独立包加载与恢复证明 |
 | S02 | [Loop、Context、Provider](seed-harness/Seed_Harness_02_Loop_Context_Provider.md) | Seed行为实现与确定性fixture |
 | S03 | [集成与发布](seed-harness/Seed_Harness_03_Integration_Release.md) | Runtime兼容矩阵、AC-M17/M48、独立发布 |
+| S04 | [Real Model Providers](seed-harness/Seed_Harness_04_Real_Model_Providers.md) | Provider profile、真实adapter、credential handle、R2 replay |
+| S05 | [First Capability Toolset](seed-harness/Seed_Harness_05_Capability_Toolset.md) | 首批工具Capability、schema校验、redaction |
+| S06 | [Conversation Session Model](seed-harness/Seed_Harness_06_Conversation_Sessions.md) | 会话=Managed State、消息→Task、Context预算 |
+| S07 | [Evolution Capability](seed-harness/Seed_Harness_07_Evolution_Capability.md) | Proposal/ChangeSet生成、隔离实验、自迭代闭环、按S03流程发布 |
 
 Seed步骤只依赖已发布的Runtime公共SDK/Contract或显式CI输入，不读取Runtime私有源码路径。Runtime CI不得反向执行这些步骤。
+
+Seed顺序为`S00 → S01 → S01A → S02 → S03 → S04 → S05 → S06 → S07`。S03发布fake Provider/echo最小版；S04～S07各自累积新增profile、关闭所需Runtime依赖并复用S03流程发布新版本。缺公开接口先由Runtime按既有ADR/Contract规则交付，不通过Seed私有导入或新增未登记RPC补洞。
 
 ## 变更规则
 

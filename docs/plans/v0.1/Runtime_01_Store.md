@@ -13,7 +13,7 @@
 - authoritative SQLite STRICT migration与connection profile。
 - filesystem CAS、AMPAK1、Artifact manifest/blob/encryption分离。
 - Unit of Work、CommandEnvelope幂等claim、meta revision、Fact hash chain和checkpoint。
-- integrity doctor、staging清理和最小backup dependency记录。
+- integrity doctor、staging清理和最小backup dependency记录（backup/restore/GC完整实现归Step 09闭合）。
 - 本步骤不调用Backend或用户代码。
 
 ## 实施顺序
