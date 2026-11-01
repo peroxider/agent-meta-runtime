@@ -1,0 +1,13 @@
+"""Credential resolution port; only enforcement composition roots may use it."""
+
+from contextlib import AbstractContextManager
+from typing import Protocol
+
+
+class CredentialStore(Protocol):
+    profile: str
+
+    def create(self, secret: bytearray, *, purpose: str) -> str: ...
+    def get_for_scoped_use(self, handle: str, *, purpose: str) -> AbstractContextManager[bytearray]: ...
+    def rotate(self, handle: str, secret: bytearray, *, purpose: str) -> str: ...
+    def delete_metadata(self, handle: str, *, reference_count: int) -> None: ...
