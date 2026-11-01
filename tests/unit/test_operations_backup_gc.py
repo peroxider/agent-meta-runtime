@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 import pytest
@@ -36,7 +37,7 @@ DAY = 24 * 60 * 60 * 1_000_000
 
 def _data_env(tmp_path, name: str):
     data_dir = tmp_path / name
-    run_init(data_dir)
+    run_init(data_dir, insecure_dev_credential_file=os.name != 'nt')
     conn = sqlite3.connect(data_dir / "meta.db")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn, data_dir
@@ -128,6 +129,11 @@ def test_backup_restore_round_trip_quarantine_and_fact(tmp_path):
     fresh = tmp_path / "fresh"
     report = restore_backup(dest, fresh)
     assert report["realm_id"] == REALM
+    assert run_init(fresh, insecure_dev_credential_file=os.name != 'nt').reinitialized
+    from agent_meta_runtime.adapters.credentials import operator_signing_authority
+    from agent_meta_runtime.adapters.crypto import verify_signature
+    operator, signer = operator_signing_authority(fresh, allow_insecure=os.name != 'nt')
+    assert verify_signature(bytes.fromhex(operator["public_key_hex"]), b"restore-proof", signer(b"restore-proof"))
     restored = sqlite3.connect(fresh / "meta.db")
     try:
         status = restored.execute(
@@ -193,7 +199,7 @@ def test_upgrade_preflight_up_to_date(tmp_path):
 # -- GC -------------------------------------------------------------------------
 
 
-def test_gc_plan_commit_sweep_and_purge(tmp_path):
+def test_gc_plan_commit_sweep_and_purge(tmp_path, monkeypatch):
     conn, data_dir = _data_env(tmp_path, "data")
     cas = FilesystemCas(data_dir)
     orphan = _seed_orphan(conn, cas, age_us=DAY + 1, tag=b"orphan-bytes")
@@ -294,6 +300,12 @@ def test_gc_plan_commit_sweep_and_purge(tmp_path):
         "SELECT COUNT(*) FROM facts WHERE event_type = 'artifact_gc_quarantined'"
     ).fetchone()[0] == 1
 
+    import agent_meta_runtime.adapters.store.gc as gc_module
+
+    # Windows wall-clock resolution can be coarser than this retention test.
+    # Advance the declared clock instead of depending on scheduler timing.
+    metadata = json.loads((trash_dir / "metadata.json").read_text())
+    monkeypatch.setattr(gc_module, "now_us", lambda: metadata["quarantined_at_us"] + 2)
     purged = purge_expired_trash(conn, data_dir, retention_us=1)
     assert orphan in purged["purged_artifacts"]
     assert not trash_dir.exists()
@@ -330,14 +342,18 @@ def test_operations_surface_over_wire(tmp_path):
     from agent_meta_runtime.interfaces.local_api.handlers import PublicApiHandlers
     from agent_meta_runtime.interfaces.local_api.server import LocalApiServer
     from agent_meta_runtime.interfaces.local_api.staging import ChunkedStaging
+    from agent_meta_runtime.adapters.credentials import operator_signing_authority
+    from agent_meta_runtime.domain.envelope import CommandEnvelope
+    from agent_meta_runtime.sdk import CommandAuthority, encode_command, sign_command
+    from agent_meta_runtime.adapters.store.connection import connect_store
 
     async def test(env):
         dest = tmp_path / "wire-backup"
         envelope = {
             "command_id": "task://" + new_uuid7(),
             "realm_id": env.realm,
-            "actor_id": ACTOR,
-            "authority_grant_id": None,
+            "actor_id": env.authority.actor_id,
+            "authority_grant_id": env.authority.authority_grant_id,
             "expected_meta_revision": None,
             "causal_parent_action_id": None,
             "payload_type": "operations.backup/v1",
@@ -347,9 +363,10 @@ def test_operations_surface_over_wire(tmp_path):
             "auth_issued_at_us": None,
             "auth_signature": None,
         }
+        signed_request = pub.CommandRequest(command_envelope_jcs=encode_command(sign_command(CommandEnvelope(**envelope), env.authority)).encode())
         response = await env.client.call(
             "agent_meta.public.v1.Operations.Backup",
-            pub.CommandRequest(command_envelope_jcs=json.dumps(envelope).encode()),
+            signed_request,
             pub.MutationResponse,
         )
         resource = json.loads(bytes(response.resource_jcs))
@@ -376,18 +393,46 @@ def test_operations_surface_over_wire(tmp_path):
             "SELECT COUNT(*) FROM facts WHERE event_type = 'backup_created'"
         ).fetchone()[0]
         assert facts == 1
+        replay = await env.client.call("agent_meta.public.v1.Operations.Backup", signed_request, pub.MutationResponse)
+        assert replay == response
+        assert env.conn.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 1
+        assert env.conn.execute("SELECT COUNT(*) FROM authority_uses WHERE use_kind='command'").fetchone()[0] == 1
+
+        # Fresh unsigned operator IDs cannot create another backup operation.
+        envelope["command_id"] = "task://" + new_uuid7()
+        with pytest.raises(StableError) as denied:
+            await env.client.call("agent_meta.public.v1.Operations.Backup",
+                pub.CommandRequest(command_envelope_jcs=encode_command(CommandEnvelope(**envelope)).encode()), pub.MutationResponse)
+        assert denied.value.code == ErrorCode.AUTHORITY_DENIED
+        assert env.conn.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 1
+
+        from dataclasses import replace
+        orphan = _seed_orphan(env.conn, env.cas, age_us=DAY + 1, tag=b"wire-gc-orphan")
+        async def mutate(method, payload_type, payload):
+            current = env.conn.execute("SELECT current_meta_revision FROM realms").fetchone()[0]
+            command = replace(CommandEnvelope(**envelope), command_id="task://" + new_uuid7(),
+                              payload_type=payload_type, payload={**payload, "expected_meta_revision": current})
+            request = pub.CommandRequest(command_envelope_jcs=encode_command(sign_command(command, env.authority)).encode())
+            return request, await env.client.call(method, request, pub.MutationResponse)
+        _, planned = await mutate("agent_meta.public.v1.Operations.GcPlan", "operations.gc-plan/v1", {})
+        plan_id = json.loads(planned.resource_jcs)["plan_artifact_id"]
+        apply_request, applied = await mutate("agent_meta.public.v1.Operations.GcApply", "operations.gc-apply/v1", {"gc_plan_artifact_id": plan_id})
+        assert orphan in json.loads(applied.resource_jcs)["quarantined"]
+        assert await env.client.call("agent_meta.public.v1.Operations.GcApply", apply_request, pub.MutationResponse) == applied
+        assert env.conn.execute("SELECT COUNT(*) FROM facts WHERE event_type='artifact_gc_quarantined'").fetchone()[0] == 1
 
     class Env:
         pass
 
     async def body():
         data_dir = tmp_path / "wire-data"
-        data_dir.mkdir()
+        run_init(data_dir, insecure_dev_credential_file=os.name != 'nt')
         env = Env()
         env.db_path = data_dir / "meta.db"
-        env.conn = initialize_store(env.db_path)
+        env.conn = connect_store(env.db_path)
         env.realm = REALM
-        bootstrap_realm(env.conn, env.realm, "epoch://" + new_uuid7())
+        operator, signer = operator_signing_authority(data_dir, allow_insecure=os.name != 'nt')
+        env.authority = CommandAuthority(operator["actor_id"], operator["authority_grant_id"], signer)
         env.cas = FilesystemCas(data_dir)
         env.staging = ChunkedStaging(env.cas, now_us=lambda: time.time_ns() // 1000)
         handlers = PublicApiHandlers(

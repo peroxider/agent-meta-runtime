@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent_meta_runtime.adapters.store.reconciliation import SqliteReconcilePersistence
 import pytest
 
 from agent_meta_runtime.adapters.store import SetServingRequest, set_serving
@@ -64,6 +65,19 @@ def _install(conn, name="org.example.harness", version="0.1.0") -> str:
 
 
 def _activate(conn, harness_id: str, revision: int | None = None) -> dict:
+    from agent_meta_runtime.adapters.store.authority import RootBootstrapRequest, bootstrap_root
+    from agent_meta_runtime.adapters.crypto import Ed25519KeyPair
+    root = conn.execute("SELECT grant_id FROM authority_grants WHERE subject_id=? AND parent_grant_id IS NULL", (ACTOR,)).fetchone()
+    if root is None:
+        _seed_if_missing(conn, artifact_id("authority-bootstrap"))
+        conn.commit()
+        receipt = _run(conn, bootstrap_root(RootBootstrapRequest(
+            REALM, conn.execute("SELECT epoch_id FROM realms").fetchone()[0], ACTOR,
+            Ed25519KeyPair.from_private_bytes(bytes(range(32))).public_bytes_raw(), "a" * 64,
+            constitution_artifact_id=artifact_id("authority-bootstrap"),
+            meta_root_artifact_id=artifact_id("authority-bootstrap"),
+        )))
+        root = (receipt["grant_id"],)
     body = {"schema": "composition/v1", "realm_id": REALM, "slots": []}
     return _run(
         conn,
@@ -71,7 +85,7 @@ def _activate(conn, harness_id: str, revision: int | None = None) -> dict:
             ActivateHarnessRequest(
                 harness_id=harness_id,
                 composition_body=body,
-                issuer_grant_id=ACTOR,
+                issuer_grant_id=root[0],
                 scoped_grants=(
                     ScopedGrantSpec(
                         subject_id=ACTOR,
@@ -248,7 +262,7 @@ def test_deactivate_drains_to_revision_zero_and_settles(store):
     assert refs[0] == 0 and refs[1] == 1  # desired cleared, serving not yet drained
 
     reconciler = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=lambda request: {},
         drain_executor=lambda request: None,
@@ -290,13 +304,13 @@ def test_uninstall_refuses_active_serving_harness(store):
     )
     assert getattr(result, "error", None) is not None
     assert result.error.code == ErrorCode.FAILED_PRECONDITION
-    # any realm composition reference (even another harness's) blocks uninstall
+    # An unrelated installation is removable while another one serves.
     other = _install(conn, "org.example.b", "1.0.0")
     result = execute_command_result(
         conn, uninstall_harness(UninstallHarnessRequest(harness_id=other))
     )
-    assert getattr(result, "error", None) is not None
-    assert result.error.code == ErrorCode.FAILED_PRECONDITION
+    assert getattr(result, "error", None) is None
+    assert result.receipt["status"] == "UNINSTALLED"
 
 
 def test_install_requires_known_harness_for_lifecycle_ops(store):
@@ -306,3 +320,77 @@ def test_install_requires_known_harness_for_lifecycle_ops(store):
     )
     assert getattr(result, "error", None) is not None
     assert result.error.code == ErrorCode.NOT_FOUND
+
+
+def test_same_installation_reactivation_revokes_old_grants_and_keeps_current_generation(store):
+    conn, _, _ = store
+    harness_id = _install(conn)
+    first = _activate(conn, harness_id)
+    _serve(conn, first["revision"], first["composition_id"])
+    second = _activate(conn, harness_id)
+    _serve(conn, second["revision"], second["composition_id"])
+    statuses = lambda receipt: [conn.execute("SELECT status FROM authority_grants WHERE grant_id=?", (gid,)).fetchone()[0] for gid in receipt["grant_ids"]]
+    assert statuses(first) == ["REVOKED"]
+    assert statuses(second) == ["ACTIVE"]
+    assert conn.execute("SELECT status,active_composition_id FROM harness_installations WHERE harness_id=?", (harness_id,)).fetchone() == ("ACTIVE", second["composition_id"])
+
+
+def test_deactivation_retires_both_serving_and_pending_activation_grants(store):
+    conn, _, _ = store
+    harness_id = _install(conn)
+    serving = _activate(conn, harness_id)
+    _serve(conn, serving["revision"], serving["composition_id"])
+    pending = _activate(conn, harness_id)
+    _run(conn, deactivate_harness(DeactivateHarnessRequest(harness_id)))
+    outcome = Reconciler(conn, persistence=SqliteReconcilePersistence(), realm_id=REALM,
+        slot_executor=lambda request: {}, drain_executor=lambda request: None).run_reconcile()
+    assert outcome.status == "DRAINED"
+    assert all(conn.execute("SELECT status FROM authority_grants WHERE grant_id=?", (gid,)).fetchone()[0] == "REVOKED"
+        for gid in (*serving["grant_ids"], *pending["grant_ids"]))
+
+
+@pytest.mark.parametrize("pin", ["desired", "serving", "realized", "task", "instance", "state", "capability_state", "effect_unknown"])
+def test_uninstall_keeps_each_owned_reference_guard(store, pin):
+    from agent_meta_runtime.domain.ids import new_uuid7
+    from agent_meta_runtime.domain.canonical import canonical_json
+    conn, _, _ = store
+    harness_id = _install(conn)
+    activation = _activate(conn, harness_id)
+    composition = activation["composition_id"]
+    package = conn.execute("SELECT package_artifact_id FROM harness_installations WHERE harness_id=?", (harness_id,)).fetchone()[0]
+    # Runtime-owned reference fixtures test the guard, not actual execution.
+    conn.execute("UPDATE composition_refs SET desired_revision=0,serving_revision=0,realized_revision=0 WHERE realm_id=?", (REALM,))
+    if pin in ("desired", "serving", "realized"):
+        columns = {"desired": "desired_revision", "serving": "serving_revision", "realized": "realized_revision"}
+        conn.execute(f"UPDATE composition_refs SET {columns[pin]}=? WHERE realm_id=?", (activation["revision"], REALM))
+    elif pin == "task":
+        conn.execute("INSERT INTO capability_surfaces(realm_id,surface_revision,composition_id,artifact_id,authority_fingerprint,backend_profile_hash,created_at_us) VALUES (?,1,?,?,'fixture','fixture',1)",
+            (REALM, composition, package))
+        conn.execute("INSERT INTO tasks(task_id,realm_id,actor_id,input_artifact_id,serving_composition_id,serving_revision,capability_surface_revision,capability_surface_artifact_id,state_snapshot_json,budget_json,consumed_budget_json,root_action_id,status,accepted_at_us) VALUES (?,?,?,?,?,1,1,?,?,?,?,?,'ACCEPTED',1)",
+            ("task://" + new_uuid7(), REALM, ACTOR, package, composition, package, canonical_json({}), canonical_json({}), canonical_json({}), "action://" + new_uuid7()))
+    elif pin == "instance":
+        conn.execute("INSERT INTO capabilities(capability_id,descriptor_revision,artifact_id,descriptor_json,created_at_us) VALUES ('capability://fixture',1,?,?,1)",
+            (package, canonical_json({})))
+        conn.execute("INSERT INTO capability_instances(instance_id,realm_id,capability_id,descriptor_revision,composition_id,placement,trust_class,status,created_at_us,updated_at_us) VALUES (?,?, 'capability://fixture',1,?,'in_process','builtin_or_signed','ACTIVE',1,1)",
+            ("instance://" + new_uuid7(), REALM, composition))
+    elif pin in ("state", "capability_state"):
+        state, revision = "state://" + new_uuid7(), "state-revision://" + new_uuid7()
+        owner = composition
+        if pin == "capability_state":
+            owner = "capability://fixture"
+            conn.execute("INSERT INTO capabilities(capability_id,descriptor_revision,artifact_id,descriptor_json,created_at_us) VALUES (?,1,?,?,1)",
+                (owner, package, canonical_json({})))
+        conn.execute("INSERT INTO state_revisions(state_revision_id,state_id,owner_id,schema_id,artifact_id,created_by,created_at_us) VALUES (?,?,?,?,?,?,1)",
+            (revision, state, owner, package, package, ACTOR))
+        conn.execute("INSERT INTO managed_states(state_id,owner_id,schema_id,current_revision_id,cas_revision,status,updated_at_us) VALUES (?,?,?,?,1,'ACTIVE',1)",
+            (state, owner, package, revision))
+    else:
+        action = "action://" + new_uuid7()
+        conn.execute("INSERT INTO actions(action_id,actor_id,intent,composition_id,status,budget_json,consumed_budget_json,created_at_us) VALUES (?,?,'guard fixture',?,'RUNNING',?,?,1)",
+            (action, ACTOR, composition, canonical_json({}), canonical_json({})))
+        conn.execute("INSERT INTO effect_intents(effect_intent_id,action_id,kind,target_scope_json,idempotency_class,reversibility,required_permissions_json,required_features_json,reservation_json,request_id,status,created_at_us) VALUES (?,?,'guard-fixture',?,'NONE','IRREVERSIBLE',?,?,?,?, 'UNKNOWN',1)",
+            ("effect://" + new_uuid7(), action, canonical_json({}), canonical_json([]), canonical_json([]), canonical_json({}), new_uuid7()))
+    conn.commit()
+    result = execute_command_result(conn, uninstall_harness(UninstallHarnessRequest(harness_id)))
+    assert getattr(result, "error", None) is not None and result.error.code == ErrorCode.FAILED_PRECONDITION
+    assert conn.execute("SELECT status FROM harness_installations WHERE harness_id=?", (harness_id,)).fetchone()[0] == "INSTALLED"

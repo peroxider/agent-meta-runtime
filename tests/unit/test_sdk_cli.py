@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 
 import pytest
 
 from agent_meta_runtime.domain.errors import ErrorCode
 from agent_meta_runtime.interfaces.cli import build_parser, main
 from agent_meta_runtime.sdk import AgentMetaClient
-from tests.unit.test_local_server import LocalEnv, run_env
+from test_local_server import LocalEnv, run_env
 
 
 class SdkTransport:
@@ -27,7 +28,7 @@ class SdkTransport:
 
 def test_sdk_get_info_and_task_submit(tmp_path):
     async def test(env):
-        client = AgentMetaClient(SdkTransport(env.client))
+        client = AgentMetaClient(SdkTransport(env.client), authority=env.authority)
         try:
             info = await client.get_info()
             assert info.core_ready and info.serving_ready
@@ -38,6 +39,8 @@ def test_sdk_get_info_and_task_submit(tmp_path):
                 budget={"max_turns": 3},
             )
             assert handle.status == "ACCEPTED" and handle.task_id
+            execution = await client.get_task_execution(handle.task_id)
+            assert execution["status"] == "ACCEPTED" and execution["invocations"] == execution["projections"] == []
             view = await client.get_view()
             assert view["realm_id"] == env.realm
             refs = await client.get_refs()
@@ -52,7 +55,7 @@ def test_sdk_get_info_and_task_submit(tmp_path):
 
 def test_sdk_artifact_upload_via_two_phase(tmp_path):
     async def test(env):
-        client = AgentMetaClient(SdkTransport(env.client))
+        client = AgentMetaClient(SdkTransport(env.client), authority=env.authority)
         try:
             content = json.dumps(
                 {
@@ -89,12 +92,13 @@ def test_cli_info_json_envelope(tmp_path, capsys):
             [
                 "--data-dir", str(env.tmp_path),
                 "--output", "json",
+                *(["--insecure-dev-credential-file"] if os.name != "nt" else []),
                 "info",
             ],
         )
         assert code == 0
         envelope = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-        assert envelope["api_version"] == "1.0"
+        assert envelope["api_version"] == "1.9"
         assert envelope["ok"] is True
         assert envelope["result"]["ready"] == envelope["result"]["core_ready"]
 
@@ -110,6 +114,7 @@ def test_cli_dry_run_submit_has_no_side_effect(tmp_path, capsys):
             [
                 "--data-dir", str(env.tmp_path),
                 "--output", "json",
+                *(["--insecure-dev-credential-file"] if os.name != "nt" else []),
                 "--dry-run",
                 "task", "submit", "--input-artifact", env.input_artifact,
             ],
@@ -133,6 +138,7 @@ def test_cli_exit_code_not_found(tmp_path, capsys):
             [
                 "--data-dir", str(env.tmp_path),
                 "--output", "json",
+                *(["--insecure-dev-credential-file"] if os.name != "nt" else []),
                 "task", "get", "task://does-not-exist",
             ],
         )

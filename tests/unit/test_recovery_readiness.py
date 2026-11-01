@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from agent_meta_runtime.adapters.store.reconciliation import SqliteReconcilePersistence
 import pytest
 
 from agent_meta_runtime.adapters.store import (
@@ -55,15 +56,11 @@ def _ready_probes():
 
 
 def _seed_root_grant(conn):
-    conn.execute(
-        "INSERT INTO authority_grants(grant_id, epoch_id, issuer_id, subject_id,"
-        " parent_grant_id, permissions_json, scope_json, constraints_json,"
-        " delegable, delegation_depth, status, issued_at_us)"
-        " VALUES ('grant://root', (SELECT epoch_id FROM realms WHERE realm_id=?),"
-        " ?, ?, NULL, ?, ?, ?, 1, 0, 'ACTIVE', ?)",
-        (REALM, ACTOR, ACTOR, b'["*"]', b'{"realm_id":"realm://main"}', b"{}", NOW_US),
-    )
-    conn.commit()
+    from agent_meta_runtime.adapters.store.authority import RootBootstrapRequest, bootstrap_root
+    run_command(conn, bootstrap_root(RootBootstrapRequest(
+        realm_id=REALM, epoch_id=conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (REALM,)).fetchone()[0],
+        principal_id=ACTOR, public_key=b"\x01" * 32, recovery_code_hash="a" * 64,
+    )))
 
 
 def _seed_desired(conn):
@@ -106,7 +103,7 @@ def test_unknown_cycle_blocks_core_ready(rstore):
     def executor(step):
         raise UnknownOutcomeError("mystery")
 
-    rc = Reconciler(conn, realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes())
+    rc = Reconciler(conn, persistence=SqliteReconcilePersistence(), realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes())
     assert rc.run_reconcile().status == "UNKNOWN"
     snap = ReadinessEvaluator(conn, realm_id=REALM, db_path=tmp_path / "meta.db").evaluate()
     assert snap.core_ready is False
@@ -120,7 +117,7 @@ def test_recovered_cycle_restores_serving_readiness(rstore):
     assert evaluator.evaluate().serving_ready is False
 
     rc = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=lambda step: {"instance_id": "instance://m", "state_bindings": []},
         drain_executor=lambda ctx: {"forced": False},
@@ -138,7 +135,7 @@ def test_recovery_redrives_unknown_after_applied_inspection(rstore):
     def executor(step):
         raise UnknownOutcomeError("mystery")
 
-    rcu = Reconciler(conn, realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes())
+    rcu = Reconciler(conn, persistence=SqliteReconcilePersistence(), realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes())
     assert rcu.run_reconcile().status == "UNKNOWN"
     dispatcher = OutboxDispatcher(conn, handlers={})
 
@@ -157,7 +154,7 @@ def test_recovery_redrives_unknown_after_applied_inspection(rstore):
     co2 = RecoveryCoordinator(
         conn, realm_id=REALM,
         reconciler=Reconciler(
-            conn,
+            conn, persistence=SqliteReconcilePersistence(),
             realm_id=REALM,
             slot_executor=lambda step: {"instance_id": "instance://m", "state_bindings": []},
             drain_executor=lambda ctx: {"forced": False},
@@ -184,7 +181,7 @@ def test_recovery_reconciles_resumable_cycle(rstore):
         conn,
         realm_id=REALM,
         reconciler=Reconciler(
-            conn,
+            conn, persistence=SqliteReconcilePersistence(),
             realm_id=REALM,
             slot_executor=lambda step: {"instance_id": "instance://m", "state_bindings": []},
             drain_executor=lambda ctx: {"forced": False},
@@ -221,7 +218,7 @@ def test_orphan_quarantine_marks_operations_and_bindings(rstore):
         conn,
         realm_id=REALM,
         reconciler=Reconciler(
-            conn, realm_id=REALM, slot_executor=lambda step: {}, probe_runner=_ready_probes()
+            conn, persistence=SqliteReconcilePersistence(), realm_id=REALM, slot_executor=lambda step: {}, probe_runner=_ready_probes()
         ),
         outbox_dispatcher=dispatcher,
         now_us=lambda: NOW_US,

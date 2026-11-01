@@ -33,6 +33,21 @@ def test_put_and_open_round_trip(tmp_path) -> None:
     assert cas.open_blob(relpath, digest, len(data)) == data
 
 
+def test_staging_preserves_every_binary_byte_and_completes_short_writes(tmp_path, monkeypatch):
+    import os
+
+    cas = FilesystemCas(tmp_path)
+    data = bytes(range(256)) * 17
+    write = os.write
+
+    def short_write(fd, chunk):
+        return write(fd, chunk[:19])
+
+    monkeypatch.setattr(os, "write", short_write)
+    path = cas.put(data)
+    assert cas.open_blob(path, sha256_hex(data), len(data)) == data
+
+
 def test_put_with_wrong_expected_hash_fails(tmp_path) -> None:
     cas = FilesystemCas(tmp_path)
     with pytest.raises(StableError) as exc:
@@ -80,14 +95,26 @@ def test_open_blob_detects_corruption(tmp_path) -> None:
 
 
 def test_rejects_traversal_and_symlink(tmp_path) -> None:
+    import os
+    import subprocess
+
     cas = FilesystemCas(tmp_path)
-    for bad in ("../escape", "a/../../b", "/abs/path"):
+    for bad in ("../escape", "a/../../b", "/abs/path", "a\\..\\b", "file:stream", "a//b"):
         with pytest.raises(StableError):
             cas.absolute_path(bad)
     real = cas.put(b"real")
     link = cas.artifacts_dir / "sha256" / "li" / "nk"
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(cas.artifacts_dir / real)
+    if os.name == "nt":
+        # File symlinks require a Windows privilege that CI users may lack.
+        # An actual directory junction exercises the same reparse-point denial
+        # without skipping the required path-boundary proof.
+        environment = dict(os.environ, AMR_TEST_LINK_PATH=str(link), AMR_TEST_TARGET_PATH=str((cas.artifacts_dir / real).parent))
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "New-Item -ItemType Junction -Path $env:AMR_TEST_LINK_PATH -Target $env:AMR_TEST_TARGET_PATH -ErrorAction Stop | Out-Null"], env=environment, capture_output=True, text=True, errors="replace", timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+        assert result.returncode == 0, result.stderr
+        assert link.is_junction()
+    else:
+        link.symlink_to(cas.artifacts_dir / real)
     with pytest.raises(StableError) as exc:
         cas.absolute_path("sha256/li/nk")
     assert exc.value.code == ErrorCode.INTEGRITY_ERROR
@@ -161,7 +188,7 @@ def _tamper(store, statements) -> Path:
             ],
             "swapped",
         ),
-        (["UPDATE realms SET fact_head_hash = 'f' || substr(fact_head_hash, 2)"], "head"),
+        (["UPDATE realms SET fact_head_hash = CASE substr(fact_head_hash, 1, 1) WHEN 'f' THEN 'e' ELSE 'f' END || substr(fact_head_hash, 2)"], "head"),
     ],
 )
 def test_tampered_fact_detected(healthy_store, statements, label) -> None:

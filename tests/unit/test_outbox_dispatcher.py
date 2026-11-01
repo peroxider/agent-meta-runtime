@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import time
 
 import pytest
@@ -12,6 +13,7 @@ from agent_meta_runtime.adapters.store.uow import bootstrap_realm
 from agent_meta_runtime.application.outbox import DeliveryError, OutboxDispatcher
 from agent_meta_runtime.domain.clock import ClockStabilityMonitor
 from agent_meta_runtime.domain.ids import new_uuid7
+from agent_meta_runtime.domain.errors import StableError, ErrorCode
 from agent_meta_runtime.domain.outbox import outbox_dedupe_key
 
 REALM = "realm://main"
@@ -41,6 +43,35 @@ def test_delivery_commits_terminal_state(odb):
     results = d.poll_once()
     assert results[0]["outcome"] == "DELIVERED"
     assert odb.execute("SELECT state FROM outbox WHERE outbox_id='ob-1'").fetchone()[0] == "DELIVERED"
+
+
+def test_async_delivery_releases_transaction_and_cancel_abandons_lease(odb):
+    _insert(odb, "async-1", "RECONCILE_REQUEST", "async-key")
+    odb.commit()
+    async def scenario():
+        entered = asyncio.Event()
+        async def waiting(item):
+            assert not odb.in_transaction
+            entered.set()
+            await asyncio.Event().wait()
+        dispatcher = OutboxDispatcher(odb, handlers={"RECONCILE_REQUEST": waiting})
+        pending = asyncio.create_task(dispatcher.poll_once_async())
+        await asyncio.wait_for(entered.wait(), 1)
+        assert odb.execute("SELECT state FROM outbox WHERE outbox_id='async-1'").fetchone()[0] == "LEASED"
+        with pytest.raises(StableError) as busy:
+            await dispatcher.poll_once_async()
+        assert busy.value.code == ErrorCode.ALREADY_RUNNING
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not odb.in_transaction
+        assert odb.execute("SELECT state,lease_owner FROM outbox WHERE outbox_id='async-1'").fetchone() == ("PENDING", None)
+        async def success(item):
+            assert not odb.in_transaction
+        dispatcher._handlers["RECONCILE_REQUEST"] = success
+        delivered = await dispatcher.poll_once_async()
+        assert delivered[0]["outcome"] == "DELIVERED"
+    asyncio.run(scenario())
 
 
 def test_foreign_lease_recovery_resets_to_pending(odb):

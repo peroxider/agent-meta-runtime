@@ -59,7 +59,7 @@ def _bootstrap(conn) -> str:
         bootstrap_root(
             RootBootstrapRequest(
                 realm_id=REALM,
-                epoch_id="epoch://e-cc",
+                epoch_id=conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (REALM,)).fetchone()[0],
                 principal_id=ACTOR,
                 public_key=b"\x01" * 32,
                 recovery_code_hash="a" * 64,
@@ -302,6 +302,17 @@ def test_signature_preimages_are_stable():
         )
 
 
+def test_bootstrap_rejects_different_realm_epoch_without_creating_authority(store):
+    conn, realm, _tmp = store
+    result = execute_command_result(conn, bootstrap_root(RootBootstrapRequest(
+        realm_id=realm, epoch_id="epoch://different", principal_id=ACTOR,
+        public_key=b"\x01" * 32, recovery_code_hash="a" * 64,
+    )))
+    assert result.error.code == ErrorCode.AUTHORITY_DENIED
+    assert conn.execute("SELECT COUNT(*) FROM authority_grants").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM principals").fetchone()[0] == 0
+
+
 def test_bootstrap_root_and_repeat_init_refused(store):
     conn, _realm, _tmp = store
     root_grant_id = _bootstrap(conn)
@@ -309,7 +320,7 @@ def test_bootstrap_root_and_repeat_init_refused(store):
     epoch_row = conn.execute(
         "SELECT epoch_id, ordinal FROM epochs WHERE realm_id = ?", (REALM,)
     ).fetchone()
-    assert epoch_row[0] == "epoch://e-cc"
+    assert epoch_row[0] == conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (REALM,)).fetchone()[0]
     principal_row = conn.execute(
         "SELECT kind, public_identity_json FROM principals WHERE principal_id = ?",
         (ACTOR,),

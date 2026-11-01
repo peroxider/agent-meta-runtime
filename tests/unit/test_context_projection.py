@@ -32,8 +32,8 @@ def test_ladder_allocates_caps_and_rolls_remainder():
     assert alloc.granted["task_input"] == 300
     assert alloc.granted["capability_schema"] == 50
     assert alloc.granted["state_summary"] == 0
-    # facts took its 100 plus all 450 unused by the earlier segments.
-    assert alloc.granted["facts"] == 550
+    # Unused quota reaches the next section; an allocation never invents need.
+    assert alloc.granted["facts"] == 100
     assert alloc.rejected is None
 
 
@@ -45,14 +45,14 @@ def test_required_full_overflow_rejects():
     ladder = _ladder(task_input=9999, facts=0)
     alloc = allocate_budget(1000, ladder)
     assert alloc.rejected is None
-    assert alloc.granted["task_input"] == 300
+    assert alloc.granted["task_input"] == 500  # unused system quota rolls here
 
 
 def test_absent_segments_get_zero():
     alloc = allocate_budget(100, _ladder(facts=10))
     assert alloc.granted["system"] == 0
     assert alloc.granted["capability_schema"] == 0
-    assert alloc.granted["facts"] == 100  # everything rolls down
+    assert alloc.granted["facts"] == 10
 
 
 def test_unknown_segment_rejected():
@@ -114,6 +114,12 @@ def test_manifest_identity_ignores_extensions():
     m2 = _manifest(extensions={"x_note": "anything"})
     assert m1.identity_hash() == m2.identity_hash()
     assert projection_identity(m1) == projection_identity(m2)
+    fields = m1.required_fields()
+    assert set(fields) == {"projection_id", "policy_artifact_id", "composition_id", "meta_revision", "source_refs",
+        "sections", "redaction_policy_artifact_id", "tokenizer_id", "total_tokens", "budget_tokens"}
+    assert set(fields["sections"][0]) == {"section_id", "renderer", "output_artifact_id", "token_count"}
+    from agent_meta_runtime.domain.canonical import canonical_json, sha256_hex
+    assert m1.identity_hash() == sha256_hex(canonical_json(fields))
 
 
 def test_manifest_rejects_over_budget_and_bad_ids():

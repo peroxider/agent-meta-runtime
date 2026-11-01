@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from contextvars import ContextVar
 
 import pytest
 
@@ -17,11 +18,14 @@ from agent_meta_runtime.protocols._v1 import execution_backend_pb2 as eb
 from agent_meta_runtime.protocols._v1 import transport_pb2 as transport
 
 
+_SESSION = ContextVar("memory_backend_contract_session", default=None)
+
+
 def make_request(rid, *, payload=None, scope="t", rev="REVERSIBLE", kind="test.echo",
-                 session="sess"):
+                 session=None):
     body = json.dumps(payload if payload is not None else {"hello": "world"}, sort_keys=True).encode()
     return eb.ExecutionRequest(
-        session_id=session,
+        session_id=session if session is not None else (_SESSION.get() or "unnegotiated"),
         realm_id="realm://main",
         request_id=rid,
         operation_kind=kind,
@@ -40,6 +44,13 @@ def make_hello(*required):
         client_instance_id="test",
         required_features=required,
     )
+
+
+async def opened_backend(*args, **kwargs):
+    backend = InMemoryBackend(*args, **kwargs)
+    session = await backend.negotiate(make_hello())
+    _SESSION.set(session.session_id)
+    return backend
 
 
 def test_capabilities_are_honest() -> None:
@@ -61,7 +72,7 @@ async def test_negotiate_grants_features() -> None:
 
 
 async def test_submit_run_and_result_hash() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     request = make_request("req-1")
     handle = await backend.submit(request)
     assert handle.request_id == "req-1"
@@ -76,7 +87,7 @@ async def test_submit_run_and_result_hash() -> None:
 
 
 async def test_submit_idempotent_replay_and_hash_conflict() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     handle = await backend.submit(make_request("req-1"))
     replay = await backend.submit(make_request("req-1"))
     assert replay.opaque_handle == handle.opaque_handle
@@ -86,7 +97,7 @@ async def test_submit_idempotent_replay_and_hash_conflict() -> None:
 
 
 async def test_payload_hash_mismatch_rejected() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     request = make_request("req-1")
     request.payload_hash = "0" * 64
     with pytest.raises(StableError) as exc:
@@ -95,7 +106,7 @@ async def test_payload_hash_mismatch_rejected() -> None:
 
 
 async def test_high_risk_reversibility_rejected() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     for rev in ("IRREVERSIBLE", "UNKNOWN"):
         with pytest.raises(StableError) as exc:
             await backend.submit(make_request(f"req-{rev}", rev=rev))
@@ -103,7 +114,7 @@ async def test_high_risk_reversibility_rejected() -> None:
 
 
 async def test_unregistered_operation_kind_rejected() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     with pytest.raises(StableError) as exc:
         await backend.submit(make_request("req-1", kind="fs.real_write"))
     assert exc.value.code == ErrorCode.FEATURE_UNAVAILABLE
@@ -114,7 +125,7 @@ async def test_cancel_graceful_and_force_unknown() -> None:
         await asyncio.sleep(30)
         return "SUCCEEDED", b"{}", b"{}"
 
-    backend = InMemoryBackend(executor=slow)
+    backend = await opened_backend(executor=slow)
     handle = await backend.submit(make_request("req-slow"))
     report = await backend.cancel(eb.CancelRequest(handle=handle, mode="GRACEFUL"))
     assert report.terminal_confirmed
@@ -130,7 +141,7 @@ async def test_cancel_graceful_and_force_unknown() -> None:
 
 
 async def test_stale_incarnation_cannot_commit() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     handle = await backend.submit(make_request("req-1"))
     await backend.await_activity(handle, 0)
     backend.renew_incarnation("req-1", "t")
@@ -147,7 +158,7 @@ async def test_await_deadline_exceeded_carries_status() -> None:
         await asyncio.sleep(30)
         return "SUCCEEDED", b"{}", b"{}"
 
-    backend = InMemoryBackend(executor=slow)
+    backend = await opened_backend(executor=slow)
     state = backend.state
     handle = await backend.submit(make_request("req-1"))
     with pytest.raises(StableError) as exc:
@@ -162,25 +173,25 @@ async def test_durable_fake_state_restart_recovers() -> None:
         return "SUCCEEDED", b"{}", b"{}"
 
     state = DurableFakeBackendState()
-    backend = InMemoryBackend(state, executor=slow)
+    backend = await opened_backend(state, executor=slow)
     handle = await backend.submit(make_request("req-live"))
     raw = state.to_bytes()
 
     restored_state = DurableFakeBackendState()
     restored_state.restore_bytes(raw)
-    restored = InMemoryBackend(restored_state)
+    restored = await opened_backend(restored_state)
     # replayed submit on a live-less RUNNING record re-spawns (recovery)
     handle2 = await restored.submit(make_request("req-live"))
     assert handle2.request_id == "req-live"
     assert handle2.incarnation >= handle.incarnation
     # unknown request ids still 404
     with pytest.raises(StableError) as exc:
-        await restored.inspect(eb.ExecutionHandle(opaque_handle=b"nope", incarnation=1))
+        await restored.inspect(eb.ExecutionHandle(backend_id="backend://inmemory", session_id=_SESSION.get(), opaque_handle=b"nope", incarnation=1))
     assert exc.value.code == ErrorCode.NOT_FOUND
 
 
 async def test_reconcile_bindings_and_orphans() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     handle = await backend.submit(make_request("req-1"))
     await backend.await_activity(handle, 0)
 
@@ -191,7 +202,7 @@ async def test_reconcile_bindings_and_orphans() -> None:
     backend._executor = slow
     await backend.submit(make_request("req-orphan"))
     report = await backend.reconcile(
-        eb.ReconcileRequest(session_id="sess", realm_id="realm://main",
+        eb.ReconcileRequest(session_id=_SESSION.get(), realm_id="realm://main",
                             known=[eb.KnownBinding(request_id="req-1")])
     )
     assert len(report.bindings) == 1
@@ -202,17 +213,17 @@ async def test_reconcile_bindings_and_orphans() -> None:
 
 
 async def test_acknowledge_terminal_hash_checked() -> None:
-    backend = InMemoryBackend()
+    backend = await opened_backend()
     handle = await backend.submit(make_request("req-1"))
     result = await backend.await_activity(handle, 0)
     ack = await backend.acknowledge_terminal(
-        eb.TerminalAck(session_id="sess", request_id="req-1",
+        eb.TerminalAck(session_id=_SESSION.get(), request_id="req-1",
                        result_hash=result.result_hash)
     )
     assert ack.status == "ACKNOWLEDGED"
     with pytest.raises(StableError) as exc:
         await backend.acknowledge_terminal(
-            eb.TerminalAck(session_id="sess", request_id="req-1", result_hash="0" * 64)
+            eb.TerminalAck(session_id=_SESSION.get(), request_id="req-1", result_hash="0" * 64)
         )
     assert exc.value.code == ErrorCode.REVISION_CONFLICT
 

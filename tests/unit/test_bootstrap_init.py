@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 
 import pytest
@@ -22,9 +23,20 @@ def test_fresh_init_creates_complete_bootstrap(tmp_path):
     assert not report.reinitialized
     assert len(report.builtin_artifacts) == len(builtin_artifact_documents(REALM_ID))
 
-    # keys are 0600, data dir 0700
-    assert stat.S_IMODE((tmp_path / "keys" / "root.key").stat().st_mode) == 0o600
-    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    config = json.loads((tmp_path / "keys" / "store.json").read_bytes())
+    assert config["handles"] == report.details["key_handles"]
+    if os.name == "nt":
+        from agent_meta_runtime.adapters.windows_security import is_owner_only
+
+        assert report.feature_summary["credential_store"] == "WINDOWS_DPAPI_CURRENT_USER"
+        assert is_owner_only(tmp_path)
+        assert is_owner_only(tmp_path / "keys")
+        key_files = list((tmp_path / "keys").glob("*.dpapi"))
+        assert len(key_files) == 2 and all(is_owner_only(path) for path in key_files)
+        assert not list((tmp_path / "keys").glob("*.key"))
+    else:
+        assert stat.S_IMODE(next((tmp_path / "keys").glob("*.key")).stat().st_mode) == 0o600
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
 
     import sqlite3
 
@@ -60,6 +72,13 @@ def test_fresh_init_creates_complete_bootstrap(tmp_path):
             "SELECT COUNT(*) FROM artifacts"
             " WHERE CAST(manifest_json AS TEXT) LIKE '%builtin%'"
         ).fetchone()[0] == len(report.builtin_artifacts)
+        from agent_meta_runtime.adapters.cas import FilesystemCas
+        from agent_meta_runtime.domain.canonical import canonical_json
+        cas = FilesystemCas(tmp_path)
+        for name, _kind, _media_type, document in builtin_artifact_documents(REALM_ID):
+            artifact_id = report.builtin_artifacts[name]
+            manifest = json.loads(conn.execute("SELECT manifest_json FROM artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()[0])
+            assert cas.open_blob(manifest["storage_relpath"], artifact_id.rsplit("/", 1)[1], manifest["size_bytes"]) == canonical_json(document)
     finally:
         conn.close()
 
@@ -74,6 +93,36 @@ def test_reinit_returns_existing_realm_without_new_secret(tmp_path):
     assert second.realm_id == first.realm_id == REALM_ID
     assert second.epoch_id == first.epoch_id
     assert second.recovery_code is None  # never shown twice
+
+
+@pytest.mark.parametrize("name", ["root", "service"])
+def test_reinit_rejects_decryptable_key_that_differs_from_committed_identity(tmp_path, name):
+    from agent_meta_runtime.adapters.credentials import open_key_store
+
+    run_init(tmp_path)
+    store, _ = open_key_store(tmp_path)
+    replacement = store.create(bytearray(b"x" * 32), purpose=f"{name}.ed25519")
+    config_path = tmp_path / "keys/store.json"
+    config = json.loads(config_path.read_bytes())
+    config["handles"][name] = replacement
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(StableError) as unavailable:
+        run_init(tmp_path)
+    assert unavailable.value.code == ErrorCode.KEY_UNAVAILABLE
+
+
+def test_init_orphan_cleanup_cannot_unlink_outside_data_directory(tmp_path):
+    outside = tmp_path / "preserve.txt"
+    outside.write_text("preserve")
+    data_dir = tmp_path / "runtime"
+    run_init(data_dir)
+    orphan = data_dir / "staging" / "orphan.bin"
+    orphan.parent.mkdir(exist_ok=True)
+    orphan.write_bytes(b"orphan")
+    (orphan.parent / "init-orphans.jcs").write_text(json.dumps({"paths": [str(outside), str(orphan)]}))
+    run_init(data_dir)
+    assert outside.read_text() == "preserve"
+    assert not orphan.exists()
 
 
 def test_init_rejects_nonempty_dir_without_db(tmp_path):

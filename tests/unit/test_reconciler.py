@@ -6,6 +6,7 @@ refs/state/history atomic cutover requirement.
 
 from __future__ import annotations
 
+from agent_meta_runtime.adapters.store.reconciliation import SqliteReconcilePersistence
 import pytest
 
 from agent_meta_runtime.adapters.store import (
@@ -157,7 +158,7 @@ def test_full_round_converges_refs_and_records_slot_facts(store):
         return _ok_executor(step)
 
     rc = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=executor,
         drain_executor=lambda ctx: {"forced": False},
@@ -172,7 +173,8 @@ def test_full_round_converges_refs_and_records_slot_facts(store):
     # slot facts committed in short transactions (E)
     degraded = conn.execute(
         "SELECT COUNT(*) FROM facts WHERE event_type='instance_degraded'"
-        " AND entity_id='instance://cache'"
+        " AND entity_id='cap-b'"
+        " AND json_extract(CAST(payload_json AS TEXT),'$.instance_id')='instance://cache'"
     ).fetchone()[0]
     assert degraded == 1
     # outbox item for the semantic transition exists exactly once
@@ -194,7 +196,7 @@ def test_failed_required_slot_preserves_old_serving(store):
         return _ok_executor(step)
 
     rc = Reconciler(
-        conn, realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes()
+        conn, persistence=SqliteReconcilePersistence(), realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes()
     )
     outcome = rc.run_reconcile()
     assert outcome.status == "FAILED" and outcome.reason_code == "SLOT_EXECUTOR_ERROR"
@@ -213,7 +215,7 @@ def test_unknown_outcome_marks_cycle_and_fact(store):
     def executor(step):
         raise UnknownOutcomeError("may or may not have committed")
 
-    rc = Reconciler(conn, realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes())
+    rc = Reconciler(conn, persistence=SqliteReconcilePersistence(), realm_id=REALM, slot_executor=executor, probe_runner=_ready_probes())
     outcome = rc.run_reconcile()
     assert outcome.status == "UNKNOWN"
     assert outcome.reason_code == "EXTERNAL_EFFECT_UNKNOWN"
@@ -230,7 +232,7 @@ def test_drain_failure_degrades_then_resume_converges(store):
     conn, realm, _tmp = store
     _seed_desired(conn)
     rc_fail = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=_ok_executor,
         drain_executor=lambda ctx: (_ for _ in ()).throw(RuntimeError("drain stuck")),
@@ -241,7 +243,7 @@ def test_drain_failure_degrades_then_resume_converges(store):
     assert _refs(conn) == (1, 1, 0, "DEGRADED")  # serving switched, realized held
 
     rc_ok = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=_ok_executor,
         drain_executor=lambda ctx: {"forced": False},
@@ -262,7 +264,7 @@ def test_converged_cycle_is_idempotent(store):
         return _ok_executor(step)
 
     rc = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=executor,
         drain_executor=lambda ctx: {"forced": False},
@@ -321,7 +323,7 @@ def test_state_binding_cutover_binds_state_and_serving_in_one_terminal_txn(store
         }
 
     rc = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=executor,
         drain_executor=lambda ctx: {"forced": False},
@@ -390,7 +392,7 @@ def test_stale_state_source_rolls_back_whole_cutover(store):
         }
 
     rc = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=first_executor,
         drain_executor=lambda ctx: {"forced": False},
@@ -459,7 +461,7 @@ def test_stale_state_source_rolls_back_whole_cutover(store):
         }
 
     rc2 = Reconciler(
-        conn,
+        conn, persistence=SqliteReconcilePersistence(),
         realm_id=REALM,
         slot_executor=stale_executor,
         drain_executor=lambda ctx: {"forced": False},

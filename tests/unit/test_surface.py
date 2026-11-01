@@ -113,7 +113,7 @@ def _env(store):
         bootstrap_root(
             RootBootstrapRequest(
                 realm_id=realm,
-                epoch_id="epoch://e-surf",
+                epoch_id=conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (realm,)).fetchone()[0],
                 principal_id=ACTOR,
                 public_key=b"\x01" * 32,
                 recovery_code_hash="a" * 64,

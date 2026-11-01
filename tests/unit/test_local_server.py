@@ -8,6 +8,7 @@ import json
 import struct
 import time
 import types
+from contextvars import ContextVar
 
 import pytest
 
@@ -15,7 +16,11 @@ from agent_meta_runtime.adapters.cas import FilesystemCas
 from agent_meta_runtime.adapters.store import bootstrap_realm, initialize_store
 from agent_meta_runtime.domain.errors import ErrorCode, StableError
 from agent_meta_runtime.domain.ids import new_uuid7
-from agent_meta_runtime.interfaces.local_api.connection import LocalConnection
+from agent_meta_runtime.domain.canonical import canonical_json
+from agent_meta_runtime.domain.envelope import CommandEnvelope
+from agent_meta_runtime.domain.deadline import Deadline
+from agent_meta_runtime.sdk import CommandAuthority, encode_command, sign_command
+from agent_meta_runtime.interfaces.local_api.connection import LocalConnection, open_local_streams
 from agent_meta_runtime.interfaces.local_api.handlers import PublicApiHandlers
 from agent_meta_runtime.interfaces.local_api.server import LocalApiServer
 from agent_meta_runtime.interfaces.local_api.staging import ChunkedStaging
@@ -24,15 +29,19 @@ from agent_meta_runtime.protocols._v1 import transport_pb2 as t
 from agent_meta_runtime.protocols.public_wire import encode_frame, parse_envelope
 
 ACTOR = "principal://operator-root/01900000-0000-7000-8000-000000000000"
+_AUTHORITY = ContextVar("local_api_test_authority", default=None)
 
 
-def make_envelope(realm, payload_type, payload):
-    return {
+def make_envelope(realm, payload_type, payload, *, expected_meta_revision=None):
+    authority = _AUTHORITY.get()
+    if authority is None:
+        raise RuntimeError("signed wire fixture must bind its authority")
+    body = {
         "command_id": "task://" + new_uuid7(),
         "realm_id": realm,
         "actor_id": ACTOR,
-        "authority_grant_id": None,
-        "expected_meta_revision": None,
+        "authority_grant_id": authority.authority_grant_id,
+        "expected_meta_revision": expected_meta_revision,
         "causal_parent_action_id": None,
         "payload_type": payload_type,
         "payload_schema_version": 1,
@@ -41,6 +50,7 @@ def make_envelope(realm, payload_type, payload):
         "auth_issued_at_us": None,
         "auth_signature": None,
     }
+    return json.loads(encode_command(sign_command(CommandEnvelope(**body), authority)))
 
 
 class LocalEnv:
@@ -84,7 +94,35 @@ class LocalEnv:
                 (self.realm,),
             )
         self.conn.commit()
+        self._bootstrap_test_authority()
         self.serving_ready = serving_ready
+
+    def _bootstrap_test_authority(self):
+        from agent_meta_runtime.adapters.crypto import Ed25519KeyPair
+        from agent_meta_runtime.adapters.store.authority import RootBootstrapRequest, bootstrap_root
+        from agent_meta_runtime.adapters.store.uow import execute_command
+        from agent_meta_runtime.adapters.credentials import InsecureDevCredentialStore, WindowsCredentialStore, write_store_config
+        import os
+
+        # Deterministic public fixture keys; this is Runtime's unit environment,
+        # never an installed external consumer's security/Host release proof.
+        pair = Ed25519KeyPair.from_private_bytes(bytes(range(32)))
+        epoch = self.conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (self.realm,)).fetchone()[0]
+        bootstrap = CommandEnvelope("task://" + new_uuid7(), self.realm, ACTOR, None, None, None, "runtime.init/v1", 1, {}, None, None, None)
+        result = execute_command(self.conn, bootstrap, bootstrap_root(RootBootstrapRequest(
+            self.realm, epoch, ACTOR, pair.public_bytes_raw(), "a" * 64,
+            constitution_artifact_id=self.input_artifact, meta_root_artifact_id=self.input_artifact,
+        )), deadline=Deadline.after(5_000_000))
+        assert not hasattr(result, "error")
+        self.authority = CommandAuthority(ACTOR, result.receipt["grant_id"], pair.sign)
+        self.conn.execute("INSERT INTO principals(principal_id,realm_id,kind,public_identity_json,status,created_at_us) VALUES (?,?,'SERVICE',?,'ACTIVE',1)",
+                          ("principal://service/01900000-0000-7000-8000-000000000001", self.realm, canonical_json({"algorithm": "Ed25519", "public_key_hex": pair.public_bytes_raw().hex()})))
+        self.conn.commit()
+        store_type = WindowsCredentialStore if os.name == "nt" else InsecureDevCredentialStore
+        store = store_type(self.tmp_path / "keys", create=True)
+        handles = {name: store.create(bytearray(pair.private_bytes_raw()), purpose=f"{name}.ed25519") for name in ("root", "service")}
+        write_store_config(store.root, profile=store.profile, handles=handles,
+                           operator={"actor_id": ACTOR, "authority_grant_id": self.authority.authority_grant_id, "public_key_hex": pair.public_bytes_raw().hex()})
 
     def readiness(self):
         return types.SimpleNamespace(
@@ -125,9 +163,11 @@ def run_env(test, tmp_path, *, serving_ready=True):
     async def body():
         env = LocalEnv(tmp_path, serving_ready=serving_ready)
         await env.start()
+        binding = _AUTHORITY.set(env.authority)
         try:
             return await test(env)
         finally:
+            _AUTHORITY.reset(binding)
             await env.stop()
 
     return asyncio.run(body())
@@ -150,7 +190,7 @@ def test_task_submit_gate_blocked_without_serving(tmp_path):
         envelope = make_envelope(
             env.realm, "task.submit/v1", {"input_artifact_id": env.input_artifact}
         )
-        request = pub.CommandRequest(command_envelope_jcs=json.dumps(envelope).encode())
+        request = pub.CommandRequest(command_envelope_jcs=canonical_json(envelope))
         with pytest.raises(StableError) as excinfo:
             await env.client.call(
                 "agent_meta.public.v1.Task.Submit", request, pub.MutationResponse
@@ -167,7 +207,7 @@ def test_task_submit_and_wait_roundtrip(tmp_path):
             "task.submit/v1",
             {"input_artifact_id": env.input_artifact, "budget": {"max_turns": 2}},
         )
-        request = pub.CommandRequest(command_envelope_jcs=json.dumps(envelope).encode())
+        request = pub.CommandRequest(command_envelope_jcs=canonical_json(envelope))
         mut = await env.client.call(
             "agent_meta.public.v1.Task.Submit", request, pub.MutationResponse
         )
@@ -237,7 +277,7 @@ def test_artifact_two_phase_upload_and_verify(tmp_path):
         )
         mut = await env.client.call(
             "agent_meta.public.v1.Artifact.Put",
-            pub.CommandRequest(command_envelope_jcs=json.dumps(envelope).encode()),
+            pub.CommandRequest(command_envelope_jcs=canonical_json(envelope)),
             pub.MutationResponse,
         )
         assert json.loads(bytes(mut.resource_jcs))["artifact_id"] == artifact_id
@@ -262,10 +302,10 @@ def test_unknown_method_maps_to_invalid_argument(tmp_path):
     run_env(test, tmp_path)
 
 
-def _raw_hello(socket_path):
+def _raw_hello(socket_path, *, minor=0):
     async def body():
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
-        hello = t.HelloRequest(supported=[t.VersionRange(major=1, min_minor=0, max_minor=0)])
+        reader, writer = await open_local_streams(socket_path)
+        hello = t.HelloRequest(supported=[t.VersionRange(major=1, min_minor=minor, max_minor=minor)])
         hello_env = t.RpcEnvelope(protocol_major=1, request_id="hello", method="Hello")
         hello_env.payload = hello.SerializeToString()
         writer.write(encode_frame(hello_env.SerializeToString()))
@@ -385,7 +425,7 @@ async def _put_bytes(env, data: bytes, kind: str) -> str:
     )
     await env.client.call(
         "agent_meta.public.v1.Artifact.Put",
-        pub.CommandRequest(command_envelope_jcs=json.dumps(envelope).encode()),
+        pub.CommandRequest(command_envelope_jcs=canonical_json(envelope)),
         pub.MutationResponse,
     )
     return artifact_id
@@ -393,6 +433,10 @@ async def _put_bytes(env, data: bytes, kind: str) -> str:
 
 def test_harness_lifecycle_over_wire(tmp_path):
     async def test(env):
+        from tests.unit.test_public_package_contract import Bundle
+
+        # A structurally plausible manifest with fake package bytes must not
+        # pass validation. It used to do so before content validation landed.
         package_bytes = json.dumps({"ampak": 1}).encode()
         package_art = await _put_bytes(env, package_bytes, "code")
         manifest = {
@@ -424,21 +468,42 @@ def test_harness_lifecycle_over_wire(tmp_path):
             pub.ValidateHarnessPackageRequest(manifest_artifact_id=manifest_art),
             pub.ResourceResponse,
         )
-        assert json.loads(bytes(report.resource_jcs))["valid"] is True
+        assert json.loads(bytes(report.resource_jcs))["valid"] is False
+
+        bundle = Bundle()
+        bundle.manifest["capability_descriptor_artifact_ids"] = [bundle.doc({
+            "capability_id": "capability://example.fake", "descriptor_revision": 1,
+            "artifact_id": bundle.manifest["package_artifact_id"], "placement": "isolated_process",
+            "trust_class": "trusted_candidate", "operations": [], "provides": [], "requires": [],
+        })]
+        grants = [{"permission": "model.invoke", "scope": {"realm_id": env.realm, "targets": [{"type": "CAPABILITY", "id": "capability://example.fake"}]}}]
+        bundle.manifest["grant_requests_artifact_id"] = bundle.doc({"schema": "harness-grant-requests/v1", "requests": grants})
+        manifest_art = bundle.sign()
+        for artifact_bytes in bundle.blobs.values():
+            await _put_bytes(env, artifact_bytes, "code")
+        package_art = bundle.manifest["package_artifact_id"]
+        body_art = bundle.manifest["composition_template_artifact_id"]
+        report = await env.client.call(
+            "agent_meta.public.v1.Harness.ValidatePackage",
+            pub.ValidateHarnessPackageRequest(manifest_artifact_id=manifest_art),
+            pub.ResourceResponse,
+        )
+        report_body = json.loads(bytes(report.resource_jcs))
+        assert report_body["valid"] is True, report_body
 
         # Install is idempotent over the wire
         install_env = make_envelope(
             env.realm,
             "harness.install/v1",
             {
-                "package_name": "org.example.harness",
+                "package_name": bundle.meta.name,
                 "package_version": "0.1.0",
                 "manifest_artifact_id": manifest_art,
                 "package_artifact_id": package_art,
-                "contract_fingerprint": "sha256:fp",
+                "contract_fingerprint": report_body["contract_fingerprint"],
             },
         )
-        request = pub.CommandRequest(command_envelope_jcs=json.dumps(install_env).encode())
+        request = pub.CommandRequest(command_envelope_jcs=canonical_json(install_env))
         mut = await env.client.call(
             "agent_meta.public.v1.Harness.Install", request, pub.MutationResponse
         )
@@ -455,26 +520,23 @@ def test_harness_lifecycle_over_wire(tmp_path):
         )
         assert json.loads(bytes(got.resource_jcs))["status"] == "INSTALLED"
 
-        # Activate needs a Service principal to receive the scoped grants
-        env.conn.execute(
-            "INSERT INTO principals(principal_id, realm_id, kind,"
-            " public_identity_json, status, created_at_us)"
-            " VALUES ('principal://service/e2e', ?, 'SERVICE', ?, 'ACTIVE', 1)",
-            (env.realm, b"{}"),
-        )
-        env.conn.commit()
+        # The bootstrapped Service receives a properly delegated scoped Grant.
         activate_env = make_envelope(
             env.realm,
             "harness.activate/v1",
             {
                 "harness_id": harness_id,
                 "composition_body_artifact_id": body_art,
-                "grant_requests": [{"permission": "model.invoke"}],
+                "grant_requests": grants,
+                "plan_hash": report_body["plan_hash"],
+                "grant_request_hash": hashlib.sha256(canonical_json(grants)).hexdigest(),
+                "expected_serving_revision": 1,
             },
+            expected_meta_revision=env.conn.execute("SELECT current_meta_revision FROM realms").fetchone()[0],
         )
         act = await env.client.call(
             "agent_meta.public.v1.Harness.Activate",
-            pub.CommandRequest(command_envelope_jcs=json.dumps(activate_env).encode()),
+            pub.CommandRequest(command_envelope_jcs=canonical_json(activate_env)),
             pub.MutationResponse,
         )
         resource = json.loads(bytes(act.resource_jcs))
@@ -576,7 +638,7 @@ def test_evolution_surface_over_wire(tmp_path):
         )
         prop = await env.client.call(
             "agent_meta.public.v1.Evolution.Propose",
-            pub.CommandRequest(command_envelope_jcs=json.dumps(propose_env).encode()),
+            pub.CommandRequest(command_envelope_jcs=canonical_json(propose_env)),
             pub.MutationResponse,
         )
         assert json.loads(bytes(prop.resource_jcs))["proposal_id"].startswith(
@@ -596,7 +658,7 @@ def test_evolution_surface_over_wire(tmp_path):
         )
         run = await env.client.call(
             "agent_meta.public.v1.Evolution.RunExperiment",
-            pub.CommandRequest(command_envelope_jcs=json.dumps(run_envelope).encode()),
+            pub.CommandRequest(command_envelope_jcs=canonical_json(run_envelope)),
             pub.MutationResponse,
         )
         run_resource = json.loads(bytes(run.resource_jcs))
@@ -633,7 +695,7 @@ def test_evolution_surface_over_wire(tmp_path):
         )
         prom = await env.client.call(
             "agent_meta.public.v1.Evolution.Promote",
-            pub.CommandRequest(command_envelope_jcs=json.dumps(promote_envelope).encode()),
+            pub.CommandRequest(command_envelope_jcs=canonical_json(promote_envelope)),
             pub.MutationResponse,
         )
         promoted = json.loads(bytes(prom.resource_jcs))
@@ -654,7 +716,7 @@ def test_evolution_surface_over_wire(tmp_path):
         rb = await env.client.call(
             "agent_meta.public.v1.Evolution.Rollback",
             pub.CommandRequest(
-                command_envelope_jcs=json.dumps(rollback_envelope).encode()
+                command_envelope_jcs=canonical_json(rollback_envelope)
             ),
             pub.MutationResponse,
         )
