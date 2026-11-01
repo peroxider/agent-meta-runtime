@@ -4,7 +4,8 @@
 frozen schema, no critical outbox dead-letters, no ``UNKNOWN`` reconcile
 cycle, an available Root authority grant, a stable clock and disk space of
 at least max(512 MiB, 5% of the volume). ``serving_ready`` additionally
-requires a serving revision and a ``READY`` reconcile cycle, and drops to
+requires a serving revision and explained live serving health (or a ``READY``
+cycle for a standalone evaluator without a bound health port), and drops to
 false while any backpressure signal exceeds its ceiling (pending tasks,
 pending outbox items, projection lag, WAL bytes). Reason codes form a
 frozen registry; every boolean downgrade maps to at least one code.
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..adapters.store.connection import USER_VERSION
+from ..domain.meta_schema import META_SCHEMA_VERSION
 from ..domain.canonical import now_us
 from ..domain.clock import CLOCK_UNSTABLE_REASON
 
@@ -120,6 +121,7 @@ class ReadinessEvaluator:
         clock: Any = None,
         limits: BackpressureLimits = BackpressureLimits(),
         disk_floor_bytes: int = _DISK_FLOOR_BYTES,
+        serving_health=None,
     ) -> None:
         self._conn = conn
         self._realm_id = realm_id
@@ -127,6 +129,7 @@ class ReadinessEvaluator:
         self._clock = clock
         self._limits = limits
         self._disk_floor_bytes = disk_floor_bytes
+        self._serving_health = serving_health
 
     # -- individual signals ---------------------------------------------------
     def _store_and_schema(self, reasons: set[str]) -> bool:
@@ -136,7 +139,7 @@ class ReadinessEvaluator:
         except sqlite3.Error:
             reasons.add("STORE_UNAVAILABLE")
             return False
-        if int(row[0]) != USER_VERSION:
+        if int(row[0]) != META_SCHEMA_VERSION:
             reasons.add("SCHEMA_INCOMPATIBLE")
             return False
         return quick is not None
@@ -165,7 +168,10 @@ class ReadinessEvaluator:
     def _root_auth_available(self, now: int) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM authority_grants g JOIN realms r ON g.epoch_id = r.epoch_id"
-            " WHERE r.realm_id = ? AND g.status='ACTIVE'"
+            " JOIN epochs e ON e.epoch_id=r.epoch_id AND e.authority_root_principal_id=g.subject_id"
+            " JOIN principals p ON p.principal_id=g.subject_id AND p.realm_id=r.realm_id"
+            " WHERE r.realm_id = ? AND g.status='ACTIVE' AND g.parent_grant_id IS NULL"
+            " AND p.kind='OPERATOR_ROOT' AND p.status='ACTIVE'"
             " AND (g.expires_at_us IS NULL OR g.expires_at_us > ?)"
             " LIMIT 1",
             (self._realm_id, now),
@@ -241,14 +247,19 @@ class ReadinessEvaluator:
             ).fetchone()
             serving_revision = int(refs[0]) if refs else 0
             reconcile_status = str(refs[1]) if refs else "PENDING"
+            healthy = reconcile_status == "READY"
+            if self._serving_health is not None and serving_revision > 0:
+                # Desired reconciliation and serving health are independent:
+                # a failing candidate must not stop the healthy old version.
+                healthy = bool(self._serving_health(serving_revision))
             serving = (
                 serving_revision > 0
-                and reconcile_status == "READY"
+                and healthy
                 and not bp_reasons
             )
             if serving_revision == 0:
                 serving_reasons = ("NO_SERVING_COMPOSITION",)
-            elif reconcile_status != "READY":
+            elif not healthy:
                 serving_reasons = ("RECONCILE_NOT_READY",)
             elif bp_reasons:
                 serving_reasons = bp_reasons

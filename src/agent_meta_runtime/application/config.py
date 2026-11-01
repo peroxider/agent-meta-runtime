@@ -63,6 +63,7 @@ def _schema() -> dict[str, Any]:
         "shutdown": {
             "grace_s": (int, 30, False),
         },
+        "execution": {"host_backend": (str, "trusted_in_process", False)},
     }
 
 
@@ -78,6 +79,7 @@ class RuntimeConfig:
     metrics_export_interval_s: int
     shutdown_grace_s: int
     config_path: Path | None = None
+    execution_backend: str = "trusted_in_process"
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -96,6 +98,7 @@ class RuntimeConfig:
             },
             "metrics": {"export_interval_s": self.metrics_export_interval_s},
             "shutdown": {"grace_s": self.shutdown_grace_s},
+            "execution": {"host_backend": self.execution_backend},
         }
 
 
@@ -232,6 +235,8 @@ def load_config(
     log_level = values["logging"]["level"].upper()
     if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ConfigError("logging.level must be one of DEBUG/INFO/WARNING/ERROR")
+    if values["execution"]["host_backend"] not in ("trusted_in_process", "in_memory"):
+        raise ConfigError("execution.host_backend must be trusted_in_process/in_memory")
 
     return RuntimeConfig(
         data_dir=data_dir,
@@ -244,6 +249,7 @@ def load_config(
         metrics_export_interval_s=values["metrics"]["export_interval_s"],
         shutdown_grace_s=values["shutdown"]["grace_s"],
         config_path=Path(config_path) if config_path is not None else None,
+        execution_backend=values["execution"]["host_backend"],
     )
 
 

@@ -18,6 +18,7 @@ their monotonic deadline.
 from __future__ import annotations
 
 import json
+import asyncio
 import secrets
 import time
 from typing import Any, Callable
@@ -28,6 +29,8 @@ from ..domain.outbox import (
     MAX_OUTBOX_ATTEMPTS,
     outbox_backoff_s,
 )
+from ..domain.errors import ErrorCode, StableError
+from .steps import Call, drive, drive_async
 
 __all__ = ["OutboxDispatcher", "DeliveryError"]
 
@@ -37,6 +40,10 @@ Handler = Callable[[dict[str, Any]], None]
 
 class DeliveryError(Exception):
     """Handler failure wrapper preserving the error detail for the outbox."""
+
+
+class _MissingHandler(DeliveryError):
+    pass
 
 
 class OutboxDispatcher:
@@ -71,6 +78,7 @@ class OutboxDispatcher:
         # outbox_id → monotonic lease deadline for this process.
         self._held: dict[str, float] = {}
         self._last_clock_check = self._monotonic()
+        self._poll_active = False
 
     @property
     def instance_id(self) -> str:
@@ -225,7 +233,8 @@ class OutboxDispatcher:
                 " WHERE outbox_id=? AND state='LEASED' AND lease_owner=?",
                 (
                     attempts,
-                    json.dumps({"error": str(error)[:2000]}, sort_keys=True).encode(
+                    json.dumps({"error": "no handler registered" if isinstance(error, _MissingHandler) else "outbox delivery failed",
+                                "code": error.code if isinstance(error, StableError) else ErrorCode.INTERNAL}, sort_keys=True).encode(
                         "utf-8"
                     ),
                     "DEAD_LETTER" if dead else "PENDING",
@@ -243,7 +252,7 @@ class OutboxDispatcher:
         return "DEAD_LETTER" if dead else "RETRY_SCHEDULED"
 
     # -- main loop -----------------------------------------------------------------
-    def poll_once(self) -> list[dict[str, Any]]:
+    def _poll_steps(self):
         """Claim a batch, deliver outside transactions, commit short CAS."""
 
         self._maintain_clock()
@@ -254,13 +263,17 @@ class OutboxDispatcher:
             if handler is None:
                 self._held.pop(outbox_id, None)
                 outcome = self._schedule_retry(
-                    item, DeliveryError(f"no handler for kind {item['kind']}")
+                    item, _MissingHandler()
                 )
                 results.append({"outbox_id": outbox_id, "outcome": outcome})
                 continue
             try:
-                handler(item)
-            except BaseException as exc:  # noqa: BLE001 - failure must be recorded
+                yield Call(handler, (item,))
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                self._abandon(outbox_id)
+                self._held.pop(outbox_id, None)
+                raise
+            except Exception as exc:
                 self._held.pop(outbox_id, None)
                 outcome = self._schedule_retry(item, exc)
                 results.append({"outbox_id": outbox_id, "outcome": outcome})
@@ -274,6 +287,30 @@ class OutboxDispatcher:
                 }
             )
         return results
+
+    def _outside_transaction(self):
+        if self._conn.in_transaction:
+            raise StableError(code=ErrorCode.INTERNAL, message="outbox delivery cannot await inside a transaction")
+
+    def poll_once(self):
+        if self._poll_active:
+            raise StableError(code=ErrorCode.ALREADY_RUNNING, message="outbox poll already active")
+        self._poll_active = True
+        try:
+            return drive(self._poll_steps(), before_call=self._outside_transaction)
+        finally:
+            self.abandon_all()
+            self._poll_active = False
+
+    async def poll_once_async(self):
+        if self._poll_active:
+            raise StableError(code=ErrorCode.ALREADY_RUNNING, message="outbox poll already active")
+        self._poll_active = True
+        try:
+            return await drive_async(self._poll_steps(), before_call=self._outside_transaction)
+        finally:
+            self.abandon_all()
+            self._poll_active = False
 
     def abandon_all(self) -> int:
         """Give every held lease back to PENDING (e.g. shutdown)."""

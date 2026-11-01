@@ -27,17 +27,6 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from ..adapters.store import (
-    SetRealizedRequest,
-    SetServingRequest,
-    StateMigrationCutoverRequest,
-    StateRevisionRegistration,
-    execute_command,
-    migrate_state_cutover,
-    set_realized,
-    set_serving,
-)
-from ..adapters.store.harness import settle_harness_for_cutover
 from ..domain.deadline import Deadline
 from ..domain.envelope import CommandEnvelope
 from ..domain.errors import ErrorCode, StableError
@@ -45,7 +34,9 @@ from ..domain.ids import new_uuid7
 from ..domain.outbox import outbox_dedupe_key
 from ..domain.probe import HealthProbeDescriptor
 from ..ports.repositories import FactAppendRequest, OutboxRequest
+from ..ports.reconciliation import ReconcilePersistence
 from .probes import ProbeRunner
+from .steps import Call, drive, drive_async
 
 __all__ = [
     "UnknownOutcomeError",
@@ -195,6 +186,7 @@ class Reconciler:
         self,
         conn: Any,
         *,
+        persistence: ReconcilePersistence,
         realm_id: str,
         slot_executor: SlotExecutor,
         drain_executor: DrainExecutor | None = None,
@@ -203,12 +195,14 @@ class Reconciler:
         command_deadline_us: int = 5_000_000,
     ) -> None:
         self._conn = conn
+        self._persistence = persistence
         self._realm_id = realm_id
         self._slot_executor = slot_executor
         self._drain_executor = drain_executor
         self._probe_runner = probe_runner
         self._actor_id = actor_id or f"principal://service/{new_uuid7()}"
         self._command_deadline_us = command_deadline_us
+        self._round_active = False
 
     # -- short read (A) --------------------------------------------------------
     def read_state(self) -> ReconcileObservation:
@@ -272,15 +266,12 @@ class Reconciler:
         )
 
     def _run_command(self, mutator: Callable[[Any], dict[str, Any]]) -> dict[str, Any]:
-        result = execute_command(
+        return self._persistence.execute(
             self._conn,
             self._envelope(),
             mutator,
             deadline=Deadline.after(self._command_deadline_us),
         )
-        if getattr(result, "error", None) is not None:
-            raise result.error
-        return dict(result.receipt)
 
     def _append_fact(
         self,
@@ -304,8 +295,23 @@ class Reconciler:
         )
 
     # -- cycle begin (C) --------------------------------------------------------
+    def _owns_target(self, revision, cas):
+        row = self._conn.execute("SELECT desired_revision,desired_cas FROM composition_refs WHERE realm_id=?", (self._realm_id,)).fetchone()
+        return row is not None and tuple(row) == (revision, cas)
+
+    def _guard_target(self, conn, revision, cas):
+        row = conn.execute("SELECT desired_revision,desired_cas FROM composition_refs WHERE realm_id=?", (self._realm_id,)).fetchone()
+        if row is None or tuple(row) != (revision, cas):
+            raise StableError(code=ErrorCode.REVISION_CONFLICT, message="reconcile target has been superseded", details={"reference": "desired"})
+
+    def _superseded(self, rid, desired_revision, slots=()):
+        refs = self._conn.execute("SELECT serving_revision,realized_revision FROM composition_refs WHERE realm_id=?", (self._realm_id,)).fetchone()
+        return ReconcileOutcome(status="SUPERSEDED", reconcile_id=rid, desired_revision=desired_revision,
+            serving_revision=refs[0], realized_revision=refs[1], slots=tuple(slots), reason_code="DESIRED_CAS_CONFLICT")
+
     def _begin_apply(self, obs: ReconcileObservation, rid: str) -> None:
         def mutator(txn: Any) -> dict[str, Any]:
+            self._guard_target(txn._conn, obs.desired_revision, obs.desired_cas)
             cursor = txn._conn.execute(
                 "UPDATE composition_refs SET reconcile_status='APPLYING'"
                 " WHERE realm_id = ? AND reconcile_status IN"
@@ -359,8 +365,8 @@ class Reconciler:
         return tuple(result["fact_ids"])
 
     # -- slot round (D + E) -------------------------------------------------------
-    def _run_slot(
-        self, step: Mapping[str, Any], obs: ReconcileObservation, rid: str
+    def _run_slot_steps(
+        self, step: Mapping[str, Any], obs: ReconcileObservation, rid: str, probe_call
     ) -> SlotOutcome:
         slot = str(step["slot"])
         criticality = str(step["criticality"])
@@ -368,8 +374,7 @@ class Reconciler:
         instance_id = ""
         state_bindings: tuple[Mapping[str, Any], ...] = ()
         try:
-            result = self._slot_executor(
-                {
+            result = yield Call(self._slot_executor, ({
                     "request_id": request_id,
                     "reconcile_id": rid,
                     "composition_id": obs.composition_id,
@@ -380,8 +385,7 @@ class Reconciler:
                     "descriptor_revision": step.get("descriptor_revision", 0),
                     "criticality": criticality,
                     "degradation_policy": step.get("degradation_policy", ""),
-                }
-            )
+                },))
             if isinstance(result, Mapping):
                 instance_id = str(result.get("instance_id", ""))
                 state_bindings = tuple(result.get("state_bindings", ()) or ())
@@ -396,7 +400,7 @@ class Reconciler:
                             "reason_code": ErrorCode.EXTERNAL_EFFECT_UNKNOWN,
                             "reconcile_id": rid,
                             "slot": slot,
-                            "detail": str(exc)[:500],
+                            "detail": "slot outcome could not be confirmed",
                         },
                     )
                 ]
@@ -422,7 +426,7 @@ class Reconciler:
                             "new_status": "UNHEALTHY",
                             "reconcile_id": rid,
                             "slot": slot,
-                            "detail": str(exc)[:500],
+                            "detail": "slot executor rejected the request",
                         },
                     )
                 ]
@@ -448,7 +452,7 @@ class Reconciler:
                             "new_status": "UNHEALTHY",
                             "reconcile_id": rid,
                             "slot": slot,
-                            "detail": str(exc)[:500],
+                            "detail": "slot executor failed",
                         },
                     )
                 ]
@@ -495,7 +499,7 @@ class Reconciler:
                 [
                     (
                         "capability",
-                        instance_id or f"capability://{slot}",
+                        step.get("capability_id") or f"capability://{slot}",
                         "instance_transitioned",
                         {
                             "reason_code": "NO_PROBE_DECLARED",
@@ -520,15 +524,11 @@ class Reconciler:
         assert self._probe_runner is not None, (
             "probe_runner required when slots declare health_probe"
         )
-        report = self._probe_runner.run(
-            HealthProbeDescriptor.from_descriptor(descriptor),
-            slot=slot,
-            criticality=criticality,
-            reconcile_id=rid,
-            composition_id=obs.composition_id,
-            instance_id=instance_id,
-            descriptor_revision=int(step.get("descriptor_revision", 0) or 0),
-        )
+        report = yield Call(probe_call, (HealthProbeDescriptor.from_descriptor(descriptor),), {
+            "slot": slot, "criticality": criticality, "reconcile_id": rid,
+            "composition_id": obs.composition_id, "instance_id": instance_id,
+            "descriptor_revision": int(step.get("descriptor_revision", 0) or 0),
+        })
         event_type = (
             "instance_transitioned"
             if report.result.status == "READY"
@@ -538,7 +538,7 @@ class Reconciler:
             [
                 (
                     "capability",
-                    instance_id or f"capability://{slot}",
+                    step.get("capability_id") or f"capability://{slot}",
                     event_type,
                     {
                         "reason_code": report.result.reason_code,
@@ -547,6 +547,7 @@ class Reconciler:
                         "reconcile_id": rid,
                         "slot": slot,
                         "request_id": report.result.request_id,
+                        "instance_id": instance_id,
                     },
                 )
             ]
@@ -570,60 +571,38 @@ class Reconciler:
         state_bindings: list[Mapping[str, Any]],
     ) -> None:
         def mutator(txn: Any) -> dict[str, Any]:
+            self._guard_target(txn._conn, obs.desired_revision, obs.desired_cas)
             if state_bindings:
-                migrate_state_cutover(
-                    StateMigrationCutoverRequest(
-                        bindings=[
-                            StateRevisionRegistration(
-                                state_id=b["state_id"],
-                                source_revision_id=b["source_revision_id"],
-                                schema_id=b.get("schema_id", ""),
-                                artifact_id=b.get("artifact_id", ""),
-                                state_revision_id=b["state_revision_id"],
-                            )
-                            for b in state_bindings
-                        ]
-                    )
-                )(txn)
-            set_serving(
-                SetServingRequest(
-                    realm_id=self._realm_id,
-                    revision=obs.desired_revision,
-                    expected_cas=obs.serving_cas,
-                )
-            )(txn)
+                self._persistence.migrate(txn, state_bindings)
+            self._persistence.set_serving(txn, self._realm_id, obs.desired_revision, obs.serving_cas)
             # Harness activation settles in the same terminal transaction
             # that moves serving (§41.60.4).
-            settle_harness_for_cutover(self._realm_id, obs.composition_id)(txn)
+            self._persistence.settle_harness(txn, self._realm_id, obs.composition_id)
             return {"serving_revision": obs.desired_revision}
 
         self._run_command(mutator)
 
     # -- terminal commit (H) ------------------------------------------------------
     def _complete(self, obs: ReconcileObservation) -> None:
-        row = self._conn.execute(
-            "SELECT realized_cas FROM composition_refs WHERE realm_id = ?",
-            (self._realm_id,),
-        ).fetchone()
-        self._run_command(
-            set_realized(
-                SetRealizedRequest(
-                    realm_id=self._realm_id,
-                    revision=obs.desired_revision,
-                    expected_cas=int(row[0]),
-                )
-            )
-        )
+        def finish(txn):
+            self._guard_target(txn._conn, obs.desired_revision, obs.desired_cas)
+            return self._persistence.set_realized(txn, self._realm_id, obs.desired_revision, obs.realized_cas)
+        self._run_command(finish)
 
     # -- failure terminal states ----------------------------------------------------
-    def _mark(self, status: str, reason_code: str, detail: str) -> None:
+    def _mark(self, status: str, reason_code: str, detail: str, *, target) -> None:
         def mutator(txn: Any) -> dict[str, Any]:
+            self._guard_target(txn._conn, *target)
             cursor = txn._conn.execute(
                 "UPDATE composition_refs SET reconcile_status=?"
                 " WHERE realm_id = ? AND reconcile_status IN"
                 " ('APPLYING','PENDING','RETRYING')",
                 (status, self._realm_id),
             )
+            if status in ("FAILED", "UNKNOWN") and target[0] > 0:
+                composition = txn._conn.execute("SELECT composition_id FROM compositions WHERE realm_id=? AND revision=?", (self._realm_id, target[0])).fetchone()
+                if composition is not None:
+                    self._persistence.fail_activation(txn, composition[0], reason_code)
             fact_id = self._append_fact(
                 txn,
                 entity_type="composition",
@@ -637,23 +616,21 @@ class Reconciler:
 
     # -- main round --------------------------------------------------------------
     # -- drain cycle: desired revision 0 (harness deactivation, §41.60.4) -----------
-    def _drain_cycle(self, serving_revision: int, realized_revision: int) -> ReconcileOutcome:
+    def _drain_cycle_steps(self, serving_revision: int, realized_revision: int):
         row = self._conn.execute(
-            "SELECT serving_cas, realized_cas FROM composition_refs WHERE realm_id = ?",
+            "SELECT serving_cas, realized_cas, desired_cas FROM composition_refs WHERE realm_id = ?",
             (self._realm_id,),
         ).fetchone()
         serving_cas, realized_cas = (int(row[0]), int(row[1])) if row else (0, 0)
+        desired_cas = int(row[2]) if row else 0
         rid = reconcile_id(self._realm_id, 0, "")
 
         if serving_revision != 0:
             def mutator(txn: Any) -> dict[str, Any]:
-                set_serving(
-                    SetServingRequest(
-                        realm_id=self._realm_id, revision=0, expected_cas=serving_cas
-                    )
-                )(txn)
+                self._guard_target(txn._conn, 0, desired_cas)
+                self._persistence.set_serving(txn, self._realm_id, 0, serving_cas)
                 # settle the drained harness in the same terminal transaction
-                settle_harness_for_cutover(self._realm_id, None)(txn)
+                self._persistence.settle_harness(txn, self._realm_id, None)
                 return {"serving_revision": 0}
 
             try:
@@ -672,16 +649,16 @@ class Reconciler:
 
         if self._drain_executor is not None:
             try:
-                self._drain_executor(
-                    {
+                yield Call(self._drain_executor, ({
                         "reconcile_id": rid,
                         "realm_id": self._realm_id,
                         "old_serving_revision": serving_revision,
                         "new_serving_revision": 0,
-                    }
-                )
+                    },))
             except Exception as exc:  # noqa: BLE001 - drain failure degrades
-                self._mark("DEGRADED", "DRAIN_FAILED", str(exc))
+                if not self._owns_target(0, desired_cas):
+                    return self._superseded(rid, 0)
+                self._mark("DEGRADED", "DRAIN_FAILED", "drain failed", target=(0, desired_cas))
                 return ReconcileOutcome(
                     status="DEGRADED",
                     reconcile_id=rid,
@@ -692,13 +669,15 @@ class Reconciler:
                 )
 
         # closes the cycle to READY even when the values are already at 0
-        self._run_command(
-            set_realized(
-                SetRealizedRequest(
-                    realm_id=self._realm_id, revision=0, expected_cas=realized_cas
-                )
-            )
-        )
+        def finish(txn):
+            self._guard_target(txn._conn, 0, desired_cas)
+            return self._persistence.set_realized(txn, self._realm_id, 0, realized_cas)
+        try:
+            self._run_command(finish)
+        except StableError as exc:
+            if exc.code == ErrorCode.REVISION_CONFLICT:
+                return self._superseded(rid, 0)
+            raise
         return ReconcileOutcome(
             status="DRAINED",
             reconcile_id=rid,
@@ -708,14 +687,14 @@ class Reconciler:
             reason_code="HARNESS_DEACTIVATED" if serving_revision else "ALREADY_DRAINED",
         )
 
-    def run_reconcile(self) -> ReconcileOutcome:
+    def _reconcile_steps(self, *, async_probes=False):
         refs = self._conn.execute(
             "SELECT desired_revision, serving_revision, realized_revision"
             " FROM composition_refs WHERE realm_id = ?",
             (self._realm_id,),
         ).fetchone()
         if refs is not None and int(refs[0]) == 0:
-            return self._drain_cycle(int(refs[1]), int(refs[2]))
+            return (yield from self._drain_cycle_steps(int(refs[1]), int(refs[2])))
         obs = self.read_state()
         rid = reconcile_id(self._realm_id, obs.desired_revision, obs.body_hash)
         if (
@@ -736,10 +715,13 @@ class Reconciler:
         state_bindings: list[Mapping[str, Any]] = []
         gate_passed = True
         for step in steps:
-            outcome = self._run_slot(step, obs, rid)
+            probe_call = self._probe_call_async if async_probes else self._probe_call
+            outcome = yield from self._run_slot_steps(step, obs, rid, probe_call)
             outcomes.append(outcome)
+            if not self._owns_target(obs.desired_revision, obs.desired_cas):
+                return self._superseded(rid, obs.desired_revision, outcomes)
             if outcome.status == "UNKNOWN":
-                self._mark("UNKNOWN", outcome.reason_code, f"slot {outcome.slot} unknown")
+                self._mark("UNKNOWN", outcome.reason_code, f"slot {outcome.slot} unknown", target=(obs.desired_revision, obs.desired_cas))
                 return ReconcileOutcome(
                     status="UNKNOWN",
                     reconcile_id=rid,
@@ -756,7 +738,7 @@ class Reconciler:
 
         if not gate_passed:
             failed = next(o for o in outcomes if not o.passed)
-            self._mark("FAILED", failed.reason_code, f"slot {failed.slot} failed gate")
+            self._mark("FAILED", failed.reason_code, f"slot {failed.slot} failed gate", target=(obs.desired_revision, obs.desired_cas))
             return ReconcileOutcome(
                 status="FAILED",
                 reconcile_id=rid,
@@ -787,16 +769,16 @@ class Reconciler:
         # (G) external drain of the previous serving generation.
         if self._drain_executor is not None:
             try:
-                self._drain_executor(
-                    {
+                yield Call(self._drain_executor, ({
                         "reconcile_id": rid,
                         "realm_id": self._realm_id,
                         "old_serving_revision": obs.serving_revision,
                         "new_serving_revision": obs.desired_revision,
-                    }
-                )
+                    },))
             except Exception as exc:  # noqa: BLE001 - drain failure degrades
-                self._mark("DEGRADED", "DRAIN_FAILED", str(exc))
+                if not self._owns_target(obs.desired_revision, obs.desired_cas):
+                    return self._superseded(rid, obs.desired_revision, outcomes)
+                self._mark("DEGRADED", "DRAIN_FAILED", "drain failed", target=(obs.desired_revision, obs.desired_cas))
                 return ReconcileOutcome(
                     status="DEGRADED",
                     reconcile_id=rid,
@@ -805,11 +787,16 @@ class Reconciler:
                     realized_revision=obs.realized_revision,
                     slots=tuple(outcomes),
                     reason_code="DRAIN_FAILED",
-                    detail=str(exc)[:500],
+                    detail="drain failed",
                 )
 
         # (H) realized CAS + READY checkpoint.
-        self._complete(obs)
+        try:
+            self._complete(obs)
+        except StableError as exc:
+            if exc.code == ErrorCode.REVISION_CONFLICT:
+                return self._superseded(rid, obs.desired_revision, outcomes)
+            raise
         return ReconcileOutcome(
             status="CONVERGED",
             reconcile_id=rid,
@@ -818,3 +805,31 @@ class Reconciler:
             realized_revision=obs.desired_revision,
             slots=tuple(outcomes),
         )
+
+    def _outside_transaction(self):
+        if self._conn.in_transaction:
+            raise StableError(code=ErrorCode.INTERNAL, message="external reconcile work cannot run inside a store transaction")
+
+    def _probe_call(self, descriptor, **kwargs):
+        return self._probe_runner.run(descriptor, **kwargs)
+
+    async def _probe_call_async(self, descriptor, **kwargs):
+        return await self._probe_runner.run_async(descriptor, **kwargs)
+
+    def run_reconcile(self) -> ReconcileOutcome:
+        if self._round_active:
+            raise StableError(code=ErrorCode.ALREADY_RUNNING, message="reconcile round already active")
+        self._round_active = True
+        try:
+            return drive(self._reconcile_steps(), before_call=self._outside_transaction)
+        finally:
+            self._round_active = False
+
+    async def run_reconcile_async(self) -> ReconcileOutcome:
+        if self._round_active:
+            raise StableError(code=ErrorCode.ALREADY_RUNNING, message="reconcile round already active")
+        self._round_active = True
+        try:
+            return await drive_async(self._reconcile_steps(async_probes=True), before_call=self._outside_transaction)
+        finally:
+            self._round_active = False

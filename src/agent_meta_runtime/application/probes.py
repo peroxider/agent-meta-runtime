@@ -16,6 +16,7 @@ traffic can never reach the serving composition.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -30,6 +31,7 @@ from ..domain.probe import (
     normalize_probe_outcome,
 )
 from ..domain.probe import ProbeResult
+from .steps import Call, drive, drive_async
 
 __all__ = [
     "PROBE_REQUEST_FIELDS",
@@ -100,14 +102,16 @@ class ProbeRunner:
         transport: Transport,
         sleep: Callable[[float], None] = time.sleep,
         wall: Callable[[], float] = time.time,
+        async_sleep: Callable = asyncio.sleep,
     ) -> None:
         self._transport = transport
         self._sleep = sleep
         self._wall = wall
+        self._async_sleep = async_sleep
 
-    def _execute(self, request: dict[str, Any], attempt: int) -> ProbeResult:
+    def _execute_steps(self, request: dict[str, Any], attempt: int):
         try:
-            raw = self._transport(request)
+            raw = yield Call(self._transport, (request,), timeout_s=request["timeout_ms"] / 1000)
         except TimeoutError:
             raw = {"status": UNHEALTHY, "reason_code": "PROBE_TIMEOUT"}
         except Exception:
@@ -120,7 +124,7 @@ class ProbeRunner:
             observed_at_us=int(self._wall() * 1_000_000),
         )
 
-    def run(
+    def _probe_steps(
         self,
         descriptor: HealthProbeDescriptor,
         *,
@@ -131,7 +135,8 @@ class ProbeRunner:
         instance_id: str = "",
         descriptor_revision: int = 0,
         backend_session_id: str = "",
-    ) -> ProbeReport:
+        async_wait: bool = False,
+    ):
         """Probe one slot; returns the gate decision for the Reconciler."""
 
         if criticality not in ("REQUIRED", "OPTIONAL"):
@@ -153,7 +158,7 @@ class ProbeRunner:
                 "timeout_ms": descriptor.timeout_ms,
             }
             assert set(request) == set(PROBE_REQUEST_FIELDS)
-            outcome = self._execute(request, attempt)
+            outcome = yield from self._execute_steps(request, attempt)
             result = ProbeResult(
                 status=outcome.status,
                 reason_code=outcome.reason_code,
@@ -165,9 +170,9 @@ class ProbeRunner:
             if result.status != UNHEALTHY:
                 break
             if attempt < descriptor.max_attempts:
-                self._sleep(
-                    PROBE_RETRY_DELAYS_S[min(attempt - 1, len(PROBE_RETRY_DELAYS_S) - 1)]
-                )
+                yield Call(self._async_sleep if async_wait else self._sleep, (
+                    PROBE_RETRY_DELAYS_S[min(attempt - 1, len(PROBE_RETRY_DELAYS_S) - 1)],
+                ))
         assert result is not None
 
         warning: CompatibilityIssue | None = None
@@ -204,3 +209,9 @@ class ProbeRunner:
             warning=warning,
             fact_payload=fact_payload,
         )
+
+    def run(self, descriptor: HealthProbeDescriptor, **kwargs) -> ProbeReport:
+        return drive(self._probe_steps(descriptor, **kwargs))
+
+    async def run_async(self, descriptor: HealthProbeDescriptor, **kwargs) -> ProbeReport:
+        return await drive_async(self._probe_steps(descriptor, async_wait=True, **kwargs))
