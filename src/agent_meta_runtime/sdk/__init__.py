@@ -9,6 +9,9 @@ from .client import (
     TaskHandle,
     Transport,
 )
+from .transport import LocalTransport, connect
+from .commands import CommandAuthority, decode_command, encode_command, sign_command
+from ..domain.errors import ErrorCode, StableError
 
 __all__ = [
     "AgentMetaClient",
@@ -17,4 +20,12 @@ __all__ = [
     "StagingSession",
     "TaskHandle",
     "Transport",
+    "LocalTransport",
+    "connect",
+    "ErrorCode",
+    "StableError",
+    "CommandAuthority",
+    "decode_command",
+    "encode_command",
+    "sign_command",
 ]

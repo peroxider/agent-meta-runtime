@@ -12,16 +12,22 @@ so SDK callers handle one error model.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
-from ..domain.canonical import canonical_json
+from ..domain.canonical import canonical_json, now_us
+from ..domain.command_policy import COMMAND_METHODS
+from ..domain.provider_configuration import configuration_payload
 from ..domain.envelope import CommandEnvelope
+from ..domain.errors import ErrorCode, StableError
 from ..domain.ids import new_uuid7
+from ..domain.task_submission import parse_task_submission
+from ..domain.principal_contract import principal_registration, delegation_payload, revocation_payload
 from ..protocols._v1 import public_pb2 as pub
+from .commands import CommandAuthority, decode_command, encode_command, sign_command
 
 __all__ = [
     "AgentMetaClient",
@@ -83,14 +89,49 @@ def _jcs_to_dict(raw: bytes) -> dict[str, Any]:
     return dict(json.loads(bytes(raw).decode("utf-8")))
 
 
+def _wait_deadlines(timeout_s: float) -> tuple[int, int]:
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not math.isfinite(timeout_s) or timeout_s < 0:
+        raise ValueError("wait timeout must be a finite non-negative number")
+    # The server's single Wait cap is 60s. Leave the transport one second to
+    # return a nonterminal snapshot rather than racing the Wait timeout.
+    wait_at = now_us() + int(min(timeout_s, 60) * 1_000_000)
+    return wait_at, wait_at + 1_000_000
+
+
 class AgentMetaClient:
     """Typed facade over the Public API v1 method registry."""
 
-    def __init__(self, transport: Transport) -> None:
+    def __init__(self, transport: Transport, *, authority: CommandAuthority | None = None) -> None:
         self._transport = transport
+        self._authority = authority
 
     async def aclose(self) -> None:
         await self._transport.close()
+
+    @property
+    def server_instance_id(self) -> str | None:
+        """Authenticated Hello identity when supplied by the local transport."""
+        return getattr(self._transport, "server_instance_id", None)
+
+    async def stop_runtime(self, *, realm_id: str, actor_id: str,
+                           instance_id: str | None = None, reason_code: str = "operator_stop",
+                           authority_grant_id: str | None = None) -> MutationResult:
+        """Request shutdown of one exact daemon incarnation (Public API 1.1).
+
+        STOPPING acknowledges durable admission, not completion of OS shutdown.
+        """
+        instance_id = instance_id or self.server_instance_id
+        if not isinstance(instance_id, str) or not instance_id or len(instance_id) > 128:
+            raise ValueError("stop requires a daemon instance identity from Hello")
+        negotiated = getattr(self._transport, "negotiated_version", None)
+        if negotiated is not None and negotiated < (1, 1):
+            from ..domain.errors import ErrorCode, StableError
+            raise StableError(code=ErrorCode.FEATURE_UNAVAILABLE, message="Runtime.Stop requires Public API 1.1")
+        return await self.execute_command("agent_meta.public.v1.Runtime.Stop", self.build_envelope_jcs(
+            realm_id=realm_id, actor_id=actor_id, payload_type="runtime.stop/v1",
+            payload={"instance_id": instance_id, "reason_code": reason_code},
+            authority_grant_id=authority_grant_id,
+        ))
 
     # -- helpers -------------------------------------------------------------
     def build_envelope_jcs(
@@ -103,6 +144,7 @@ class AgentMetaClient:
         authority_grant_id: str | None = None,
         expected_meta_revision: int | None = None,
         causal_parent_action_id: str | None = None,
+        command_id: str | None = None,
     ) -> str:
         """Canonical CommandEnvelope JCS for one mutation (§41.46).
 
@@ -110,8 +152,10 @@ class AgentMetaClient:
         without sending it.
         """
 
+        if self._authority is not None and actor_id == self._authority.actor_id and authority_grant_id is None:
+            authority_grant_id = self._authority.authority_grant_id
         envelope = CommandEnvelope(
-            command_id="task://" + new_uuid7(),
+            command_id=command_id or "task://" + new_uuid7(),
             realm_id=realm_id,
             actor_id=actor_id,
             authority_grant_id=authority_grant_id,
@@ -124,24 +168,20 @@ class AgentMetaClient:
             auth_issued_at_us=None,
             auth_signature=None,
         )
-        body: dict[str, Any] = {
-            field: getattr(envelope, field)
-            for field in (
-                "command_id",
-                "realm_id",
-                "actor_id",
-                "authority_grant_id",
-                "expected_meta_revision",
-                "causal_parent_action_id",
-                "payload_type",
-                "payload_schema_version",
-                "auth_nonce",
-                "auth_issued_at_us",
-                "auth_signature",
-            )
-        }
-        body["payload"] = dict(envelope.payload)
-        return canonical_json(body).decode("utf-8")
+        if self._authority is not None and actor_id == self._authority.actor_id:
+            envelope = sign_command(envelope, self._authority)
+        return encode_command(envelope)
+
+    async def execute_command(self, method: str, envelope_jcs: str, *, deadline_us: int | None = None) -> MutationResult:
+        """Send an already prepared command verbatim; never generate a new ID.
+
+        Persist method + full envelope before sending when recovery is needed.
+        Recovery must replay that exact representation, not a convenience method.
+        """
+        envelope = decode_command(envelope_jcs)
+        if method not in COMMAND_METHODS or COMMAND_METHODS[method][0] != envelope.payload_type:
+            raise ValueError("command method/payload type differs from the public registry")
+        return await self._mutate(method, envelope_jcs, deadline_us=deadline_us)
 
     async def _mutate(
         self, method: str, envelope_jcs: str, *, deadline_us: int | None = None
@@ -185,8 +225,8 @@ class AgentMetaClient:
             realized_revision=info.realized_revision,
         )
 
-    async def get_view(self, meta_revision: int | None = None) -> dict[str, Any]:
-        request = pub.GetViewRequest()
+    async def get_view(self, meta_revision: int | None = None, *, include_backend: bool = False) -> dict[str, Any]:
+        request = pub.GetViewRequest(include_backend=include_backend)
         if meta_revision is not None:
             request.meta_revision = meta_revision
         response = await self._call(
@@ -200,6 +240,43 @@ class AgentMetaClient:
         )
         return _jcs_to_dict(response.report_jcs)
 
+    # -- ordinary Authority ---------------------------------------------------
+    async def create_principal(self, *, realm_id: str, actor_id: str, kind: str, public_key: bytes,
+                               principal_id: str | None = None, authority_grant_id: str | None = None) -> MutationResult:
+        if not isinstance(public_key, bytes):
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="public key must be raw Ed25519 bytes")
+        payload = {"kind": kind, "public_key_hex": public_key.hex()}
+        if principal_id is not None:
+            payload["principal_id"] = principal_id
+        principal_registration(payload)
+        return await self._mutate("agent_meta.public.v1.Authority.CreatePrincipal", self.build_envelope_jcs(
+            realm_id=realm_id, actor_id=actor_id, payload_type="authority.principal.create/v1", payload=payload,
+            authority_grant_id=authority_grant_id))
+
+    async def delegate_authority(self, *, realm_id: str, actor_id: str, subject_id: str, permissions: Sequence[str],
+                                 scope: Mapping[str, Any], constraints: Mapping[str, Any] | None = None,
+                                 delegable: bool = False, authority_grant_id: str | None = None) -> MutationResult:
+        if (not isinstance(scope, Mapping) or constraints is not None and not isinstance(constraints, Mapping)
+                or isinstance(permissions, (str, bytes)) or not isinstance(permissions, Sequence)):
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="delegation requires an object scope/constraints and a permission sequence")
+        try:
+            payload = {"subject_id": subject_id, "permissions": sorted(set(permissions)), "scope": dict(scope),
+                "constraints": dict(constraints) if constraints is not None else {}, "delegable": delegable}
+        except (ValueError, TypeError) as exc:
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="invalid delegation arguments") from exc
+        delegation_payload(payload, realm_id=realm_id)
+        return await self._mutate("agent_meta.public.v1.Authority.Delegate", self.build_envelope_jcs(
+            realm_id=realm_id, actor_id=actor_id, payload_type="authority.delegate/v1", payload=payload,
+            authority_grant_id=authority_grant_id))
+
+    async def revoke_authority(self, *, realm_id: str, actor_id: str, grant_id: str,
+                               reason_code: str = "operator_revoke", authority_grant_id: str | None = None) -> MutationResult:
+        payload = {"grant_id": grant_id, "reason_code": reason_code}
+        revocation_payload(payload)
+        return await self._mutate("agent_meta.public.v1.Authority.Revoke", self.build_envelope_jcs(
+            realm_id=realm_id, actor_id=actor_id, payload_type="authority.revoke/v1", payload=payload,
+            authority_grant_id=authority_grant_id))
+
     # -- Task ----------------------------------------------------------------
     async def submit_task(
         self,
@@ -211,12 +288,14 @@ class AgentMetaClient:
         deadline_at_us: int | None = None,
         authority_grant_id: str | None = None,
         expected_meta_revision: int | None = None,
+        causal_parent_action_id: str | None = None,
     ) -> TaskHandle:
         payload: dict[str, Any] = {"input_artifact_id": input_artifact_id}
-        if budget:
-            payload["budget"] = dict(budget)
+        if budget is not None:
+            payload["budget"] = dict(budget) if isinstance(budget, Mapping) else budget
         if deadline_at_us is not None:
             payload["deadline_at_us"] = deadline_at_us
+        parse_task_submission(payload)
         result = await self._mutate(
             "agent_meta.public.v1.Task.Submit",
             self.build_envelope_jcs(
@@ -226,6 +305,7 @@ class AgentMetaClient:
                 payload=payload,
                 authority_grant_id=authority_grant_id,
                 expected_meta_revision=expected_meta_revision,
+                causal_parent_action_id=causal_parent_action_id,
             ),
         )
         resource = result.resource or {}
@@ -244,18 +324,28 @@ class AgentMetaClient:
         )
         return _jcs_to_dict(response.resource_jcs)
 
+    async def get_task_execution(self, task_id: str) -> dict[str, Any]:
+        """Read bounded durable invocation/projection metadata (Public API 1.2)."""
+        response = await self._call("agent_meta.public.v1.Task.GetExecution",
+            pub.GetTaskRequest(task_id=task_id), pub.ResourceResponse)
+        return _jcs_to_dict(response.resource_jcs)
+
+    async def get_task_trace(self, task_id: str) -> dict[str, Any]:
+        """Bounded persisted Action/Fact state metadata (Public API 1.5)."""
+        response = await self._call("agent_meta.public.v1.Task.GetTrace", pub.GetTaskRequest(task_id=task_id), pub.ResourceResponse)
+        return _jcs_to_dict(response.resource_jcs)
+
     async def wait_task(
         self, task_id: str, *, timeout_s: float = 60.0
     ) -> tuple[dict[str, Any], bool]:
         """Wait for terminal state; ``(resource, terminal)`` — timeout is not an error."""
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_s
+        wait_at, rpc_at = _wait_deadlines(timeout_s)
         response = await self._call(
             "agent_meta.public.v1.Task.Wait",
-            pub.WaitTaskRequest(task_id=task_id, wait_deadline_at_us=0),
+            pub.WaitTaskRequest(task_id=task_id, wait_deadline_at_us=wait_at),
             pub.TaskWaitResponse,
-            deadline_us=int(timeout_s * 1_000_000),
+            deadline_us=rpc_at,
         )
         return _jcs_to_dict(response.resource_jcs), bool(response.terminal)
 
@@ -352,6 +442,29 @@ class AgentMetaClient:
             pub.VerifyArtifactResponse,
         )
         return bool(response.ok), str(response.reason_code)
+
+    async def get_artifact_content(self, artifact_id: str) -> bytes:
+        """Read/hash-verify ordinary content up to 1 MiB (Public API 1.3)."""
+        response = await self._call("agent_meta.public.v1.Artifact.GetContent",
+            pub.GetArtifactRequest(artifact_id=artifact_id), pub.ResourceResponse)
+        try:
+            if len(response.resource_jcs) > 2 * 1024 * 1024 + 4096:
+                raise ValueError("content response exceeds ceiling")
+            value = json.loads(response.resource_jcs)
+            if not isinstance(value, dict) or canonical_json(value) != response.resource_jcs:
+                raise ValueError("content response is not a canonical object")
+            if value.get("resource_type") != "artifact-content/v1" or type(value.get("schema_version")) is not int or value["schema_version"] != 1:
+                raise StableError(code=ErrorCode.CONTRACT_INCOMPATIBLE, message="unsupported Artifact content response schema")
+            if value.get("artifact_id") != artifact_id or not all(isinstance(value.get(key), str) for key in ("kind", "media_type")) or type(value.get("size_bytes")) is not int or not 0 <= value["size_bytes"] <= 1024 * 1024:
+                raise ValueError("invalid content identity or size")
+            if not isinstance(value.get("content_hex"), str) or len(value["content_hex"]) != 2 * value["size_bytes"]:
+                raise ValueError("invalid content encoding")
+            content = bytes.fromhex(value["content_hex"])
+            if content.hex() != value["content_hex"] or len(content) != value["size_bytes"] or "artifact://sha256/" + hashlib.sha256(content).hexdigest() != artifact_id:
+                raise ValueError("content hash mismatch")
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
+            raise StableError(code=ErrorCode.INTEGRITY_ERROR, message="Artifact content response failed verification") from exc
+        return content
 
     # -- Composition ---------------------------------------------------------
     async def validate_composition(
@@ -472,24 +585,99 @@ class AgentMetaClient:
         grant_request_hash: str = "",
         authority_grant_id: str | None = None,
         expected_meta_revision: int | None = None,
+        expected_serving_revision: int | None = None,
     ) -> MutationResult:
-        return await self._mutate(
-            "agent_meta.public.v1.Harness.Activate",
-            self.build_envelope_jcs(
+        envelope = await self.prepare_harness_activation(
+            realm_id=realm_id, actor_id=actor_id, harness_id=harness_id,
+            composition_body_artifact_id=composition_body_artifact_id,
+            grant_requests=grant_requests, plan_hash=plan_hash, grant_request_hash=grant_request_hash,
+            authority_grant_id=authority_grant_id, expected_meta_revision=expected_meta_revision,
+            expected_serving_revision=expected_serving_revision,
+        )
+        return await self.execute_command("agent_meta.public.v1.Harness.Activate", envelope)
+
+    async def prepare_harness_activation(
+        self, *, realm_id: str, actor_id: str, harness_id: str,
+        composition_body_artifact_id: str, grant_requests: list[dict[str, Any]] | None = None,
+        plan_hash: str = "", grant_request_hash: str = "",
+        authority_grant_id: str | None = None, expected_meta_revision: int | None = None,
+        expected_serving_revision: int | None = None,
+    ) -> str:
+        """Read/validate and sign an exact activation plan without submitting it.
+
+        Explicit hashes/revisions are preserved; stale plans fail on submission.
+        Persist the returned bytes to recover a lost response with execute_command.
+        """
+        if not plan_hash:
+            installation = await self.get_harness(harness_id)
+            report = await self.validate_harness_package(installation["manifest_artifact_id"])
+            if not report["valid"]:
+                from ..domain.errors import ErrorCode, StableError
+                raise StableError(code=ErrorCode.CONTRACT_INCOMPATIBLE, message="activation package validation failed", details=report)
+            plan_hash = report["plan_hash"]
+        requests = list(grant_requests or [])
+        if not grant_request_hash:
+            grant_request_hash = hashlib.sha256(canonical_json(requests)).hexdigest()
+        if expected_meta_revision is None or expected_serving_revision is None:
+            view = await self.get_view()
+            if view["realm_id"] != realm_id:
+                raise ValueError("activation Realm differs from endpoint")
+            if expected_meta_revision is None:
+                expected_meta_revision = view["meta_revision"]
+            if expected_serving_revision is None:
+                expected_serving_revision = view["serving_revision"]
+        return self.build_envelope_jcs(
                 realm_id=realm_id,
                 actor_id=actor_id,
                 payload_type="harness.activate/v1",
                 payload={
                     "harness_id": harness_id,
                     "composition_body_artifact_id": composition_body_artifact_id,
-                    "grant_requests": list(grant_requests or []),
+                    "grant_requests": requests,
                     "plan_hash": plan_hash,
                     "grant_request_hash": grant_request_hash,
+                    "expected_serving_revision": expected_serving_revision,
                 },
                 authority_grant_id=authority_grant_id,
                 expected_meta_revision=expected_meta_revision,
-            ),
         )
+
+    async def prepare_harness_provider_configuration(self, *, realm_id: str, actor_id: str, harness_id: str,
+            capability_id: str, profile_artifact_id: str, credential_handle: str, enabled: bool=True,
+            expected_configuration_revision: int | None=None, expected_meta_revision: int | None=None,
+            authority_grant_id: str | None=None) -> str:
+        """Sign a reviewable, secretless installation/profile/handle binding."""
+        payload=configuration_payload({'harness_id':harness_id,'capability_id':capability_id,'profile_artifact_id':profile_artifact_id,
+            'credential_handle':credential_handle,'enabled':enabled,'expected_configuration_revision':expected_configuration_revision if expected_configuration_revision is not None else 0})
+        if expected_configuration_revision is None:
+            installation=await self.get_harness(harness_id)
+            old=installation.get('provider_configuration')
+            expected_configuration_revision=old['configuration_revision'] if old else 0
+        if expected_meta_revision is None:
+            view=await self.get_view()
+            if view['realm_id']!=realm_id:
+                raise ValueError('Provider configuration Realm differs from endpoint')
+            expected_meta_revision=view['meta_revision']
+        payload['expected_configuration_revision']=expected_configuration_revision
+        return self.build_envelope_jcs(realm_id=realm_id,actor_id=actor_id,payload_type='harness.configure-provider/v1',
+            payload=payload,
+            authority_grant_id=authority_grant_id,expected_meta_revision=expected_meta_revision)
+
+    async def validate_harness_provider_configuration(self, envelope_jcs: str) -> dict[str, Any]:
+        """Read-only validation of a signed binding; no command/use claim."""
+        response=await self._call('agent_meta.public.v1.Harness.ValidateProviderConfiguration',
+            pub.CommandRequest(command_envelope_jcs=envelope_jcs.encode('utf-8')),pub.ResourceResponse)
+        return _jcs_to_dict(response.resource_jcs)
+
+    async def configure_harness_provider(self, *, realm_id: str, actor_id: str, harness_id: str,
+            capability_id: str, profile_artifact_id: str, credential_handle: str, enabled: bool=True,
+            expected_configuration_revision: int | None=None, expected_meta_revision: int | None=None,
+            authority_grant_id: str | None=None) -> MutationResult:
+        envelope=await self.prepare_harness_provider_configuration(realm_id=realm_id,actor_id=actor_id,harness_id=harness_id,
+            capability_id=capability_id,profile_artifact_id=profile_artifact_id,credential_handle=credential_handle,enabled=enabled,
+            expected_configuration_revision=expected_configuration_revision,expected_meta_revision=expected_meta_revision,
+            authority_grant_id=authority_grant_id)
+        return await self.execute_command('agent_meta.public.v1.Harness.ConfigureProvider',envelope)
 
     async def deactivate_harness(
         self,
@@ -613,12 +801,12 @@ class AgentMetaClient:
         self, experiment_id: str, *, timeout_s: float = 60.0
     ) -> tuple[dict[str, Any], bool]:
         """Wait for terminal Experiment status; timeout is not an error."""
-
+        wait_at, rpc_at = _wait_deadlines(timeout_s)
         response = await self._call(
             "agent_meta.public.v1.Evolution.WaitExperiment",
-            pub.WaitExperimentRequest(experiment_id=experiment_id, wait_deadline_at_us=0),
+            pub.WaitExperimentRequest(experiment_id=experiment_id, wait_deadline_at_us=wait_at),
             pub.TaskWaitResponse,
-            deadline_us=int(timeout_s * 1_000_000),
+            deadline_us=rpc_at,
         )
         return _jcs_to_dict(response.resource_jcs), bool(response.terminal)
 
@@ -765,11 +953,12 @@ class AgentMetaClient:
     async def wait_operation(
         self, operation_id: str, *, timeout_s: float = 60.0
     ) -> dict[str, Any]:
+        wait_at, rpc_at = _wait_deadlines(timeout_s)
         response = await self._call(
             "agent_meta.public.v1.Operations.WaitOperation",
-            pub.WaitOperationRequest(operation_id=operation_id, wait_deadline_at_us=0),
+            pub.WaitOperationRequest(operation_id=operation_id, wait_deadline_at_us=wait_at),
             pub.ResourceResponse,
-            deadline_us=int(timeout_s * 1_000_000),
+            deadline_us=rpc_at,
         )
         return _jcs_to_dict(response.resource_jcs)
 
