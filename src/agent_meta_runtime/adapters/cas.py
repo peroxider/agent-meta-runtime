@@ -56,7 +56,7 @@ class FilesystemCas:
     def absolute_path(self, storage_relpath: str) -> Path:
         """Resolve a stored relpath, rejecting traversal and symlinks."""
 
-        if storage_relpath.startswith("/") or ".." in storage_relpath.split("/"):
+        if not isinstance(storage_relpath, str) or not storage_relpath or any(char in storage_relpath for char in ("\\", ":", "\x00")) or any(part in ("", ".", "..") for part in storage_relpath.split("/")):
             raise _integrity_error(
                 "storage relpath must be relative and normalized",
                 storage_relpath=storage_relpath,
@@ -72,11 +72,15 @@ class FilesystemCas:
         current = self.artifacts_dir
         for part in Path(storage_relpath).parts:
             current = current / part
-            if current.is_symlink():
-                raise _integrity_error("symlink in artifact path", path=str(current))
+            if current.is_symlink() or current.is_junction():
+                raise _integrity_error("symlink or junction in artifact path", path=str(current))
         return target
 
     def _fsync_dir(self, directory: Path) -> None:
+        if os.name == "nt":
+            # Windows cannot fsync directory descriptors through os.open.
+            # publish uses MoveFileExW(MOVEFILE_WRITE_THROUGH) instead.
+            return
         fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(fd)
@@ -90,11 +94,16 @@ class FilesystemCas:
         digest = hashlib.sha256()
         staging_path = self.staging_dir / f"{uuid.uuid4().hex}.tmp"
         size = 0
-        fd = os.open(staging_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(staging_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
         try:
             for offset in range(0, len(data), CHUNK_SIZE):
                 chunk = data[offset : offset + CHUNK_SIZE]
-                os.write(fd, chunk)
+                pending = memoryview(chunk)
+                while pending:
+                    written = os.write(fd, pending)
+                    if written <= 0:
+                        raise OSError("staged artifact write made no progress")
+                    pending = pending[written:]
                 digest.update(chunk)
                 size += len(chunk)
             os.fsync(fd)
@@ -130,7 +139,18 @@ class FilesystemCas:
                 storage_relpath=relpath,
             )
         target.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(staged.staging_path, target)
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            move = kernel.MoveFileExW
+            move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+            move.restype = wintypes.BOOL
+            if not move(str(staged.staging_path), str(target), 0x8):
+                raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            os.rename(staged.staging_path, target)
         self._fsync_dir(target.parent)
         return relpath
 
@@ -158,6 +178,8 @@ class FilesystemCas:
     ) -> bytes:
         """Read a blob, verifying path, size and full SHA-256 (§41.7)."""
 
+        if type(size_bytes) is not int or size_bytes < 0:
+            raise _integrity_error("invalid expected blob size")
         path = self.absolute_path(storage_relpath)
         if not path.is_file():
             raise StableError(
@@ -165,7 +187,8 @@ class FilesystemCas:
                 message="artifact blob missing from CAS",
                 details={"storage_relpath": storage_relpath},
             )
-        data = path.read_bytes()
+        with path.open("rb") as source:
+            data = source.read(size_bytes + 1)
         if len(data) != size_bytes or hashlib.sha256(data).hexdigest() != sha256_hex:
             raise _integrity_error(
                 "artifact blob failed integrity verification",

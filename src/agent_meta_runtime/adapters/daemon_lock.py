@@ -18,6 +18,11 @@ from ..domain.errors import ErrorCode, StableError
 
 __all__ = ["AlreadyRunning", "DaemonLock", "DaemonLockInfo", "acquire_daemon_lock"]
 
+# Windows byte-range locks are mandatory: locking the metadata's first byte
+# prevents even read-only discovery. Reserve a separate byte beyond the bounded
+# metadata region, while every writer still competes for the same OS lock.
+_WINDOWS_LOCK_OFFSET = 1 << 20
+
 
 class AlreadyRunning(StableError):
     """Raised when the data directory already has a live daemon owner."""
@@ -31,6 +36,18 @@ class AlreadyRunning(StableError):
 
 
 def _process_start_identity() -> str:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+        creation, exit_time, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(kernel.GetCurrentProcess(), ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return f"windows-filetime:{(creation.dwHighDateTime << 32) | creation.dwLowDateTime}"
     # Best-effort identity distinguishing process incarnations with the same
     # PID across restarts. Linux exposes starttime via /proc.
     try:
@@ -96,7 +113,9 @@ def _lock_fd(fd: int) -> None:
     if os.name == "nt":
         import msvcrt
 
+        os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        os.lseek(fd, 0, os.SEEK_SET)
     else:
         import fcntl
 
@@ -107,7 +126,7 @@ def _unlock_fd(fd: int) -> None:
     if os.name == "nt":
         import msvcrt
 
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     else:
         import fcntl
@@ -119,8 +138,12 @@ def acquire_daemon_lock(data_dir: Path, endpoint: str, instance_id: str) -> Daem
     """Acquire the single-writer lock or raise ``AlreadyRunning`` (exit code 12)."""
 
     run_dir = data_dir / "run"
+    if run_dir.is_symlink() or run_dir.is_junction():
+        raise StableError(code=ErrorCode.FAILED_PRECONDITION, message="daemon run directory cannot be a reparse point")
     run_dir.mkdir(parents=True, exist_ok=True)
     lock_path = run_dir / "daemon.lock"
+    if lock_path.is_symlink() or lock_path.is_junction():
+        raise StableError(code=ErrorCode.FAILED_PRECONDITION, message="daemon lock cannot be a reparse point")
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         _lock_fd(fd)
@@ -142,7 +165,10 @@ def acquire_daemon_lock(data_dir: Path, endpoint: str, instance_id: str) -> Daem
             endpoint=endpoint,
             created_at_us=now_us(),
         )
-        os.write(fd, json.dumps(info.to_json()).encode("utf-8"))
+        metadata = json.dumps(info.to_json()).encode("utf-8")
+        if len(metadata) >= _WINDOWS_LOCK_OFFSET:
+            raise OSError("daemon endpoint metadata exceeds reserved region")
+        os.write(fd, metadata)
     except OSError:
         _unlock_fd(fd)
         os.close(fd)

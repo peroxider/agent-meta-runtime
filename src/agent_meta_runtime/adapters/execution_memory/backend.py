@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable
 
 from ...domain.canonical import canonical_json
 from ...domain.errors import ErrorCode, StableError
+from ...ports.execution import ExecutionOutcome
 from ...protocols._v1 import execution_backend_pb2 as eb
 from ...protocols.backend_wire import (
     AuthorityToken,
@@ -47,7 +48,7 @@ INMEMORY_FEATURES: dict[str, str] = {
 _ALLOWED_OPERATION_PREFIX = "test."
 _DISALLOWED_REVERSIBILITY = {"IRREVERSIBLE", "UNKNOWN"}
 
-Executor = Callable[[eb.ExecutionRequest], Awaitable[tuple[str, bytes, bytes]]]
+Executor = Callable[[eb.ExecutionRequest], Awaitable[ExecutionOutcome | tuple[str, bytes, bytes]]]
 """Async executor returning ``(status, usage_jcs, result_error_jcs)``."""
 
 
@@ -214,12 +215,21 @@ class InMemoryBackend:
         *,
         backend_id: str = "backend://inmemory",
         executor: Executor | None = None,
+        authorize: Callable[[eb.ExecutionRequest], Any] | None = None,
+        maximum_requests: int = 4096,
+        maximum_retained_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         self._state = state or DurableFakeBackendState()
         self._backend_id = backend_id
         self._executor: Executor = executor or _default_executor  # type: ignore[assignment]
         self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._open_sessions: set[str] = set()
         self._closed_sessions: set[str] = set()
+        self._authorize = authorize
+        if type(maximum_requests) is not int or maximum_requests <= 0 or type(maximum_retained_bytes) is not int or maximum_retained_bytes <= 0:
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="Backend retention limits must be positive integers")
+        self._maximum_requests = maximum_requests
+        self._maximum_retained_bytes = maximum_retained_bytes
 
     # -- capabilities / session ----------------------------------------------
     def capabilities(self) -> dict[str, Any]:
@@ -227,6 +237,7 @@ class InMemoryBackend:
             "backend_id": self._backend_id,
             "profile": "PORTABLE",
             "features": dict(INMEMORY_FEATURES),
+            "authorization": "INJECTED_VERIFIER" if self._authorize else "UNAUTHORIZED_CONTRACT_TEST_ONLY",
         }
 
     @property
@@ -249,7 +260,24 @@ class InMemoryBackend:
             established_at_us=now,
         )
         self._state._sessions[session.session_id] = {"closed": False, "at_us": now}
+        self._open_sessions.add(session.session_id)
         return session
+
+    def _require_session(self, session_id, *, allow_closed=False):
+        if not session_id or session_id not in self._open_sessions and not (allow_closed and session_id in self._closed_sessions):
+            raise StableError(code=ErrorCode.FAILED_PRECONDITION, message="no negotiated Backend session")
+
+    def _reserve_capacity(self, request):
+        now = self._state.now_us()
+        for key, record in tuple(self._state._requests.items()):
+            if record.terminal_acknowledged and record.retained_until_us <= now and key not in self._tasks:
+                del self._state._requests[key]
+                self._state._by_handle.pop(record.handle_bytes, None)
+        # Reserve room for the bounded terminal metadata too; this is a logical
+        # ledger limit, not a claimed OS hard-memory quota.
+        reserved = sum(row.request.ByteSize() + 66 * 1024 for row in self._state._requests.values())
+        if len(self._state._requests) >= self._maximum_requests or reserved + request.ByteSize() + 66 * 1024 > self._maximum_retained_bytes:
+            raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="Backend unexpired request retention is full")
 
     # -- submit ----------------------------------------------------------------
     def _validate_request(self, request: eb.ExecutionRequest) -> None:
@@ -263,6 +291,12 @@ class InMemoryBackend:
                 code=ErrorCode.INVALID_ARGUMENT,
                 message="payload_hash does not match payload_jcs",
             )
+        if not request.realm_id or not request.dedupe_scope or request.requested_retention_us < 0 or request.deadline_at_us < 0:
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="Backend scope/retention/deadline is invalid")
+        if request.ByteSize() > 16 * 1024 * 1024:
+            raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="Backend request exceeds its byte ceiling")
+        if request.deadline_at_us and self._state.now_us() >= request.deadline_at_us:
+            raise StableError(code=ErrorCode.DEADLINE_EXCEEDED, message="Backend request deadline has expired")
         if not request.operation_kind.startswith(_ALLOWED_OPERATION_PREFIX):
             raise StableError(
                 code=ErrorCode.FEATURE_UNAVAILABLE,
@@ -279,18 +313,18 @@ class InMemoryBackend:
     async def submit(self, request: eb.ExecutionRequest) -> eb.ExecutionHandle:
         self._validate_request(request)
         session_id = request.session_id
-        if not session_id or session_id in self._closed_sessions:
-            raise StableError(
-                code=ErrorCode.FAILED_PRECONDITION, message="no open session"
-            )
+        self._require_session(session_id)
+        if self._authorize is not None:
+            self._authorize(request)
         key = (request.dedupe_scope, request.request_id)
         state = self._state
         existing = state._requests.get(key)
         if existing is not None:
-            if existing.request.payload_hash != request.payload_hash:
+            fields = ("realm_id", "operation_kind", "payload_hash", "idempotency_class", "reversibility", "deadline_at_us", "requested_retention_us")
+            if any(getattr(existing.request, name) != getattr(request, name) for name in fields):
                 raise StableError(
                     code=ErrorCode.IDEMPOTENCY_CONFLICT,
-                    message="same request id submitted with a different payload hash",
+                    message="same request id submitted with different execution semantics",
                     details={"request_id": request.request_id},
                 )
             if (
@@ -303,6 +337,11 @@ class InMemoryBackend:
                 self._spawn(existing, session_id)
             return _handle_for(self._backend_id, session_id, existing)
 
+        if any(rid == request.request_id for _, rid in state._requests):
+            # Frozen Ack addresses request_id alone. A second scoped owner
+            # would be ambiguous, so do not create one or execute its callback.
+            raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message="Backend request identity is already owned by another scope")
+        self._reserve_capacity(request)
         record = _RequestRecord(request, state.now_us())
         state._requests[key] = record
         state._by_handle[record.handle_bytes] = key
@@ -320,13 +359,14 @@ class InMemoryBackend:
 
         async def run() -> None:
             try:
-                status, usage_jcs, error_jcs = await self._executor(record.request)
+                value = await self._executor(record.request)
+                outcome = value if isinstance(value, ExecutionOutcome) else ExecutionOutcome(*value)
             except Exception as exc:  # noqa: BLE001 - terminal must be reached
                 failure = (
                     exc if isinstance(exc, StableError)
-                    else StableError(code=ErrorCode.INTERNAL, message=f"executor failed: {exc!r}")
+                    else StableError(code=ErrorCode.INTERNAL, message="executor failed")
                 )
-                status, usage_jcs, error_jcs = (
+                outcome = ExecutionOutcome(
                     "FAILED",
                     canonical_json({}),
                     failure.canonical_bytes(),
@@ -334,13 +374,23 @@ class InMemoryBackend:
             self.commit_terminal(
                 record.request.request_id,
                 record.request.dedupe_scope,
-                status=status,
-                usage_jcs=usage_jcs,
-                error_jcs=error_jcs,
+                status=outcome.status,
+                usage_jcs=outcome.usage_jcs,
+                error_jcs=outcome.error_jcs,
+                result_artifact_id=outcome.result_artifact_id,
                 incarnation=incarnation,
             )
 
-        self._tasks[key] = asyncio.get_running_loop().create_task(run())
+        task = asyncio.get_running_loop().create_task(run())
+        self._tasks[key] = task
+        def completed(worker):
+            if self._tasks.get(key) is worker:
+                self._tasks.pop(key, None)
+            if not worker.cancelled():
+                # Late/stale owners can be refused at terminal commit. Consume
+                # that task exception; it must never become a second result.
+                worker.exception()
+        task.add_done_callback(completed)
 
     # -- terminal commit (owner-checked) ---------------------------------------
     def commit_terminal(
@@ -378,7 +428,14 @@ class InMemoryBackend:
                 message="stale incarnation cannot commit terminal result",
                 details={"incarnation": incarnation, "current": record.incarnation},
             )
+        try:
+            ExecutionOutcome(status, usage_jcs, error_jcs, result_artifact_id)
+        except (ValueError, TypeError) as exc:
+            raise StableError(code=ErrorCode.INVALID_RESULT, message="Backend terminal outcome is invalid") from exc
         if record.result is not None:
+            old = record.result
+            if (old.status, bytes(old.usage_jcs), bytes(old.error_jcs), old.result_artifact_id, old.effect_state_unknown) != (status, usage_jcs, error_jcs, result_artifact_id, effect_state_unknown):
+                raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message="Backend terminal outcome conflicts with its first result")
             return record.result  # idempotent terminal replay
         if record.state == "UNKNOWN":
             raise StableError(
@@ -433,10 +490,15 @@ class InMemoryBackend:
         )
 
     def _require_record(self, handle: eb.ExecutionHandle) -> _RequestRecord:
+        self._require_session(handle.session_id, allow_closed=True)
+        if handle.backend_id != self._backend_id:
+            raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="Backend handle identity mismatch")
         key = self._state._by_handle.get(bytes(handle.opaque_handle))
         if key is None:
             raise StableError(code=ErrorCode.NOT_FOUND, message="unknown handle")
         record = self._state._requests[key]
+        if handle.request_id != record.request.request_id:
+            raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="Backend handle request mismatch")
         if handle.incarnation != record.incarnation:
             raise StableError(
                 code=ErrorCode.HANDLE_EXPIRED, message="stale handle incarnation"
@@ -451,6 +513,10 @@ class InMemoryBackend:
     async def cancel(self, request: eb.CancelRequest) -> eb.CancelReport:
         record = self._require_record(request.handle)
         mode = request.mode or "GRACEFUL"
+        if mode not in ("GRACEFUL", "FORCE") or request.deadline_at_us < 0:
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="Backend cancellation mode/deadline is invalid")
+        if record.state == "UNKNOWN":
+            return eb.CancelReport(status="UNKNOWN", terminal_confirmed=False, details_jcs=canonical_json({}))
         if record.result is not None:
             return eb.CancelReport(
                 status=record.state,
@@ -461,11 +527,13 @@ class InMemoryBackend:
         task = self._tasks.get(key)
         if task is not None and not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            self._tasks.pop(key, None)
+            deadline = request.deadline_at_us or self._state.now_us() + 5_000_000
+            remaining = max(0, min(5_000_000, deadline - self._state.now_us())) / 1_000_000
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if not done:
+                record.state, record.effect_state_unknown = "UNKNOWN", True
+                record.updated_at_us = self._state.now_us()
+                return eb.CancelReport(status="UNKNOWN", terminal_confirmed=False, details_jcs=canonical_json({}))
         if mode == "FORCE" and record.result is None:
             # Forced cancellation with no observed terminal: effect state is
             # unknown and the workload can never commit a result afterwards.
@@ -496,19 +564,21 @@ class InMemoryBackend:
 
     # -- reconcile / ack / close ---------------------------------------------------
     async def reconcile(self, request: eb.ReconcileRequest) -> eb.ReconcileReport:
+        self._require_session(request.session_id)
         now = self._state.now_us()
         report = eb.ReconcileReport(observed_at_us=now)
+        seen = set()
         for known in request.known:
-            record = next(
-                (
-                    r
-                    for (_, rid), r in self._state._requests.items()
-                    if rid == known.request_id
-                ),
-                None,
-            )
-            if record is None:
+            matches = [(key, r) for key, r in self._state._requests.items()
+                if key[1] == known.request_id and r.request.realm_id == request.realm_id
+                and (not known.payload_hash or known.payload_hash == r.request.payload_hash)
+                and (not known.handle.opaque_handle or bytes(known.handle.opaque_handle) == r.handle_bytes)]
+            if not matches:
                 continue
+            if len(matches) != 1:
+                raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message="Backend binding identity is ambiguous")
+            key, record = matches[0]
+            seen.add(key)
             binding = report.bindings.add()
             binding.known.CopyFrom(known)
             binding.status = "TERMINAL" if record.result is not None else record.state
@@ -518,11 +588,10 @@ class InMemoryBackend:
                 binding.renewed_handle.CopyFrom(
                     _handle_for(self._backend_id, request.session_id, record)
                 )
-        seen = {known.request_id for known in request.known}
         for (scope, request_id), record in self._state._requests.items():
-            if request_id in seen or record.request.realm_id != request.realm_id:
+            if (scope, request_id) in seen or record.request.realm_id != request.realm_id:
                 continue
-            if record.state in ("RUNNING", "PREPARED"):
+            if record.state in ("RUNNING", "PREPARED", "UNKNOWN"):
                 orphan = report.orphans.add()
                 orphan.handle.CopyFrom(
                     _handle_for(self._backend_id, request.session_id, record)
@@ -533,20 +602,23 @@ class InMemoryBackend:
         return report
 
     async def acknowledge_terminal(self, request: eb.TerminalAck) -> eb.AckReport:
-        for record in self._state._requests.values():
-            if record.request.request_id != request.request_id:
-                continue
+        self._require_session(request.session_id, allow_closed=True)
+        matches = [record for record in self._state._requests.values() if record.request.request_id == request.request_id]
+        if len(matches) > 1:
+            raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message="Backend acknowledgement identity is ambiguous")
+        for record in matches:
             if record.result is None:
                 raise StableError(
                     code=ErrorCode.FAILED_PRECONDITION, message="request not terminal"
                 )
-            if request.result_hash and request.result_hash != record.result.result_hash:
+            if request.result_hash != record.result.result_hash:
                 raise StableError(
                     code=ErrorCode.REVISION_CONFLICT,
                     message="acknowledgement hash mismatch",
                 )
-            record.terminal_acknowledged = True
-            record.retained_until_us = self._state.now_us() + 3_600_000_000
+            if not record.terminal_acknowledged:
+                record.terminal_acknowledged = True
+                record.retained_until_us = max(record.retained_until_us, self._state.now_us() + 3_600_000_000)
             return eb.AckReport(
                 status="ACKNOWLEDGED", retained_until_us=record.retained_until_us
             )
@@ -555,6 +627,10 @@ class InMemoryBackend:
         )
 
     async def close_session(self, session: eb.BackendSession) -> eb.CloseReport:
+        self._require_session(session.session_id, allow_closed=True)
+        if session.backend_id != self._backend_id:
+            raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="Backend session identity mismatch")
+        self._open_sessions.discard(session.session_id)
         self._closed_sessions.add(session.session_id)
         now = self._state.now_us()
         self._state._sessions[session.session_id] = {"closed": True, "at_us": now}
