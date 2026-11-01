@@ -8,6 +8,37 @@ The normative design is [`docs/Agent_Meta_Runtime_Requirements_Design_v0.1.md`](
 The step-by-step implementation plans start at [`docs/plans/v0.1/README.md`](docs/plans/v0.1/README.md).
 Per-ID traceability lives in [`docs/spec/v0.1-scope-and-traceability.md`](docs/spec/v0.1-scope-and-traceability.md).
 
+## Development control plane
+
+On Windows, an installed development wheel now provides a real foreground
+daemon, Named Pipe discovery and signed shutdown (Public API 1.1):
+
+```powershell
+$runtimeData = Join-Path $env:LOCALAPPDATA 'AgentMetaRuntime\data'
+agent-meta --data-dir $runtimeData --output json init
+agent-meta --data-dir $runtimeData --output json start
+# In another shell, with the same absolute data directory:
+agent-meta --data-dir $runtimeData --output json info
+agent-meta --data-dir $runtimeData --output json stop
+```
+
+Initialization uses CurrentUser DPAPI and owner-only DACLs. `start` holds the OS
+writer lock; a concurrent start or init returns exit 12. `stop` acknowledges
+`STOPPING` for the connected instance. Without an active package the owner
+reports serving-not-ready. The development Host now executes explicitly trusted
+signed in-process AMPAKs, zero-cost model calls and PURE tools after actual
+factory/health convergence. See [ADR 037](docs/adr/037-bound-trusted-host-and-durable-invocation-journal.md)
+for the frozen snapshots, invocation recovery, supported schema/Context subset
+and remaining gates. This profile does not provide process isolation, paid
+Provider egress or State/Scratch access. Non-Windows
+secure credential storage remains pending; fixture plaintext requires the
+explicit `--insecure-dev-credential-file` option.
+
+[ADR 038](docs/adr/038-harness-source-audit-and-serving-recovery.md) adds source/
+provenance/package-ownership validation and old-serving recovery after a failed
+candidate. The actual in-process owner reports unattached worker Backend
+features as unsupported; its frozen profile hash reflects that distinction.
+
 ## What it is
 
 The runtime is a single-user, locally-running Python service (CPython 3.12) that
@@ -190,6 +221,37 @@ so `max_steps` is the sum. The only effect path is the Provider-normalized
 (§41.53).
 
 ## Source layout
+
+Public API 1.2 adds bounded operator execution inspection through
+`client.get_task_execution(task_id)` or `agent-meta task execution <task-id>`.
+It returns durable Invocation/Projection references, status and budget metadata
+without exposing store paths or raw contents. See [ADR 040](docs/adr/040-public-task-execution-inspection.md).
+
+Public API 1.7 adds secretless Provider plan/normalization callbacks to
+`sdk.host` ([ADR 054](docs/adr/054-public-provider-plan-and-normalization-spi.md)).
+These callbacks require Runtime-approved profile, exact-tokenizer and pricing
+enforcement. The current daemon rejects an unavailable configuration before
+creating an Invocation; this SPI does not advertise configured or live Provider
+support. Existing explicitly zero-cost adapters retain their behavior.
+
+Public API 1.8 adds signed Root-operator approval of an installation's declared
+Provider profile and opaque credential handle. Configuration revisions and
+Task snapshots are durable; approval does not start a request or make an
+unready profile executable. Frozen pricing/usage primitives and the remaining
+execution work are described in [ADR 055](docs/adr/055-provider-profile-approval-and-frozen-pricing.md).
+
+Public API 1.9 adds read-only validation and a reviewable configuration CLI.
+The separate native `agent-meta-provider-credential` entry point imports a
+credential into a Realm-scoped protected store and returns only its handle.
+See [the operator procedure](docs/provider-operator-workflow.md) and
+[ADR 056](docs/adr/056-provider-credential-provisioning-and-reviewable-cli.md).
+Approval still does not enable configured model execution in this checkpoint.
+
+An embedded Root-only loopback `TEST` assembly now exercises approved Provider
+Tasks through the native worker and independent wire-usage settlement. Its
+separate Host profile and limits are described in
+[ADR 057](docs/adr/057-frozen-provider-admission-and-controlled-daemon-assembly.md).
+The default daemon and real Provider readiness remain unchanged.
 
 ```
 src/agent_meta_runtime/

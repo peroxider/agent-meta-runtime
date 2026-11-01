@@ -25,6 +25,8 @@
 > **r10 Python 命名修订**：PyPI distribution与仓库保持`agent-meta-runtime`，Python import namespace冻结为更具体的`agent_meta_runtime`；CLI保持`agent-meta`，语言中立Protobuf package保持`agent_meta.*`。
 
 > **r11 跨项目解耦修订**：Seed Harness迁移为外部项目`agent-meta-seed-harness`；Meta-Runtime不反向依赖其代码、Artifact、Composition或测试结果，并冻结core/serving双readiness、Harness install协议与跨仓库兼容矩阵。
+>
+> **Context开发补充**：[ADR 039](adr/039-frozen-context-policy-and-host-recomputation.md)定义公开通用Context机制、冻结来源和Host独立重算。外部Harness拥有应用策略；§41.44.4及External-Seed验收范围不变，开发回归不等于完整门禁通过。
 
 ---
 
@@ -3309,6 +3311,14 @@ Token 至少绑定 actor、action、effect kind、resource ceiling、realm、exp
 
 v0.1 execution token 使用 JCS payload + daemon Service Principal Ed25519 signature，不使用可变 JWT library defaults。Init 生成独立 service key存 Credential Store，Root签署其 `{service_principal_id,public_key,realm_id,epoch_id,permissions,not_after}` certificate Artifact；它绝不复用 Root private key。Token payload固定为 `{token_version:1,token_id,backend_session_id,realm_id,actor_id,action_id,effect_kind,target_scope_hash,resource_ceiling,issued_at_us,expires_at_us,nonce}`；signature preimage 为 `agent-meta-execution-token-v1\0` + JCS bytes。TTL 默认 60 秒且不得超过 Task deadline。Backend session negotiation取得 certificate chain并验证 Root public key、service certificate、signature/session/expiry/nonce；相同 token_id 仅允许相同 request_id重放。Meta Store只保存 token_id/payload hash/public key id/use Fact，不保存 serialized token。Portable同进程 Adapter仍执行相同 verifier contract。
 
+[ADR 047](adr/047-root-certified-service-execution-tokens.md)固定证书/token的JCS envelope、Root证书
+签名域与有限重放缓存。验证方独立pin Root/Realm/Epoch，并从已登记操作推导binding，不信任token自报scope。
+该纯契约实现不代替实际bootstrap证书、worker装配、效果预留与持久terminal acknowledgement。
+
+[ADR 049](adr/049-bootstrap-public-service-certificate.md)在native init的同一bootstrap事务登记实际
+Root签名Service公开证书；worker只取得公开链并用独立Service签名验证，证书本身不产生effect授权。
+旧开发数据缺证书时不隐式补签，未来执行profile须明确拒绝；证书更新与实际Backend装配仍按各自门禁验证。
+
 默认安全策略：
 
 - `in_process` 仅允许内建/签名/显式信任的 Capability；第三方与 Candidate 默认 `isolated_process`；
@@ -4489,12 +4499,12 @@ v0.1 canonical event type 不允许 Adapter 自创；新增类型必须先加入
 | Runtime/Realm | `runtime_initialized`、`runtime_started`、`runtime_stopping`、`readiness_changed`、`epoch_created` |
 | Artifact | `artifact_registered`、`artifact_verified`、`artifact_corrupt_observed`、`artifact_accessed_restricted`、`artifact_crypto_erased` |
 | Capability | `capability_defined`、`capability_validated`、`instance_transitioned`、`instance_degraded` |
-| Harness | `harness_installed`、`harness_activated`、`harness_deactivated`、`harness_uninstalled`、`harness_contract_rejected` |
+| Harness | `harness_installed`、`harness_activated`、`harness_deactivated`、`harness_uninstalled`、`harness_contract_rejected`、`provider_configured`（ADR 055） |
 | Composition | `composition_committed`、`reconcile_started`、`serving_switched`、`realization_completed`、`reconcile_failed`、`composition_rolled_back` |
 | State | `state_revision_created`、`migration_started`、`migration_completed`、`migration_failed` |
-| Authority | `grant_created`、`grant_delegated`、`grant_revoked`、`authority_denied`、`root_recovery_performed` |
+| Authority | `principal_registered`、`grant_created`、`grant_delegated`、`grant_revoked`、`authority_denied`、`root_recovery_performed` |
 | Task | `task_accepted`、`task_started`、`task_succeeded`、`task_failed`、`task_recovery_failed`、`task_cancel_requested`、`task_cancelled`、`task_timed_out` |
-| Action/Invocation | `action_started`、`action_finished`、`invocation_created`、`invocation_attempted`、`invocation_finished`、`late_completion_observed` |
+| Action/Invocation | `action_started`、`action_finished`、`invocation_created`、`invocation_attempted`、`invocation_finished`、`provider_cost_reserved`、`provider_cost_settled`、`provider_dispatch_authorized`（ADR 052/053：内部费用/dispatch账本，公开Provider接入仍OPEN）、`late_completion_observed` |
 | Execution | `execution_submitted`、`execution_bound`、`execution_status_observed`、`execution_orphan_quarantined`、`external_effect_unknown`、`terminal_acknowledged` |
 | Evolution | `proposal_created`、`candidate_created`、`experiment_started`、`evidence_recorded`、`evaluation_recorded`、`promotion_requested`、`candidate_promoted`、`candidate_rejected` |
 | Operations | `outbox_dead_lettered`、`projection_rebuilt`、`security_degradation_observed`、`diagnostics_collected` |
@@ -4640,6 +4650,12 @@ Outbox `dedupe_key = sha256(kind + NUL + realm_id + NUL + semantic_entity_id + N
 配置加载后写 `effective-config.redacted.json`，采用 JCS 和 `config_fingerprint`；secret value 替换为 `{source, handle, present}`。热更新 v0.1 仅支持 log level 和 metrics export interval；其他变化要求 graceful restart。
 
 ### 41.39.2 daemon lock 与 shutdown
+
+Public API 1.1管理面实现见[ADR 035](adr/035-local-daemon-lifecycle.md)：公开`Runtime.Stop`
+使用现有CommandRequest/MutationResponse，签名payload固定`instance_id,reason_code`，要求
+`runtime.admin.stop`。Hello返回的实例身份经SDK暴露；旧停止命令可恢复原回执但不能停止新实例。
+`agent-meta start`以前台方式持锁运行，`info`发现实际连接实例，`stop`提交签名请求；
+没有绑定真实执行Host时不得仅凭持久refs宣布serving ready。
 
 `<data_dir>/run/daemon.lock` 使用 OS advisory exclusive lock，文件内容为 instance id、pid、process start identity 和 endpoint。不得仅用 PID 文件判断所有权。无法获取锁时 daemon 返回 exit code 12/`ALREADY_RUNNING`。`init` 与 offline migration 必须获得同一锁；CLI read/write 只经 daemon。
 
@@ -5119,6 +5135,7 @@ Filesystem target 必须在 workspace root 下通过 handle-relative/openat 类�
 | `capability.register/v1` | `capability_id, descriptor_artifact_id, expected_descriptor_revision` |
 | `harness.install/v1` | `manifest_artifact_id, package_artifact_id, expected_meta_revision` |
 | `harness.activate/v1` | `harness_id, composition_body_artifact_id, grant_requests_artifact_id, expected_meta_revision, expected_serving_revision` |
+| `harness.configure-provider/v1` | `harness_id, capability_id, profile_artifact_id, credential_handle, enabled, expected_configuration_revision`；envelope required `expected_meta_revision`；当前Epoch Root operator专用（ADR 055） |
 | `harness.deactivate/v1` | `harness_id, expected_meta_revision, expected_serving_revision, reason_code` |
 | `harness.uninstall/v1` | `harness_id, expected_meta_revision, expected_status, reason_code` |
 | `composition.commit/v1` | `composition_body_artifact_id, expected_meta_revision, expected_desired_revision` |
@@ -5342,6 +5359,29 @@ message PutChunkResponse { uint64 committed_offset = 1; }
 
 所有 resource JCS 的 `resource_type` 固定：`task-handle/v1`、`task-result/v1`、`artifact-manifest/v1`、`capability-descriptor/v1`、`harness-validation/v1`、`harness-installation/v1`、`composition-commit/v1`、`state-revision/v1`、`authority-grant/v1`、`proposal-result/v1`、`candidate-result/v1`、`experiment-handle/v1`、`promotion-result/v1`、`scratch-session/v1`、`scratch-execution/v1`、`operation-handle/v1`、`action-result/v1`。Reader 使用 `schema_version`，未知 optional field 忽略并 round-trip；未知 required semantic 通过 schema major 失败。
 
+Public API 1.2依[ADR 040](adr/040-public-task-execution-inspection.md)新增`Task.GetExecution`
+（现有`GetTaskRequest/ResourceResponse`消息）与`task-execution/v1`资源。它在同owner本地管理边界
+只读返回真实Task/Invocation/Projection引用、规范化usage和预算元数据；不返回原始Artifact内容、
+Provider/native对象或凭据。记录/字节上限、Realm范围、schema版本与旧minor拒绝由该ADR固定。
+
+Public API 1.3依[ADR 042](adr/042-public-ordinary-artifact-content.md)新增`Artifact.GetContent`
+（现有`GetArtifactRequest/ResourceResponse`）与`artifact-content/v1`资源。普通内容每次最多1 MiB，
+返回经完整性核对的hex编码，SDK再次验证ArtifactId/size/hash；响应及错误不泄露CAS路径。
+有加密或Restricted tombstone记录的Artifact始终拒绝，不能凭同owner身份或明文副本绕过受权读取。
+
+Public API 1.4依[ADR 044](adr/044-public-ordinary-principals-and-delegation.md)增加签名命令
+`Authority.CreatePrincipal/Delegate/Revoke`，复用`CommandRequest/MutationResponse`与既有42项权限。
+新增`principal-identity/v1`资源及以PrincipalId为entity的`authority.principal_registered` Fact；
+仅注册普通AGENT/CAPABILITY/PEER的公开Ed25519身份，Root/Service仍走专用生命周期。
+委派的父Grant固定为签名envelope中的授权Grant，严格衰减scope/权限/time/epoch/use/depth；
+未实现的非空金额上限明确拒绝。撤销须有权限、归属和完整scope覆盖，不改变历史uses或已提交命令重放。
+CLI的`authority create-principal/delegate/revoke`只传公开身份与显式范围；不导出Root私钥。
+
+Public API 1.5依[ADR 046](adr/046-public-task-state-trace.md)增加`Task.GetTrace`与`task-trace/v1`，
+在同owner管理边界、单一SQLite snapshot中返回本Realm Task的有界Action/Fact状态元数据与causal edges。
+它只返回实际持久化的顺序/状态/原因，不返回原始Fact payload，不从当前状态补造历史。
+SDK为`get_task_trace`，CLI为`task trace`。该观察入口不改变Host权限或声明外部验收完成。
+
 Backup、GC apply、projection rebuild、forced reconcile 和 Experiment 是异步 operation：mutation response 返回 `operation-handle/v1`/`experiment-handle/v1`；`Operations.Get/Wait` 或 `Evolution.GetExperiment/WaitExperiment` 读取 terminal。Operation ACCEPTED row、Action、Fact/outbox先原子提交，外部工作在 transaction外执行，terminal row + Fact再原子提交。Wait timeout不取消 operation；v0.1只有明确支持 cancellation的 Task/Scratch execute暴露 Cancel。
 
 Cursor 是 daemon 使用每次启动 session key 计算的 opaque authenticated token，内容为 query kind、snapshot revision/fact boundary、last sort key、expiry；默认 15 分钟。篡改、query 不匹配或过期返回 `INVALID_ARGUMENT`。分页期间 snapshot 已被 GC（v0.1 canonical row不删除，正常不会发生）则返回 `FAILED_PRECONDITION`。Why cursor还保存 traversal frontier hash，不允许 client 修改 budget 绕过 Authority。
@@ -5349,6 +5389,48 @@ Cursor 是 daemon 使用每次启动 session key 计算的 opaque authenticated 
 CLI 到 RPC/exit code 固定映射：成功 0；参数/schema 2；Authority 3；not found 4；revision/idempotency conflict 5；feature/precondition/readiness 6；temporary Backend/resource/deadline 7；integrity/data loss/key 8；internal 70。Human output 可以演进；`--output json` 必须输出 `{api_version,ok,result|error}`，stderr只输出 redacted diagnostic，stdout只输出一个 JSON document。`--dry-run` 运行全部纯 validation/Authority/plan 但不 claim command id、不写 DB/CAS/outbox、不调用 Backend；结果包含 `would_change`、expected revisions、required permissions/features 和 plan Artifact hash（内容在内存生成，不发布）。
 
 ## 41.53 External Harness Loop Contract 与 Model Terminal Semantics
+
+[ADR 050](adr/050-inmemory-host-activity-and-durable-ack.md)定义显式`execution.host_backend=in_memory`
+开发Host：真实session/submit/handle/await与Root认证Service token，实际Capability instance因果绑定，
+Invocation终态与terminal-ack outbox同事务提交，事务外发送ack；丢失ephemeral session明确标为不可确认，
+不重新执行已确认结果。Public API 1.6的Task.GetExecution只公开binding摘要，当前GetView可选择profile。
+该profile仍为trusted Python、PURE/明确零成本、协作取消和EMULATED持久性，不增加隔离或发布支持声明。
+
+公共执行期SPI的精确Python DTO/Protocol与规范化结果编码见
+[ADR 032](adr/032-public-host-spi.md)，公开import路径为`agent_meta_runtime.sdk.host`。
+该增量仍在开发中：只有实际Host绑定与公开wheel恢复证明通过后，Runtime才可声明
+Harness Contract 1.2.0/Host SPI 1.0.0；仅DTO/Protocol可import不关闭Seed的RP-01/RP-02。
+当前已发布到开发wheel的1.1.0包校验能力不隐含可执行Host支持。
+
+Public API 1.7依[ADR 054](adr/054-public-provider-plan-and-normalization-spi.md)新增
+`ProviderAdapter`、`ProviderRequestPlan`及`ProviderTerminalResponse`，不改变RPC字段编号。
+计划只携带profile ArtifactId及有界canonical terminal Messages body；endpoint、credential及worker由Runtime选择。
+新callback与旧`invoke_model`二选一，共用规范化和串行tool dispatcher；Root Provider edge拥有终态提交。
+缺少批准的profile、exact tokenizer或firm maximum cost时必须在Invocation/调用预留前拒绝。
+当前daemon没有配置该执行入口，公开失败路径证明不等于配置成功、真实Provider支持或RP-03关闭。
+
+Public API 1.8依[ADR 055](adr/055-provider-profile-approval-and-frozen-pricing.md)增加签名
+`Harness.ConfigureProvider`及只含handle的`harness-provider-configuration/v1`批准记录。
+使用精确HARNESS scope的`harness.activate`权限并额外要求当前Epoch Root operator，不向委派的激活主体隐式授予凭据改绑权。
+profile必须匹配签名包及model descriptor；双修订guard保护writer事务，Task View冻结批准FactId，GC保留完整制品closure。
+`enabled`只表示批准，不表示执行就绪。Root冻结profile/计价/usage解析逻辑已实现，公开执行桥仍OPEN；缺exact tokenizer/firm maximum不填0。
+
+Public API 1.9依[ADR 056](adr/056-provider-credential-provisioning-and-reviewable-cli.md)增加签名只读
+`Harness.ValidateProviderConfiguration`及配置CLI dry-run；验证不占用Command、Authority use或Fact，writer仍复查双修订guard。
+独立native `agent-meta-provider-credential`只允许当前Realm Root operator向Provider专用受保护目录导入凭据；
+它直接执行Credential Store及只读Authority验证，属于native enforcement，不改变普通CLI仅走公开API的约束。
+CLI显式读取有界stdin或指定settings文件，输出只有handle/profile；轮换保留旧item，备份只包含完整已发布item。
+Windows使用DPAPI，Linux显式测试存储仍为INSECURE_TEST_ONLY。该操作不批准绑定、不执行模型、不关闭RP-03。
+
+[ADR 057](adr/057-frozen-provider-admission-and-controlled-daemon-assembly.md)实现Root专用的loopback/TEST装配，
+不改变默认daemon的真实Provider门禁。内部预留v2绑定批准Fact和绝对deadline；预留及发送前writer事务均重读
+Task实际冻结View、当前批准、完整profile closure、handle、request和独立最大成本。
+Root以原始wire usage和冻结计价替换包的usage声明；规范化失败仍保留已知费用，unknown不填0，overrun阻止成功交付。
+显式测试CA只由embedded Root constructor选择，使用独立Host profile hash；不开放公开CLI选择，不宣称Managed/真实上游/RP-03关闭。
+
+协作式可信Host依[ADR 045](adr/045-cooperative-host-call-scheduling.md)在三个异步facade操作入口
+先于任何事务/回调让出事件循环，再检查取消、期限和授权，避免连续立即完成的调用饿死管理面。
+该调度点不跨事务持锁，不提供回调内部的硬抢占或隔离保证。
 
 本节是外部Harness的互操作Contract：Runtime必须提供DTO/schema、budget/authority/effect enforcement与Conformance Host tests，但不在产品源码实现该Loop。外部Seed v0.1 Loop不得从自由文本解析自定义命令；唯一effect路径是Provider正规化后的`tool_calls`。每个turn精确定义为一次Model Invocation加其返回的全部tool call串行处理：
 
@@ -5383,6 +5465,10 @@ if max_turns/max_steps/model_calls exhausted: fail RESOURCE_EXHAUSTED
 v0.1公共Model SPI是非streaming terminal response。外部Provider Adapter可以在内部消费provider stream，但不得在terminal commit前把部分内容交给Loop/Tool dispatcher；取消时丢弃未完成partial raw，仅记录受policy允许的redacted diagnostic。Runtime release gate只要求test-only Conformance Provider通过Host Contract，不要求或发布真实/Fake Seed Provider。Provider rate limit映射`RESOURCE_EXHAUSTED`+retry_after，只有尚未确认provider接受request且Retry Policy允许时自动重试；否则按unknown/non-idempotent规则处理。
 
 Task timeout 包含 durable queue 等待；`deadline_at_us` 是从接纳起生效的绝对 wall deadline。Scheduler 取到已过 deadline 的 ACCEPTED Task，直接原子提交 TIMED_OUT，不创建 Model Invocation。每次外部 await 使用 `min(task deadline, operation deadline)`。
+
+接纳标量依[ADR 043](adr/043-strict-task-submission-scalars.md)严格校验，不接受bool、浮点或字符串
+到预算/期限整数的隐式转换；deadline 0必须保留为已过期Unix时间，不能表示无期限。CLI的
+`task submit --deadline-at-us`公开同一既有字段，纯dry-run使用相同校验。
 
 ## 41.54 IPython Scratch v0 Adapter
 
@@ -5573,11 +5659,27 @@ build_provenance_artifact_id: artifact://sha256/...
 
 ### 41.60.3 Validate 与 Install
 
+Harness Contract 1.1.0（[ADR 031](adr/031-public-harness-consumer-contract.md)）补齐消费者打包入口
+`agent_meta_runtime.sdk.packages`，不改变AMPAK1编码和manifest字段。
+publisher identity Artifact内容为32-byte raw Ed25519 public key，signature Artifact内容为64-byte raw Ed25519 signature；
+两者均按内容SHA-256寻址。自签名不等于受信publisher；只有operator显式配置的publisher fingerprint
+才允许按`builtin_or_signed`placement执行，其余采用`trusted_candidate`约束。
+grant request的`scope`使用§41.28的typed Scope对象，拒绝`REALM_ALL`及authority/harness/runtime管理权限请求。
+`ValidatePackage`对每个引用校验内容hash；JSON制品必须为无重复key的JCS object。
+plan hash绑定manifest、所有验证过的ArtifactId、resolved contract versions、Backend feature levels和trust class。
+`Install`重跑验证且请求identity必须与签名manifest一致；已提交command重放先返回原receipt。
+
 `Harness.ValidatePackage`是纯query：验证AMPAK/hash/path、manifest/schema/signature、contract range、Capability descriptor、Composition template、loop policy、grant request、Backend feature和placement；返回排序issue、resolved contract versions、trust class、requested permissions/features和plan hash，不写DB/CAS或执行代码。`Harness.Get`按`harness_id`读取单个installation；`Harness.List`按`(package_name,package_version,harness_id)`升序、使用41.52 authenticated snapshot cursor分页，默认/最大limit为100/1000，空`status`表示全部，非空必须是状态枚举。
 
 `Harness.Install`要求`harness.install`，只接受已经由Artifact.Put进入staging/CAS的manifest/package Artifact。单一事务登记Artifact引用、immutable Capability descriptors、`harness_installations(status=INSTALLED)`、history、Action/Fact；`harness_id`为`harness://<uuidv7>`。Install不得创建Grant、Composition revision、Instance、Task或Backend request，不运行package entrypoint。相同command幂等重放；同Realm相同package name/version但不同hash返回`IDEMPOTENCY_CONFLICT`。安装成功不改变serving readiness。
 
 ### 41.60.4 Activate 与 Deactivate
+
+具体CommandEnvelope绑定见[ADR 034](adr/034-signed-activation-plan-and-delegation.md)：
+`plan_hash`必须等于当前ValidatePackage报告值，`grant_request_hash`为完整请求数组JCS的SHA-256；
+envelope必须有`expected_meta_revision`，签名payload必须有`expected_serving_revision`。
+实际Composition的slot只能引用该installation签名descriptor的精确code Artifact或显式Runtime builtin。
+SDK `prepare_harness_activation`只读查询并返回完整可持久重发的签名命令；缺失/陈旧guard或委派扩权均拒绝。
 
 `Harness.Activate`要求`harness.activate`以及grant request中每项permission的签发权。事务前重跑Validate并生成CompatibilityReport；operator必须签署包含plan hash、grant request hash、expected meta/serving revision的CommandEnvelope。v0.1每个由Harness提交的Composition只能引用该installation提供的Capability与Runtime builtin；跨多个外部package拼装同一Composition延期。事务创建显式scoped Grants、immutable Composition revision、desired CAS、Harness activation Operation/Action/Fact/outbox；不直接改变serving。Reconciler成功切换后，在同一terminal事务把新installation标`ACTIVE`，把先前ACTIVE installation标`INACTIVE`并撤销其scoped Grants，然后写双方history和`harness_activated`；切换前新installation保持`INSTALLED/INACTIVE`。失败时撤销本次所有activation-scoped Grants（已发生的use审计历史保留）、保持旧serving，installation状态不变。
 
@@ -5588,6 +5690,11 @@ build_provenance_artifact_id: artifact://sha256/...
 `Harness.Uninstall`要求`harness.uninstall`，仅允许`INSTALLED/INACTIVE`且不存在desired/serving/realized Composition、non-terminal Task、active Instance、State owner或unsettled Effect引用。事务撤销残余Grant、标`UNINSTALLED`、写history/Fact；不删除Artifact、Fact、Composition、Evidence或历史row。GC以后按41.47 retention决定不可达bytes。UNINSTALLED是terminal；v0.1同一Realm不得重新安装相同`package_name + package_version`，必须发布新版本并获得新`harness_id`，历史不复活。
 
 升级固定为install新version → validate/experiment → activate新Composition → drain旧version → uninstall旧installation；禁止原地改package/hash/version。回滚只切换到仍installed且Artifact可读的旧Composition/State，遵守41.59.3。
+
+归属检查依[ADR 041](adr/041-installation-reference-and-grant-generation-guards.md)：卸载阻止项必须
+属于目标installation的不可变Composition/Capability版本闭包，而不是Realm内其他包的正常serving或
+Task。State owner和未决Effect（含UNKNOWN）仍必须阻止卸载。生命周期撤销覆盖旧激活代的所有
+scoped Grants；同一installation再次激活时只保留当前代，不能留下更早代的隐式权限。
 
 ### 41.60.6 CLI、跨仓库CI与失败隔离
 
@@ -6553,6 +6660,24 @@ AgentOS Kernel
 ---
 
 # 49. 最终定义
+
+实现补充（2026-10-30）：[ADR 033](adr/033-local-command-authority-and-credential-storage.md)
+固定公开CommandEnvelope签名/Grant执行规则、可重发SDK表示以及Windows DPAPI/DACL凭据存储。
+本补充保留Public API v1的现有字段与冻结权限词表；非Windows安全凭据后端、完整Host恢复与
+外部Seed验收仍待实现，不因局部单元证明而改变发布状态。
+
+Host生命周期补充见[ADR 036](adr/036-task-free-factories-and-async-reconciliation.md)：
+AMPAK同步factory不接收Task，实际Task只在执行入口传入；PURE health有独立DTO与异步回调。
+异步Reconciler复用原A–H事务程序，外部await期间不持SQLite事务，所有切换/完成受冻结desired CAS约束。
+后续实现见[ADR 037](adr/037-bound-trusted-host-and-durable-invocation-journal.md)：
+显式信任的进程内Host已接通冻结接收View、Context登记、模型/PURE工具调用、同事务Authority/预算
+预留以及已确认结果重放/未知结果终止恢复。仅支持独立计数的utf8-bytes Context子集和显式零成本
+模型结果；不宣称完整Context、受控联网/凭据、强隔离或外部Seed最小版门禁已经完成。
+
+[ADR 038](adr/038-harness-source-audit-and-serving-recovery.md)实现全包源码边界与provenance/code归属
+验证，并使实际serving health独立于desired候选状态；候选失败后，旧serving继续接收Task，重启时
+必须实际重绑定并重新探活原快照。相对导入架构lint现按真实Python import root解析；Reconciler通过
+显式端口复用Service同事务授权，不直接依赖Adapter。该实现不提升任何完整发布验收状态。
 
 本设计中的 **Agent Meta-Runtime** 定义为：
 
