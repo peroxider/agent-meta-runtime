@@ -7,5 +7,5 @@ configured at the edge. Domain never imports adapters, sqlite3, IPython or grpc.
 
 from __future__ import annotations
 
-__version__ = "0.0.1"
+__version__ = "0.1.0.dev1"
 

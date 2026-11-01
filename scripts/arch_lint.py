@@ -55,7 +55,8 @@ def _resolve_relative(root: Path, file: Path, node: ast.ImportFrom) -> str:
     base = file.parent
     for _ in range(node.level - 1):
         base = base.parent
-    parts = list(base.relative_to(root).parts)
+    import_root = root / "src" if file.is_relative_to(root / "src") else root
+    parts = list(base.relative_to(import_root).parts)
     if node.module:
         parts.append(node.module)
     return ".".join(parts)
