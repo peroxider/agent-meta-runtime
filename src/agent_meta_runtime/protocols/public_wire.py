@@ -37,7 +37,7 @@ __all__ = [
 ]
 
 PUBLIC_API_MAJOR = 1
-PUBLIC_API_MINOR = 0
+PUBLIC_API_MINOR = 9
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 HELLO_TIMEOUT_S = 5.0
@@ -65,14 +65,21 @@ METHODS: dict[str, tuple[Any, Any]] = {
         _m("Runtime", "GetView", pub.GetViewRequest, pub.ResourceResponse),
         _m("Runtime", "Doctor", pub.DoctorRequest, pub.DoctorResponse),
         _m("Runtime", "GetMetrics", pub.GetMetricsRequest, pub.GetMetricsResponse),
+        _m("Runtime", "Stop", pub.CommandRequest, pub.MutationResponse),
+        _m("Authority", "CreatePrincipal", pub.CommandRequest, pub.MutationResponse),
+        _m("Authority", "Delegate", pub.CommandRequest, pub.MutationResponse),
+        _m("Authority", "Revoke", pub.CommandRequest, pub.MutationResponse),
         _m("Task", "Submit", pub.CommandRequest, pub.MutationResponse),
         _m("Task", "Get", pub.GetTaskRequest, pub.ResourceResponse),
+        _m("Task", "GetExecution", pub.GetTaskRequest, pub.ResourceResponse),
+        _m("Task", "GetTrace", pub.GetTaskRequest, pub.ResourceResponse),
         _m("Task", "Wait", pub.WaitTaskRequest, pub.TaskWaitResponse),
         _m("Task", "Cancel", pub.CommandRequest, pub.MutationResponse),
         _m("Artifact", "BeginPut", pub.BeginPutRequest, pub.BeginPutResponse),
         _m("Artifact", "PutChunk", pub.PutChunkRequest, pub.PutChunkResponse),
         _m("Artifact", "Put", pub.CommandRequest, pub.MutationResponse),
         _m("Artifact", "GetManifest", pub.GetArtifactRequest, pub.ArtifactManifestResponse),
+        _m("Artifact", "GetContent", pub.GetArtifactRequest, pub.ResourceResponse),
         _m("Artifact", "Verify", pub.VerifyArtifactRequest, pub.VerifyArtifactResponse),
         _m("Composition", "Validate", pub.ValidateCompositionRequest, pub.ValidateCompositionResponse),
         _m("Composition", "Commit", pub.CommandRequest, pub.MutationResponse),
@@ -82,6 +89,8 @@ METHODS: dict[str, tuple[Any, Any]] = {
         _m("Harness", "List", pub.ListHarnessRequest, pub.ResourceResponse),
         _m("Harness", "Install", pub.CommandRequest, pub.MutationResponse),
         _m("Harness", "Activate", pub.CommandRequest, pub.MutationResponse),
+        _m("Harness", "ConfigureProvider", pub.CommandRequest, pub.MutationResponse),
+        _m("Harness", "ValidateProviderConfiguration", pub.CommandRequest, pub.ResourceResponse),
         _m("Harness", "Deactivate", pub.CommandRequest, pub.MutationResponse),
         _m("Harness", "Uninstall", pub.CommandRequest, pub.MutationResponse),
         _m("Evolution", "Propose", pub.CommandRequest, pub.MutationResponse),
@@ -99,6 +108,11 @@ METHODS: dict[str, tuple[Any, Any]] = {
         _m("Operations", "GcApply", pub.CommandRequest, pub.MutationResponse),
     )
 }
+
+METHOD_MINORS = {"agent_meta.public.v1.Runtime.Stop": 1, "agent_meta.public.v1.Task.GetExecution": 2,
+    "agent_meta.public.v1.Artifact.GetContent": 3,
+    "agent_meta.public.v1.Authority.CreatePrincipal": 4, "agent_meta.public.v1.Authority.Delegate": 4,
+    "agent_meta.public.v1.Authority.Revoke": 4, "agent_meta.public.v1.Task.GetTrace": 5}
 
 
 def encode_frame(payload: bytes) -> bytes:

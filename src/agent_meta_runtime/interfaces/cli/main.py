@@ -26,7 +26,9 @@ from typing import Any
 from ...domain.errors import ErrorCode, StableError
 from ...protocols.public_wire import PUBLIC_API_MAJOR, PUBLIC_API_MINOR
 from ..local_api.connection import LocalConnection
-from ...sdk import AgentMetaClient
+from ...sdk import AgentMetaClient, LocalTransport
+from ...sdk import CommandAuthority, decode_command
+from ...adapters.credentials import operator_signing_authority
 from .init import run_init
 
 __all__ = ["EXIT_CODES", "build_parser", "main", "run_cli"]
@@ -53,7 +55,7 @@ EXIT_CODES: dict[str, int] = {
     ErrorCode.FAILED_PRECONDITION: _EXIT_READINESS,
     ErrorCode.SERVING_NOT_READY: _EXIT_READINESS,
     ErrorCode.NO_SERVING_COMPOSITION: _EXIT_READINESS,
-    ErrorCode.ALREADY_RUNNING: _EXIT_READINESS,
+    ErrorCode.ALREADY_RUNNING: 12,
     ErrorCode.CONTRACT_INCOMPATIBLE: _EXIT_READINESS,
     ErrorCode.BACKEND_UNAVAILABLE: _EXIT_TEMPORARY,
     ErrorCode.RESOURCE_EXHAUSTED: _EXIT_TEMPORARY,
@@ -68,21 +70,6 @@ EXIT_CODES: dict[str, int] = {
 }
 
 
-class _LocalTransport:
-    """Adapts one :class:`LocalConnection` to the SDK ``Transport`` protocol."""
-
-    def __init__(self, connection: LocalConnection) -> None:
-        self._connection = connection
-
-    async def call(
-        self, method: str, request: bytes, *, deadline_us: int | None = None
-    ) -> bytes:
-        return await self._connection.call_raw(method, request, deadline_us=deadline_us)
-
-    async def close(self) -> None:
-        await self._connection.close()
-
-
 def _socket_path(data_dir: Path) -> Path:
     return Path(data_dir) / "run" / "agent-meta.sock"
 
@@ -94,11 +81,22 @@ async def _connect(args: argparse.Namespace) -> AgentMetaClient:
     except StableError:
         await connection.close()
         raise
-    return AgentMetaClient(_LocalTransport(connection))
+    authority = None
+    try:
+        operator, signer = operator_signing_authority(args.data_dir, allow_insecure=args.insecure_dev_credential_file)
+        if args.actor is None:
+            args.actor = operator["actor_id"]
+        if args.actor == operator["actor_id"]:
+            authority = CommandAuthority(operator["actor_id"], operator["authority_grant_id"], signer)
+    except StableError:
+        if args.command in {"authority", "task", "artifact", "composition", "harness", "evolution", "operations", "stop"}:
+            await connection.close()
+            raise
+    return AgentMetaClient(LocalTransport(connection), authority=authority)
 
 
 def _emit_json(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, sort_keys=True))
+    print(json.dumps(payload, sort_keys=True), flush=True)
 
 
 def _fail(args: argparse.Namespace, exc: StableError) -> int:
@@ -116,6 +114,13 @@ def _fail(args: argparse.Namespace, exc: StableError) -> int:
         )
     else:
         print(f"error: {exc.code}: {exc.message}", file=sys.stderr)
+    if args.command == "start":
+        startup_codes = {ErrorCode.INVALID_ARGUMENT: 2, ErrorCode.INTEGRITY_ERROR: 3,
+                         ErrorCode.DATA_LOSS: 3, ErrorCode.FAILED_PRECONDITION: 3,
+                         ErrorCode.AUTHORITY_DENIED: 4, ErrorCode.KEY_UNAVAILABLE: 4,
+                         ErrorCode.BACKEND_UNAVAILABLE: 5, ErrorCode.CONTRACT_INCOMPATIBLE: 5,
+                         ErrorCode.ALREADY_RUNNING: 12}
+        return startup_codes.get(exc.code, _EXIT_INTERNAL)
     return EXIT_CODES.get(exc.code, _EXIT_INTERNAL)
 
 
@@ -130,18 +135,23 @@ def _emit_result(args: argparse.Namespace, result: Any) -> int:
 #: Static dry-run declaration of the authority each mutation requires
 #: (§41.52: plans must state required permissions/capabilities).
 _REQUIRED_PERMISSIONS: dict[str, tuple[str, ...]] = {
+    "authority.principal.create/v1": ("authority.grant",),
+    "authority.delegate/v1": ("authority.delegate",),
+    "authority.revoke/v1": ("authority.revoke",),
+    "runtime.stop/v1": ("runtime.admin.stop",),
     "task.submit/v1": ("task.submit",),
     "task.cancel/v1": ("task.cancel",),
     "artifact.put/v1": ("artifact.put",),
     "composition.commit/v1": ("composition.commit",),
     "harness.install/v1": ("harness.install",),
     "harness.activate/v1": ("harness.activate",),
+    "harness.configure-provider/v1": ("harness.activate",),
     "harness.deactivate/v1": ("harness.deactivate",),
     "harness.uninstall/v1": ("harness.uninstall",),
-    "evolution.propose/v1": ("evolution.propose",),
+    "evolution.propose/v1": ("experiment.run",),
     "experiment.run/v1": ("experiment.run",),
-    "candidate.promote/v1": ("evolution.promote",),
-    "composition.rollback/v1": ("evolution.rollback",),
+    "candidate.promote/v1": ("composition.promote",),
+    "composition.rollback/v1": ("composition.rollback",),
     "operations.backup/v1": ("operations.backup",),
     "operations.gc-plan/v1": ("operations.gc",),
     "operations.gc-apply/v1": ("operations.gc",),
@@ -171,7 +181,9 @@ def _plan(
 def cmd_init(args: argparse.Namespace) -> int:
     """Local bootstrap; runs without a daemon connection (§41.57.1)."""
 
-    report = run_init(args.data_dir)
+    report = run_init(args.data_dir, insecure_dev_credential_file=args.insecure_dev_credential_file)
+    if report.feature_summary["credential_store"] == "INSECURE_TEST_ONLY":
+        print("credential_store=INSECURE_TEST_ONLY: development fixture, not product security", file=sys.stderr)
     result = {
         "realm_id": report.realm_id,
         "epoch_id": report.epoch_id,
@@ -192,6 +204,7 @@ async def cmd_info(client: AgentMetaClient, args: argparse.Namespace) -> int:
         args,
         {
             "live": info.live,
+            "instance_id": client.server_instance_id,
             "core_ready": info.core_ready,
             "serving_ready": info.serving_ready,
             "ready": info.core_ready,  # v1 alias equals core_ready (§41.52)
@@ -202,6 +215,31 @@ async def cmd_info(client: AgentMetaClient, args: argparse.Namespace) -> int:
             "realized_revision": info.realized_revision,
         },
     )
+
+
+async def cmd_start(args: argparse.Namespace) -> int:
+    from ..daemon import RuntimeDaemon
+
+    if args.dry_run:
+        return _emit_result(args, {"dry_run": True, "data_dir": str(args.data_dir.resolve()),
+                                  "foreground": True, "trusted_publishers": sorted(args.trusted_publisher)})
+    daemon = RuntimeDaemon(args.data_dir, config_path=args.config,
+        allow_insecure_credentials=args.insecure_dev_credential_file,
+        trusted_publishers=args.trusted_publisher, execution_backend=args.execution_backend)
+    try:
+        status = await daemon.start()
+        _emit_result(args, status)
+        await daemon.wait()
+    finally:
+        await daemon.close()
+    return _emit_result(args, {"state": "STOPPED", "instance_id": daemon.instance_id})
+
+
+async def cmd_stop(client: AgentMetaClient, args: argparse.Namespace) -> int:
+    if args.dry_run:
+        return _dry_run(args, "runtime.stop/v1", {"instance_id": client.server_instance_id, "reason_code": args.reason})
+    result = await client.stop_runtime(realm_id=args.realm, actor_id=args.actor, reason_code=args.reason)
+    return _emit_result(args, {**dict(result.receipt), **dict(result.resource or {})})
 
 
 async def cmd_view(client: AgentMetaClient, args: argparse.Namespace) -> int:
@@ -216,10 +254,70 @@ async def cmd_refs(client: AgentMetaClient, args: argparse.Namespace) -> int:
     return _emit_result(args, await client.get_refs())
 
 
+def _authority_json(raw: str):
+    def unique_fields(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate field")
+            value[key] = item
+        return value
+    try:
+        return json.loads(raw, object_pairs_hook=unique_fields)
+    except (ValueError, TypeError) as exc:
+        raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="Authority arguments require valid JSON with unique fields") from exc
+
+
+async def cmd_authority(client: AgentMetaClient, args: argparse.Namespace) -> int:
+    from ...domain.principal_contract import delegation_payload, principal_registration, revocation_payload
+
+    if args.authority_command == "create-principal":
+        payload = {"kind": args.kind, "public_key_hex": args.public_key_hex}
+        if args.principal_id is not None:
+            payload["principal_id"] = args.principal_id
+        _, _, public_key = principal_registration(payload)
+        if args.dry_run:
+            return _dry_run(args, "authority.principal.create/v1", payload)
+        result = await client.create_principal(realm_id=args.realm, actor_id=args.actor,
+            kind=args.kind, public_key=public_key, principal_id=args.principal_id)
+    elif args.authority_command == "delegate":
+        payload = {"subject_id": args.subject, "permissions": sorted(set(args.permission)),
+            "scope": _authority_json(args.scope), "constraints": _authority_json(args.constraints),
+            "delegable": args.delegable}
+        delegation_payload(payload, realm_id=args.realm)
+        if args.dry_run:
+            return _dry_run(args, "authority.delegate/v1", payload)
+        result = await client.delegate_authority(realm_id=args.realm, actor_id=args.actor,
+            subject_id=args.subject, permissions=payload["permissions"], scope=payload["scope"],
+            constraints=payload["constraints"], delegable=args.delegable)
+    else:
+        payload = {"grant_id": args.grant_id, "reason_code": args.reason}
+        revocation_payload(payload)
+        if args.dry_run:
+            return _dry_run(args, "authority.revoke/v1", payload)
+        result = await client.revoke_authority(realm_id=args.realm, actor_id=args.actor,
+            grant_id=args.grant_id, reason_code=args.reason)
+    return _emit_result(args, {**dict(result.receipt), **dict(result.resource or {})})
+
+
 async def cmd_task_submit(client: AgentMetaClient, args: argparse.Namespace) -> int:
+    from ...domain.task_submission import parse_task_submission
     payload = {"input_artifact_id": args.input_artifact}
-    if args.budget:
-        payload["budget"] = json.loads(args.budget)
+    if args.budget is not None:
+        def unique_budget_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate budget field")
+                result[key] = value
+            return result
+        try:
+            payload["budget"] = json.loads(args.budget, object_pairs_hook=unique_budget_fields)
+        except (ValueError, TypeError) as exc:
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="Task budget must be valid JSON with unique fields") from exc
+    if args.deadline_at_us is not None:
+        payload["deadline_at_us"] = args.deadline_at_us
+    parse_task_submission(payload)
     if args.dry_run:
         info = await client.get_info()
         refs = await client.get_refs()
@@ -242,7 +340,8 @@ async def cmd_task_submit(client: AgentMetaClient, args: argparse.Namespace) -> 
         realm_id=args.realm,
         actor_id=args.actor,
         input_artifact_id=args.input_artifact,
-        budget=json.loads(args.budget) if args.budget else None,
+        budget=payload.get("budget"),
+        deadline_at_us=payload.get("deadline_at_us"),
     )
     return _emit_result(
         args,
@@ -257,6 +356,14 @@ async def cmd_task_submit(client: AgentMetaClient, args: argparse.Namespace) -> 
 
 async def cmd_task_get(client: AgentMetaClient, args: argparse.Namespace) -> int:
     return _emit_result(args, await client.get_task(args.task_id))
+
+
+async def cmd_task_execution(client: AgentMetaClient, args: argparse.Namespace) -> int:
+    return _emit_result(args, await client.get_task_execution(args.task_id))
+
+
+async def cmd_task_trace(client: AgentMetaClient, args: argparse.Namespace) -> int:
+    return _emit_result(args, await client.get_task_trace(args.task_id))
 
 
 async def cmd_task_wait(client: AgentMetaClient, args: argparse.Namespace) -> int:
@@ -322,6 +429,11 @@ async def cmd_artifact_get(client: AgentMetaClient, args: argparse.Namespace) ->
     return _emit_result(args, await client.get_artifact_manifest(args.artifact_id))
 
 
+async def cmd_artifact_content(client: AgentMetaClient, args: argparse.Namespace) -> int:
+    content = await client.get_artifact_content(args.artifact_id)
+    return _emit_result(args, {"artifact_id": args.artifact_id, "size_bytes": len(content), "content_hex": content.hex()})
+
+
 async def cmd_artifact_verify(client: AgentMetaClient, args: argparse.Namespace) -> int:
     ok, reason = await client.verify_artifact(args.artifact_id)
     return _emit_result(args, {"ok": ok, "reason_code": reason})
@@ -383,6 +495,16 @@ async def cmd_harness(client: AgentMetaClient, args: argparse.Namespace) -> int:
         )
     if args.harness_command == "inspect":
         return _emit_result(args, await client.get_harness(args.harness_id))
+    if args.harness_command == 'configure-provider':
+        envelope=await client.prepare_harness_provider_configuration(realm_id=args.realm,actor_id=args.actor,
+            harness_id=args.harness_id,capability_id=args.capability,profile_artifact_id=args.profile_artifact,
+            credential_handle=args.credential_handle,enabled=not args.disable,
+            expected_configuration_revision=args.expected_configuration_revision,expected_meta_revision=args.expected_meta_revision)
+        validation=await client.validate_harness_provider_configuration(envelope)
+        if args.dry_run:
+            return _emit_result(args,{'dry_run':True,'would_change':True,**validation,'command_envelope_jcs':envelope})
+        result=await client.execute_command('agent_meta.public.v1.Harness.ConfigureProvider',envelope)
+        return _emit_result(args,{**dict(result.receipt),**dict(result.resource or {})})
     if args.harness_command == "activate":
         refs = await client.get_refs()
         if args.expected_revision is not None and refs["serving_revision"] != args.expected_revision:
@@ -397,30 +519,27 @@ async def cmd_harness(client: AgentMetaClient, args: argparse.Namespace) -> int:
                 message="serving revision does not match --expected-serving",
                 details={"serving_revision": str(refs["serving_revision"])},
             )
+        envelope_jcs = await client.prepare_harness_activation(
+            realm_id=args.realm, actor_id=args.actor, harness_id=args.harness_id,
+            composition_body_artifact_id=args.body_artifact,
+            grant_requests=[json.loads(g) for g in args.grant] if args.grant else None,
+            expected_serving_revision=refs["serving_revision"],
+        )
         if args.dry_run:
+            envelope = decode_command(envelope_jcs)
             return _emit_result(
                 args,
                 {
                     "dry_run": True,
                     "would_change": True,
-                    "plan": _plan(
-                        payload_type="harness.activate/v1",
-                        payload={
-                            "harness_id": args.harness_id,
-                            "composition_body_artifact_id": args.body_artifact,
-                        },
-                        realm=args.realm,
-                        actor=args.actor,
-                    ),
+                    "plan": dict(envelope.payload),
+                    "expected_meta_revision": envelope.expected_meta_revision,
+                    "required_permissions": sorted({"harness.activate", *({"authority.delegate"} if envelope.payload["grant_requests"] else set()),
+                                                    *(item["permission"] for item in envelope.payload["grant_requests"])}),
+                    "command_envelope_jcs": envelope_jcs,
                 },
             )
-        result = await client.activate_harness(
-            realm_id=args.realm,
-            actor_id=args.actor,
-            harness_id=args.harness_id,
-            composition_body_artifact_id=args.body_artifact,
-            grant_requests=[json.loads(g) for g in args.grant] if args.grant else None,
-        )
+        result = await client.execute_command("agent_meta.public.v1.Harness.Activate", envelope_jcs)
         return _emit_result(args, {**dict(result.receipt), **dict(result.resource or {})})
     if args.harness_command == "deactivate":
         if args.dry_run:
@@ -638,9 +757,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, required=True, help="runtime data directory")
     parser.add_argument("--realm", default="realm://main")
     parser.add_argument(
-        "--actor", default="principal://cli-agent/00000000-0000-7000-8000-000000000000"
+        "--actor", default=None
     )
     parser.add_argument("--output", choices=("json", "text"), default="text")
+    parser.add_argument("--insecure-dev-credential-file", action="store_true", help="explicitly allow fixture-only credential storage")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -648,23 +768,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init").set_defaults(func=cmd_init)
+    init = sub.add_parser("init")
+    init.add_argument("--insecure-dev-credential-file", action="store_true", default=argparse.SUPPRESS, help="explicit fixture-only credential storage; never a product security profile")
+    init.set_defaults(func=cmd_init)
     sub.add_parser("info").set_defaults(func=cmd_info)
+    start = sub.add_parser("start", help="run the local daemon in the foreground")
+    start.add_argument("--config", type=Path, default=None)
+    start.add_argument("--trusted-publisher", action="append", default=[], help="explicitly trusted publisher SHA-256 fingerprint")
+    start.add_argument("--execution-backend", choices=("trusted_in_process", "in_memory"), default=None, help="select the Host execution backend; overrides execution.host_backend")
+    start.set_defaults(func=cmd_start)
+    stop = sub.add_parser("stop", help="request signed shutdown of the connected daemon instance")
+    stop.add_argument("--reason", default="operator_stop")
+    stop.set_defaults(func=cmd_stop)
     view = sub.add_parser("view")
     view.add_argument("--revision", type=int, default=None)
     view.set_defaults(func=cmd_view)
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
     sub.add_parser("refs").set_defaults(func=cmd_refs)
 
+    authority = sub.add_parser("authority")
+    authority_sub = authority.add_subparsers(dest="authority_command", required=True)
+    principal = authority_sub.add_parser("create-principal")
+    principal.add_argument("--kind", required=True, choices=("AGENT", "CAPABILITY", "PEER"))
+    principal.add_argument("--public-key-hex", required=True, help="32 raw Ed25519 public bytes in lowercase hex")
+    principal.add_argument("--principal-id", default=None)
+    principal.set_defaults(func=cmd_authority)
+    delegate = authority_sub.add_parser("delegate")
+    delegate.add_argument("--subject", required=True)
+    delegate.add_argument("--permission", action="append", required=True)
+    delegate.add_argument("--scope", required=True, help="typed scope JSON in the current realm")
+    delegate.add_argument("--constraints", default="{}", help="strict grant constraints JSON")
+    delegate.add_argument("--delegable", action="store_true")
+    delegate.set_defaults(func=cmd_authority)
+    revoke = authority_sub.add_parser("revoke")
+    revoke.add_argument("grant_id")
+    revoke.add_argument("--reason", default="operator_revoke")
+    revoke.set_defaults(func=cmd_authority)
+
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
     submit = task_sub.add_parser("submit")
     submit.add_argument("--input-artifact", required=True)
     submit.add_argument("--budget", default=None, help="JSON object of TaskBudget fields")
+    submit.add_argument("--deadline-at-us", type=int, default=None, help="absolute Unix microsecond deadline; zero is already expired")
     submit.set_defaults(func=cmd_task_submit)
     get = task_sub.add_parser("get")
     get.add_argument("task_id")
     get.set_defaults(func=cmd_task_get)
+    execution = task_sub.add_parser("execution")
+    execution.add_argument("task_id")
+    execution.set_defaults(func=cmd_task_execution)
+    trace = task_sub.add_parser("trace")
+    trace.add_argument("task_id")
+    trace.set_defaults(func=cmd_task_trace)
     wait = task_sub.add_parser("wait")
     wait.add_argument("task_id")
     wait.add_argument("--timeout", type=float, default=60.0)
@@ -684,6 +840,9 @@ def build_parser() -> argparse.ArgumentParser:
     get_art = art_sub.add_parser("get")
     get_art.add_argument("artifact_id")
     get_art.set_defaults(func=cmd_artifact_get)
+    content = art_sub.add_parser("content")
+    content.add_argument("artifact_id")
+    content.set_defaults(func=cmd_artifact_content)
     verify = art_sub.add_parser("verify")
     verify.add_argument("artifact_id")
     verify.set_defaults(func=cmd_artifact_verify)
@@ -714,6 +873,15 @@ def build_parser() -> argparse.ArgumentParser:
     hinspect = harness_sub.add_parser("inspect")
     hinspect.add_argument("harness_id")
     hinspect.set_defaults(func=cmd_harness)
+    hconfigure=harness_sub.add_parser('configure-provider')
+    hconfigure.add_argument('harness_id')
+    hconfigure.add_argument('--capability',required=True)
+    hconfigure.add_argument('--profile-artifact',required=True)
+    hconfigure.add_argument('--credential-handle',required=True,help='opaque provider handle, never a token value')
+    hconfigure.add_argument('--disable',action='store_true')
+    hconfigure.add_argument('--expected-configuration-revision',type=int,default=None)
+    hconfigure.add_argument('--expected-meta-revision',type=int,default=None)
+    hconfigure.set_defaults(func=cmd_harness)
     hactivate = harness_sub.add_parser("activate")
     hactivate.add_argument("harness_id")
     hactivate.add_argument("body_artifact", help="composition body artifact id")
@@ -821,6 +989,8 @@ def build_parser() -> argparse.ArgumentParser:
 async def _run(args: argparse.Namespace) -> int:
     if getattr(args.func, "__name__", "") == "cmd_init":
         return cmd_init(args)  # init bootstraps locally; no daemon connection
+    if args.func is cmd_start:
+        return await cmd_start(args)
     client = await _connect(args)
     try:
         return await args.func(client, args)

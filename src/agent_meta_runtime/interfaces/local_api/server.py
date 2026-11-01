@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -33,6 +34,7 @@ from ...protocols.public_wire import (
     MAX_FRAME_BYTES,
     MAX_INFLIGHT_PER_CONNECTION,
     METHODS,
+    METHOD_MINORS,
     PUBLIC_API_MAJOR,
     PUBLIC_API_MINOR,
     decode_frame_length,
@@ -40,6 +42,7 @@ from ...protocols.public_wire import (
     parse_envelope,
 )
 from .peer import prepare_socket_dir, require_same_uid, socket_path_for_data_dir
+from ...sdk.transport import pipe_name_for_data_dir
 
 __all__ = ["LocalApiServer"]
 
@@ -47,10 +50,12 @@ Handler = Callable[[Any, int], Awaitable[Any]]
 
 
 class _ConnectionState:
-    __slots__ = ("inflight",)
+    __slots__ = ("inflight", "seen", "minor")
 
     def __init__(self) -> None:
         self.inflight: set[str] = set()
+        self.seen: set[str] = set()
+        self.minor = 0
 
 
 class LocalApiServer:
@@ -63,17 +68,33 @@ class LocalApiServer:
         handlers: dict[str, Handler],
         instance_id: str | None = None,
         now_us: Callable[[], int] | None = None,
+        response_sent: Callable[[str, bool], None] | None = None,
     ) -> None:
         self._data_dir = Path(data_dir)
         self._handlers = handlers
         self._instance_id = instance_id or uuid.uuid4().hex
-        self._now_us = now_us or (lambda: 0)
+        self._now_us = now_us or (lambda: time.time_ns() // 1000)
         self._server: asyncio.Server | None = None
+        self._pipe_servers: list = []
         self._connections: set[asyncio.StreamWriter] = set()
+        self._connection_tasks: set[asyncio.Task] = set()
+        self._response_sent = response_sent
 
     # -- lifecycle -----------------------------------------------------------
     async def start(self) -> Path:
+        if self._server is not None or self._pipe_servers:
+            raise StableError(code=ErrorCode.ALREADY_RUNNING, message="local API server already started")
         run_dir = prepare_socket_dir(self._data_dir)
+        if os.name == "nt":
+            loop = asyncio.get_running_loop()
+            address = pipe_name_for_data_dir(self._data_dir)
+
+            def protocol_factory():
+                reader = asyncio.StreamReader(limit=MAX_FRAME_BYTES)
+                return asyncio.StreamReaderProtocol(reader, self._handle_connection)
+
+            self._pipe_servers = await loop.start_serving_pipe(protocol_factory, address)
+            return Path(address)
         path = socket_path_for_data_dir(self._data_dir)
         path.unlink(missing_ok=True)
         self._server = await asyncio.start_unix_server(
@@ -87,10 +108,20 @@ class LocalApiServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+            self._server = None
+        for server in self._pipe_servers:
+            server.close()
+        self._pipe_servers.clear()
         for writer in list(self._connections):
             writer.close()
         self._connections.clear()
-        socket_path_for_data_dir(self._data_dir).unlink(missing_ok=True)
+        pending = [task for task in self._connection_tasks if task is not asyncio.current_task()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if os.name != "nt":
+            socket_path_for_data_dir(self._data_dir).unlink(missing_ok=True)
 
     @property
     def instance_id(self) -> str:
@@ -104,14 +135,22 @@ class LocalApiServer:
             writer.close()
             return
         self._connections.add(writer)
+        current = asyncio.current_task()
+        self._connection_tasks.add(current)
         state = _ConnectionState()
         try:
             try:
                 # Peer identity before any payload processing (§41.49.1).
-                sock = writer.get_extra_info("socket")
-                if sock is not None:
+                if os.name == "nt":
+                    from ...sdk._windows_peer import require_same_pipe_user
+
+                    require_same_pipe_user(writer.get_extra_info("pipe"), server_side=True)
+                else:
+                    sock = writer.get_extra_info("socket")
+                    if sock is None:
+                        raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="local peer identity missing")
                     require_same_uid(sock, os.getuid())
-                await asyncio.wait_for(self._handshake(reader, writer), HELLO_TIMEOUT_S)
+                state.minor = await asyncio.wait_for(self._handshake(reader, writer), HELLO_TIMEOUT_S)
                 await self._request_loop(reader, writer, state)
             except (
                 StableError,
@@ -123,11 +162,12 @@ class LocalApiServer:
                 pass  # close only this connection
         finally:
             self._connections.discard(writer)
+            self._connection_tasks.discard(current)
             writer.close()
 
     async def _handshake(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    ) -> int:
         from ...protocols._v1 import transport_pb2 as t
 
         raw = await self._read_frame(reader)
@@ -151,6 +191,7 @@ class LocalApiServer:
             encode_frame(build_response_envelope(hello, response.SerializeToString()))
         )
         await writer.drain()
+        return minor
 
     async def _request_loop(
         self,
@@ -169,7 +210,7 @@ class LocalApiServer:
                     code=ErrorCode.INVALID_ARGUMENT,
                     message="server received a response envelope",
                 )
-            if envelope.request_id in state.inflight:
+            if envelope.request_id in state.seen:
                 error = error_to_rpc(
                     StableError(
                         code=ErrorCode.INVALID_ARGUMENT,
@@ -203,12 +244,21 @@ class LocalApiServer:
             # before the next frame is read; the request_id bookkeeping still
             # enforces the one-use-per-connection rule (§41.26).
             state.inflight.add(envelope.request_id)
+            state.seen.add(envelope.request_id)
             try:
-                response = await self._dispatch(envelope)
+                if METHOD_MINORS.get(envelope.method, 0) > state.minor:
+                    response = error_envelope(envelope.method, envelope.request_id, error_to_rpc(
+                        StableError(code=ErrorCode.CONTRACT_INCOMPATIBLE, message="method requires a newer negotiated API minor"),
+                        correlation_id=envelope.request_id,
+                    ))
+                else:
+                    response = await self._dispatch(envelope)
             finally:
                 state.inflight.discard(envelope.request_id)
             writer.write(encode_frame(response))
             await writer.drain()
+            if self._response_sent is not None:
+                self._response_sent(envelope.method, not parse_envelope(response).HasField("error"))
 
     async def _dispatch(self, envelope: transport.RpcEnvelope) -> bytes:
         request_id = envelope.request_id or uuid.uuid4().hex
@@ -232,6 +282,8 @@ class LocalApiServer:
                     code=ErrorCode.INVALID_ARGUMENT, message="malformed request payload"
                 ) from exc
             deadline = envelope.deadline_at_us or self._now_us() + DEFAULT_REQUEST_DEADLINE_US
+            if deadline <= self._now_us():
+                raise StableError(code=ErrorCode.DEADLINE_EXCEEDED, message="request deadline expired before dispatch")
             handler = self._handlers[envelope.method]
             result = await asyncio.wait_for(
                 handler(request, deadline),

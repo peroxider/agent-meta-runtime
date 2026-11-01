@@ -4,6 +4,23 @@
 // other v1 request/response messages are additive and owned by this file.
 // Mutation methods all wrap the canonical CommandEnvelope per §41.52 —
 // public messages never re-define domain fields.
+// Public API 1.1 adds agent_meta.public.v1.Runtime.Stop using the existing
+// CommandRequest/MutationResponse messages; method registry lives in public_wire.
+// Public API 1.2 adds Task.GetExecution using GetTaskRequest/ResourceResponse;
+// the additive task-execution/v1 resource is specified in ADR 040.
+// Public API 1.3 adds Artifact.GetContent using GetArtifactRequest/ResourceResponse;
+// bounded ordinary reads use artifact-content/v1 (ADR 042).
+// Public API 1.5 adds read-only Task.GetTrace using GetTaskRequest/ResourceResponse.
+// Public API 1.4 adds signed Authority.CreatePrincipal/Delegate/Revoke using
+// CommandRequest/MutationResponse and ordinary identities only (ADR 044).
+// Public API 1.6 adds optional execution_binding to Task.GetExecution and
+// current GetView(include_backend=true) profile metadata (ADR 050).
+// Public API 1.7 adds SDK Host Provider plan/normalization callbacks (ADR 054).
+// No new RPC/field is added; unavailable Provider enforcement fails closed.
+// Public API 1.8 adds signed Harness.ConfigureProvider via CommandRequest and
+// MutationResponse; ordinary configuration contains handles, never secrets.
+// Public API 1.9 adds read-only Harness.ValidateProviderConfiguration with
+// CommandRequest/ResourceResponse; it validates but never claims the command.
 
 syntax = "proto3";
 
@@ -205,7 +222,7 @@ message WaitOperationRequest {
 //   Runtime:  GetInfo GetView Doctor GetMetrics
 //   Task:     Submit Get Wait Cancel
 //   Artifact: BeginPut PutChunk Put GetManifest Verify
-//   Harness:  ValidatePackage Install Activate Get List Deactivate Uninstall
+//   Harness:  ValidatePackage Install Activate ConfigureProvider ValidateProviderConfiguration Get List Deactivate Uninstall
 //   Composition: Validate Commit GetRefs
 //   Evolution: Propose RunExperiment GetExperiment WaitExperiment Promote Rollback
 //   Graph:    Why Lineage

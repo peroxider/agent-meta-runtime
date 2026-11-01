@@ -11,7 +11,6 @@ marked no-cover here).
 
 from __future__ import annotations
 
-import hashlib
 import os
 import socket
 import stat
@@ -19,6 +18,7 @@ import struct
 from pathlib import Path
 
 from ...domain.errors import ErrorCode, StableError
+from ...sdk.transport import pipe_name_for_data_dir
 
 __all__ = [
     "SOCKET_MODE",
@@ -34,11 +34,6 @@ SOCKET_MODE = 0o600
 
 def socket_path_for_data_dir(data_dir: Path) -> Path:
     return Path(data_dir) / "run" / "agent-meta.sock"
-
-
-def pipe_name_for_data_dir(data_dir: Path) -> str:  # pragma: no cover - Windows
-    digest = hashlib.sha256(str(Path(data_dir).resolve()).encode()).hexdigest()
-    return f"\\\\.\\pipe\\agent-meta-{digest[:16]}"
 
 
 def require_same_uid(sock: socket.socket, daemon_uid: int) -> int:
