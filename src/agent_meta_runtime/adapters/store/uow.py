@@ -265,6 +265,17 @@ def _record_rejection(
 ) -> RejectedResult:
     conn.execute("BEGIN IMMEDIATE")
     try:
+        replay = _read_replay(conn, envelope, auth_hash)
+        if replay is not None:
+            conn.rollback()
+            return replay
+        nonce_hash = sha256_hex(envelope.auth_nonce.encode("utf-8")) if envelope.auth_nonce else None
+        if nonce_hash is not None and conn.execute(
+            "SELECT 1 FROM commands WHERE realm_id=? AND auth_nonce_hash=?",
+            (envelope.realm_id, nonce_hash),
+        ).fetchone():
+            # Only the original command may claim this unique nonce.
+            nonce_hash = None
         conn.execute(
             "INSERT INTO commands(command_id, realm_id, payload_hash,"
             " authorization_hash, auth_nonce_hash, status, meta_revision,"
@@ -275,9 +286,7 @@ def _record_rejection(
                 envelope.realm_id,
                 payload_hash,
                 auth_hash,
-                sha256_hex(envelope.auth_nonce.encode("utf-8"))
-                if envelope.auth_nonce
-                else None,
+                nonce_hash,
                 canonical_json(error.to_json()),
                 now_us,
                 now_us,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import shutil
 import sqlite3
@@ -28,6 +29,7 @@ from ...domain.errors import ErrorCode, StableError
 from ...domain.facts import compute_fact_hash
 from ...domain.ids import new_uuid7
 from ..cas import CHUNK_SIZE
+from ..private_paths import require_private_path, secure_private_path
 from .connection import APPLICATION_ID, USER_VERSION
 from .doctor import run_integrity_doctor
 from .initializer import verify_store_identity
@@ -166,7 +168,7 @@ def _copy_hashed(source: Path, target: Path, root: Path, files: list) -> None:
             size += len(chunk)
     files.append(
         {
-            "relpath": str(target.relative_to(root)),
+            "relpath": target.relative_to(root).as_posix(),
             "size_bytes": size,
             "sha256": digest.hexdigest(),
         }
@@ -218,6 +220,7 @@ def create_backup(
         )
 
     dest.mkdir(parents=True, mode=0o700)
+    secure_private_path(dest)
     files: list[dict[str, Any]] = []
     try:
         # 1. meta.db through the SQLite backup API (consistent snapshot).
@@ -259,12 +262,35 @@ def create_backup(
                 if marker_path.is_file():
                     _copy_hashed(marker_path, dest / "backend" / marker, dest, files)
 
-        # 3. keys directory (local keyfiles; the backup dir is 0o700).
+        # 3. Credential ciphertext/metadata retain explicit owner-only ACLs.
         keys_dir = data_dir / "keys"
         if keys_dir.is_dir():
+            require_private_path(keys_dir)
+            (dest / "keys").mkdir()
+            secure_private_path(dest / "keys")
             for key_path in sorted(keys_dir.iterdir()):
                 if key_path.is_file():
+                    require_private_path(key_path)
                     _copy_hashed(key_path, dest / "keys" / key_path.name, dest, files)
+                    secure_private_path(dest / "keys" / key_path.name)
+            providers=keys_dir/'providers'
+            if providers.exists() or providers.is_symlink() or providers.is_junction():
+                require_private_path(providers)
+                for realm_dir in sorted(providers.iterdir()):
+                    if not realm_dir.is_dir() or re.fullmatch(r'[0-9a-f]{64}',realm_dir.name) is None:
+                        raise StableError(code=ErrorCode.INTEGRITY_ERROR,message='Provider credential storage scope is invalid')
+                    require_private_path(realm_dir)
+                    target_dir=dest/'keys'/'providers'/realm_dir.name
+                    target_dir.mkdir(parents=True,exist_ok=True)
+                    secure_private_path(target_dir.parent); secure_private_path(target_dir)
+                    for item in sorted(realm_dir.iterdir()):
+                        if item.name.startswith('.provisioning-'):
+                            continue  # unpublished, unreferenced native staging
+                        if (not item.is_file() or re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(dpapi|key)',item.name) is None):
+                            raise StableError(code=ErrorCode.INTEGRITY_ERROR,message='Provider credential item path is invalid')
+                        require_private_path(item)
+                        _copy_hashed(item,target_dir/item.name,dest,files)
+                        secure_private_path(target_dir/item.name)
 
         # 4. CAS blobs: hardlink on the same volume, copy otherwise.
         artifacts_dir = data_dir / "artifacts"
@@ -276,7 +302,7 @@ def create_backup(
                     _link_or_copy(source_path, dest / relpath)
                     size, sha = _hash_file(dest / relpath)
                     files.append(
-                        {"relpath": str(relpath), "size_bytes": size, "sha256": sha}
+                        {"relpath": relpath.as_posix(), "size_bytes": size, "sha256": sha}
                     )
         files.sort(key=lambda entry: entry["relpath"])
 
@@ -444,19 +470,35 @@ def restore_backup(source_dir: Path, data_dir: Path) -> dict[str, Any]:
             details={"data_dir": str(data_dir)},
         )
     data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    secure_private_path(data_dir)
 
     staging = data_dir / ".restore-staging"
     staging.mkdir(mode=0o700)
+    secure_private_path(staging)
     try:
         for entry in manifest["files"]:
             relpath = str(entry["relpath"])
             target = staging / relpath
             target.parent.mkdir(parents=True, exist_ok=True)
+            if relpath.startswith("keys/"):
+                parent=staging/'keys'
+                for part in target.parent.relative_to(parent).parts:
+                    secure_private_path(parent)
+                    parent=parent/part
+                secure_private_path(parent)
             shutil.copy2(source_dir / relpath, target)
+            if relpath.startswith("keys/"):
+                secure_private_path(target)
         for entry in manifest["files"]:
             relpath = str(entry["relpath"])
             final = data_dir / relpath
             final.parent.mkdir(parents=True, exist_ok=True)
+            if relpath.startswith("keys/"):
+                parent=data_dir/'keys'
+                for part in final.parent.relative_to(parent).parts:
+                    secure_private_path(parent)
+                    parent=parent/part
+                secure_private_path(parent)
             os.replace(staging / relpath, final)
     finally:
         shutil.rmtree(staging, ignore_errors=True)

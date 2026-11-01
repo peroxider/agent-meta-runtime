@@ -14,11 +14,10 @@ package_version)`` key plus the installation triggers enforce the
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ...domain.authority import (
-    Grant,
     GrantConstraints,
     Scope,
     ScopeTarget,
@@ -28,7 +27,7 @@ from ...domain.errors import ErrorCode, StableError
 from ...domain.fact_catalog import validate_fact_event
 from ...domain.ids import new_uuid7
 from ...ports.repositories import FactAppendRequest, OutboxRequest
-from .authority import RevokeGrantRequest, revoke_grant
+from .authority import CreateGrantRequest, RevokeGrantRequest, create_grant, revoke_grant
 from .composition import (
     CompositionCreateRequest,
     SetDesiredRequest,
@@ -57,9 +56,6 @@ __all__ = [
     "uninstall_harness",
 ]
 
-_TERMINAL_TASK_STATUSES = ("SUCCEEDED", "FAILED", "FAILED_RECOVERY", "TIMED_OUT", "CANCELLED")
-
-
 def _append_fact(
     txn: "_SqliteStoreTransaction",
     *,
@@ -85,7 +81,7 @@ def _append_fact(
 def _installation(txn: "_SqliteStoreTransaction", harness_id: str) -> tuple:
     row = txn._conn.execute(
         "SELECT harness_id, realm_id, package_name, package_version, status,"
-        " active_composition_id FROM harness_installations WHERE harness_id = ?",
+        " active_composition_id, package_artifact_id FROM harness_installations WHERE harness_id = ?",
         (harness_id,),
     ).fetchone()
     if row is None:
@@ -123,8 +119,8 @@ def _write_history(
     )
 
 
-def _revoke_scoped_grants(txn: "_SqliteStoreTransaction", harness_id: str) -> list[str]:
-    """Revoke the activation-scoped Grants recorded in the latest fact."""
+def _revoke_scoped_grants(txn: "_SqliteStoreTransaction", harness_id: str, *, exclude_composition_id=None) -> list[str]:
+    """Retire all recorded activation generations except an explicit survivor."""
 
     row = txn._conn.execute(
         "SELECT payload_json FROM facts WHERE entity_type = 'harness'"
@@ -132,16 +128,16 @@ def _revoke_scoped_grants(txn: "_SqliteStoreTransaction", harness_id: str) -> li
         " ORDER BY seq DESC",
         (harness_id,),
     ).fetchall()
-    grant_ids: list[str] = []
-    for (payload_json,) in row:  # latest fact that carries the activation grant ids
+    grant_ids: set[str] = set()
+    for (payload_json,) in row:
         payload = json_loads(payload_json)
-        grant_ids = [gid for gid in payload.get("grant_ids", []) if isinstance(gid, str)]
-        if grant_ids:
-            break
+        if exclude_composition_id is not None and payload.get("composition_id") == exclude_composition_id:
+            continue
+        grant_ids.update(gid for gid in payload.get("grant_ids", []) if isinstance(gid, str))
     if not grant_ids:
         return []
     revoked = []
-    for grant_id in grant_ids:
+    for grant_id in sorted(grant_ids):
         active = txn._conn.execute(
             "SELECT 1 FROM authority_grants WHERE grant_id = ? AND status = 'ACTIVE'",
             (grant_id,),
@@ -172,6 +168,7 @@ class InstallHarnessRequest:
     package_artifact_id: str
     contract_fingerprint: str
     installed_by: str
+    verified_artifact_ids: tuple[str, ...] = ()
 
 
 def install_harness(request: InstallHarnessRequest):
@@ -243,6 +240,7 @@ def install_harness(request: InstallHarnessRequest):
                 "package_name": request.package_name,
                 "package_version": request.package_version,
                 "contract_fingerprint": request.contract_fingerprint,
+                "artifact_ids": list(request.verified_artifact_ids),
             },
         )
         _write_history(
@@ -310,13 +308,8 @@ def activate_harness(request: ActivateHarnessRequest):
 
         grant_ids: list[str] = []
         for spec in request.scoped_grants:
-            grant = Grant(
-                grant_id="grant://" + str(new_uuid7()),
-                epoch_id=txn._conn.execute(
-                    "SELECT epoch_id FROM realms WHERE realm_id = ?",
-                    (txn._envelope.realm_id,),
-                ).fetchone()[0],
-                issuer_id=request.issuer_grant_id,
+            receipt = create_grant(CreateGrantRequest(
+                issuer_grant_id=request.issuer_grant_id,
                 subject_id=spec.subject_id,
                 permissions=spec.permissions,
                 scope=Scope(
@@ -326,33 +319,8 @@ def activate_harness(request: ActivateHarnessRequest):
                     expires_at_us=spec.expires_at_us, max_uses=spec.max_uses
                 ),
                 delegable=False,
-                delegation_depth=1,
-                status="ACTIVE",
-                issued_at_us=txn.recorded_at_us,
-            )
-            from .authority import _insert_grant, _write_grant_history
-
-            _insert_grant(txn, grant)
-            grant_fact = _append_fact(
-                txn,
-                entity_type="authority",
-                entity_id=grant.grant_id,
-                event_type="grant_created",
-                payload={
-                    "subject_id": spec.subject_id,
-                    "harness_id": request.harness_id,
-                    "scoped": "true",
-                },
-            )
-            _write_grant_history(
-                conn,
-                grant_id=grant.grant_id,
-                meta_revision=_next_meta_revision(txn),
-                status="ACTIVE",
-                effective_at_us=txn.recorded_at_us,
-                source_fact_id=grant_fact,
-            )
-            grant_ids.append(grant.grant_id)
+            ))(txn)
+            grant_ids.append(receipt["grant_id"])
 
         refs = conn.execute(
             "SELECT desired_cas FROM composition_refs WHERE realm_id = ?",
@@ -409,6 +377,40 @@ def activate_harness(request: ActivateHarnessRequest):
 
 
 # -- Reconciler settlement (§41.60.4) ------------------------------------------
+
+
+def fail_harness_activation(composition_id: str, *, reason_code: str):
+    """Revoke only this failed candidate's Grants, never the old serving set."""
+    def mutator(txn):
+        owner = txn._conn.execute(
+            "SELECT DISTINCT h.harness_id,h.status FROM harness_installations h JOIN harness_installation_history x "
+            "ON x.harness_id=h.harness_id WHERE x.composition_id=? AND h.realm_id=?",
+            (composition_id, txn._envelope.realm_id),
+        ).fetchone()
+        if owner is None:
+            return {}
+        serving = txn._conn.execute("SELECT c.composition_id FROM composition_refs r JOIN compositions c ON c.realm_id=r.realm_id AND c.revision=r.serving_revision WHERE r.realm_id=?", (txn._envelope.realm_id,)).fetchone()
+        if serving is not None and serving[0] == composition_id:
+            return {}  # a failed rebind does not impersonate a new activation
+        requested = txn._conn.execute(
+            "SELECT payload_json FROM facts WHERE realm_id=? AND entity_type='harness' AND entity_id=? AND event_type='harness_activated' "
+            "AND json_extract(CAST(payload_json AS TEXT),'$.phase')='requested' "
+            "AND json_extract(CAST(payload_json AS TEXT),'$.composition_id')=? ORDER BY seq DESC LIMIT 1",
+            (txn._envelope.realm_id, owner[0], composition_id),
+        ).fetchone()
+        if requested is None:
+            return {}
+        revoked = []
+        for grant_id in json_loads(requested[0]).get("grant_ids", []):
+            status = txn._conn.execute("SELECT status FROM authority_grants WHERE grant_id=?", (grant_id,)).fetchone()
+            if status is not None and status[0] == "ACTIVE":
+                revoke_grant(RevokeGrantRequest(grant_id, reason_code="harness_activation_failed"))(txn)
+                revoked.append(grant_id)
+        fact_id = _append_fact(txn, entity_type="harness", entity_id=owner[0], event_type="harness_activated",
+            payload={"phase": "failed", "composition_id": composition_id, "reason_code": reason_code, "revoked_grant_ids": revoked})
+        _write_history(txn, harness_id=owner[0], status=owner[1], composition_id=composition_id, source_fact_id=fact_id)
+        return {"revoked_grant_ids": revoked}
+    return mutator
 
 
 def settle_harness_for_cutover(realm_id: str, composition_id: str | None):
@@ -472,6 +474,8 @@ def settle_harness_for_cutover(realm_id: str, composition_id: str | None):
         if status == "UNINSTALLED":
             return {"harness_id": harness_id, "settled": "skipped-uninstalled"}
 
+        retired_grants = _revoke_scoped_grants(txn, harness_id, exclude_composition_id=composition_id)
+
         conn.execute(
             "UPDATE harness_installations SET status = 'ACTIVE',"
             " active_composition_id = ?, updated_at_us = ? WHERE harness_id = ?",
@@ -485,6 +489,7 @@ def settle_harness_for_cutover(realm_id: str, composition_id: str | None):
             payload={
                 "phase": "serving",
                 "composition_id": composition_id,
+                "revoked_grant_ids": retired_grants,
             },
         )
         _write_history(
@@ -497,7 +502,7 @@ def settle_harness_for_cutover(realm_id: str, composition_id: str | None):
             " WHERE realm_id = ? AND status = 'ACTIVE' AND harness_id != ?",
             (realm_id, harness_id),
         ).fetchone()
-        revoked: list[str] = []
+        revoked: list[str] = list(retired_grants)
         if previous is not None:
             conn.execute(
                 "UPDATE harness_installations SET status = 'INACTIVE',"
@@ -505,7 +510,7 @@ def settle_harness_for_cutover(realm_id: str, composition_id: str | None):
                 " WHERE harness_id = ?",
                 (txn.recorded_at_us, previous[0]),
             )
-            revoked = _revoke_scoped_grants(txn, previous[0])
+            revoked.extend(_revoke_scoped_grants(txn, previous[0]))
             prev_fact = _append_fact(
                 txn,
                 entity_type="harness",
@@ -624,37 +629,40 @@ def uninstall_harness(request: UninstallHarnessRequest):
                 details={"status": row[4]},
             )
         conn = txn._conn
-        refs = conn.execute(
-            "SELECT desired_revision, serving_revision, realized_revision"
-            " FROM composition_refs WHERE realm_id = ?",
-            (txn._envelope.realm_id,),
-        ).fetchone()
-        if refs is not None and any(int(v) != 0 for v in refs):
-            raise StableError(
-                code=ErrorCode.FAILED_PRECONDITION,
-                message="realm still references a composition; uninstall refused",
+        # Only the target installation's typed ownership closure pins it.
+        # A new serving generation must not prevent removal of a drained old
+        # version. The checks remain in this same command transaction.
+        pins = conn.execute("""
+            WITH owned_compositions(composition_id) AS (
+                SELECT hist.composition_id FROM harness_installation_history hist
+                JOIN compositions c ON c.composition_id=hist.composition_id
+                WHERE hist.harness_id=:harness AND c.realm_id=:realm
+                UNION
+                SELECT c.composition_id FROM compositions c WHERE c.realm_id=:realm
+                AND EXISTS (SELECT 1 FROM json_each(c.body_json,'$.slots') slot
+                    WHERE CASE WHEN slot.type='object' THEN json_extract(slot.value,'$.artifact_id') END=:package)
+            ), owned_capabilities(capability_id,descriptor_revision) AS (
+                SELECT capability_id,descriptor_revision FROM capabilities WHERE artifact_id=:package
             )
-        non_terminal_tasks = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE realm_id = ? AND status NOT IN"
-            " (?, ?, ?, ?, ?)",
-            (txn._envelope.realm_id, *_TERMINAL_TASK_STATUSES),
-        ).fetchone()[0]
-        if non_terminal_tasks:
-            raise StableError(
-                code=ErrorCode.FAILED_PRECONDITION,
-                message="non-terminal Tasks exist; uninstall refused",
-                details={"count": str(non_terminal_tasks)},
-            )
-        active_instances = conn.execute(
-            "SELECT COUNT(*) FROM capability_instances WHERE realm_id = ?"
-            " AND status IN ('ACTIVE','INSTANTIATING','DRAINING')",
-            (txn._envelope.realm_id,),
-        ).fetchone()[0]
-        if active_instances:
-            raise StableError(
-                code=ErrorCode.FAILED_PRECONDITION,
-                message="active Capability instances exist; uninstall refused",
-            )
+            SELECT
+                EXISTS (SELECT 1 FROM composition_refs r JOIN compositions c ON c.realm_id=r.realm_id
+                    AND c.revision IN (r.desired_revision,r.serving_revision,r.realized_revision)
+                    WHERE r.realm_id=:realm AND c.composition_id IN owned_compositions),
+                (SELECT COUNT(*) FROM tasks WHERE realm_id=:realm AND serving_composition_id IN owned_compositions
+                    AND status NOT IN ('SUCCEEDED','FAILED','FAILED_RECOVERY','TIMED_OUT','CANCELLED')),
+                (SELECT COUNT(*) FROM capability_instances i WHERE i.realm_id=:realm
+                    AND i.status IN ('ACTIVE','INSTANTIATING','DRAINING')
+                    AND (i.composition_id IN owned_compositions OR EXISTS (SELECT 1 FROM owned_capabilities c
+                        WHERE c.capability_id=i.capability_id AND c.descriptor_revision=i.descriptor_revision))),
+                (SELECT COUNT(*) FROM managed_states WHERE owner_id IN (:harness,:package)
+                    OR owner_id IN owned_compositions OR owner_id IN (SELECT capability_id FROM owned_capabilities)),
+                (SELECT COUNT(*) FROM effect_intents e JOIN actions a ON a.action_id=e.action_id
+                    WHERE a.composition_id IN owned_compositions AND e.status NOT IN ('SUCCEEDED','FAILED','COMPENSATED'))
+            """, {"realm": txn._envelope.realm_id, "harness": request.harness_id, "package": row[6]}).fetchone()
+        for count, kind in zip(pins, ("current Composition", "non-terminal Task", "active Capability instance", "State owner", "unsettled Effect")):
+            if count:
+                raise StableError(code=ErrorCode.FAILED_PRECONDITION,
+                    message=f"installation still has a {kind} reference; uninstall refused", details={"count": str(count)})
         revoked = _revoke_scoped_grants(txn, request.harness_id)
         conn.execute(
             "UPDATE harness_installations SET status = 'UNINSTALLED',"

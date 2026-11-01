@@ -73,6 +73,7 @@ _JSON_REF_COLUMNS: tuple[tuple[str, str], ...] = (
     ("worlds", "body_json"),
     ("evolution_objects", "body_json"),
     ("experiments", "body_json"),
+    ("context_projections", "manifest_json"),
 )
 
 _ARTIFACT_REF_RE = re.compile(r"artifact://sha256/([0-9a-f]{64})")

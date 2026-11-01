@@ -85,17 +85,17 @@ def promote_candidate(request: PromoteCandidateRequest):
         candidate_body = _load_json(candidate_row[0])
         composition_id = str(candidate_body.get("composition_id"))
         composition = conn.execute(
-            "SELECT revision, body_json FROM compositions WHERE composition_id = ?",
-            (composition_id,),
+            "SELECT revision, body_json FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (composition_id, request.realm_id),
         ).fetchone()
         if composition is None:
             _gate_fail(txn, "candidate composition missing")
         revision, body_json = int(composition[0]), _load_json(composition[1])
 
         experiment = conn.execute(
-            "SELECT experiment_id FROM experiments WHERE candidate_id = ?"
+            "SELECT experiment_id FROM experiments WHERE candidate_id = ? AND realm_id = ?"
             " ORDER BY created_at_us DESC, experiment_id DESC LIMIT 1",
-            (request.candidate_id,),
+            (request.candidate_id, request.realm_id),
         ).fetchone()
         if experiment is None:
             _gate_fail(txn, "candidate has no experiment")
@@ -237,8 +237,8 @@ def rollback_composition(request: RollbackCompositionRequest):
                         },
                     )
         parent = txn._conn.execute(
-            "SELECT revision FROM compositions WHERE composition_id = ?",
-            (request.target_parent_id,),
+            "SELECT revision FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (request.target_parent_id, request.realm_id),
         ).fetchone()
         if parent is None:
             raise StableError(

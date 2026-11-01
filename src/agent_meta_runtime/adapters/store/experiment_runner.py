@@ -248,8 +248,8 @@ def start_experiment(experiment_id: str, backend_features: Mapping[str, str]):
         conn = txn._conn
         experiment = conn.execute(
             "SELECT realm_id, candidate_id, baseline_id, world_id, status"
-            " FROM experiments WHERE experiment_id = ?",
-            (experiment_id,),
+            " FROM experiments WHERE experiment_id = ? AND realm_id = ?",
+            (experiment_id, txn._envelope.realm_id),
         ).fetchone()
         if experiment is None:
             raise StableError(
@@ -264,8 +264,8 @@ def start_experiment(experiment_id: str, backend_features: Mapping[str, str]):
             )
         candidate = conn.execute(
             "SELECT body_json FROM evolution_objects WHERE object_id = ?"
-            " AND object_type = 'CANDIDATE'",
-            (candidate_id,),
+            " AND object_type = 'CANDIDATE' AND realm_id = ?",
+            (candidate_id, realm_id),
         ).fetchone()
         if candidate is None:
             raise StableError(
@@ -287,18 +287,19 @@ def start_experiment(experiment_id: str, backend_features: Mapping[str, str]):
                 "placement": PLACEMENTS.get(trust_class),
             }
         world_row = conn.execute(
-            "SELECT body_json FROM worlds WHERE world_id = ?", (world_id,)
+            "SELECT body_json FROM worlds WHERE world_id = ? AND realm_id = ?",
+            (world_id, realm_id),
         ).fetchone()
         if world_row is None:
             raise StableError(code=ErrorCode.NOT_FOUND, message="world not found")
         world = _load_json(world_row[0])
         baseline_row = conn.execute(
-            "SELECT body_json FROM compositions WHERE composition_id = ?",
-            (baseline_id,),
+            "SELECT body_json FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (baseline_id, realm_id),
         ).fetchone()
         candidate_row = conn.execute(
-            "SELECT body_json FROM compositions WHERE composition_id = ?",
-            (candidate_composition_id,),
+            "SELECT body_json FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (candidate_composition_id, realm_id),
         ).fetchone()
         if baseline_row is None or candidate_row is None:
             raise StableError(

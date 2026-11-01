@@ -110,6 +110,10 @@ class TaskAcceptRequest:
     capability_surface_artifact_id: str | None = None
     backend_profile_hash: str = "portable-v1"
     reserve_grant_use: bool = False
+    prepared_surface: Mapping[str, Any] | None = None
+    prepared_view: Mapping[str, Any] | None = None
+    context_profile_artifact_id: str | None = None
+    causal_parent_action_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +206,8 @@ def _check_grant_at_accept(
         txn, grant_id, now_us=txn.recorded_at_us, actor_id=actor_id
     )
     uses_count = txn._conn.execute(
-        "SELECT COUNT(*) FROM authority_uses WHERE grant_id = ?", (grant_id,)
+        "SELECT COUNT(*) FROM authority_uses WHERE grant_id = ? AND NOT(action_id=? AND use_kind='command')",
+        (grant_id, txn._envelope.command_id),
     ).fetchone()[0]
     reason = authorize(
         grant,
@@ -210,7 +215,7 @@ def _check_grant_at_accept(
         permission="task.submit",
         resource_realm=txn._envelope.realm_id,
         resource_target=None,
-        epoch_id=grant.epoch_id,
+        epoch_id=txn._conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (txn._envelope.realm_id,)).fetchone()[0],
         now_us=txn.recorded_at_us,
         uses_count=uses_count,
     )
@@ -331,12 +336,25 @@ def accept_task(request: TaskAcceptRequest):
                 composition_id=request.serving_composition_id,
                 actor_id=request.actor_id,
                 backend_profile_hash=request.backend_profile_hash,
+                prepared=request.prepared_surface,
             )
             surface_revision = surface["surface_revision"]
             surface_artifact_id = surface["surface_artifact_id"]
         else:
             surface_revision = request.capability_surface_revision
             surface_artifact_id = request.capability_surface_artifact_id
+        if request.prepared_view is not None:
+            from .task_snapshot import acceptance_view, register_staged_artifact
+            view = acceptance_view(txn._conn, realm_id=txn._envelope.realm_id,
+                actor_id=request.actor_id, composition_id=request.serving_composition_id,
+                serving_revision=request.serving_revision, surface_artifact_id=surface_artifact_id,
+                authority_fingerprint=request.prepared_surface["authority_fingerprint"],
+                backend_profile_hash=request.backend_profile_hash, context_profile_artifact_id=request.context_profile_artifact_id,
+                causal_parent_action_id=request.causal_parent_action_id, now_us=txn.recorded_at_us)
+            if view["content"] != request.prepared_view["content"]:
+                raise StableError(code=ErrorCode.REVISION_CONFLICT, message="Task acceptance View changed before admission")
+            snapshot = view["value"]["state_snapshot"]
+            register_staged_artifact(txn, request.prepared_view, kind="task_view")
         if request.authority_grant_id:
             _check_grant_at_accept(
                 txn,
@@ -383,9 +401,9 @@ def accept_task(request: TaskAcceptRequest):
             )
             txn.execute(
                 "INSERT INTO actions(action_id, task_id, actor_id, intent,"
-                " composition_id, grant_id, status, budget_json,"
+                " composition_id, grant_id, causal_parent_action_id, status, budget_json,"
                 " consumed_budget_json, created_at_us)"
-                " VALUES (?, ?, ?, ?, ?, ?, 'CREATED', ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 'CREATED', ?, ?, ?)",
                 (
                     root_action_id,
                     task_id,
@@ -393,6 +411,7 @@ def accept_task(request: TaskAcceptRequest):
                     "task_root",
                     request.serving_composition_id,
                     request.authority_grant_id,
+                    request.causal_parent_action_id,
                     budget_json,
                     empty_json,
                     txn.recorded_at_us,
@@ -413,6 +432,8 @@ def accept_task(request: TaskAcceptRequest):
                 "input_artifact_id": request.input_artifact_id,
                 "serving_composition_id": request.serving_composition_id,
                 "serving_revision": request.serving_revision,
+                **({"acceptance_view_artifact_id": request.prepared_view["artifact_id"]}
+                   if request.prepared_view is not None else {}),
             },
             actor_id=request.actor_id,
         )
@@ -423,6 +444,8 @@ def accept_task(request: TaskAcceptRequest):
             from_id=root_action_id,
             to_id=task_id,
         )
+        if request.causal_parent_action_id is not None:
+            _append_edge(txn, fact_id=fact_id, edge_type="caused_by", from_id=root_action_id, to_id=request.causal_parent_action_id)
         if request.authority_grant_id:
             _append_edge(
                 txn,

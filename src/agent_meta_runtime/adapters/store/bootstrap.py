@@ -26,7 +26,10 @@ from ...domain.authority import (
 from ...domain.canonical import canonical_json
 from ...domain.envelope import CommandEnvelope
 from ...domain.facts import GENESIS_FACT_HEAD
+from ...domain.errors import ErrorCode, StableError
+from ...domain.execution_tokens import ExecutionTokenVerifier
 from ...domain.ids import new_uuid7
+from ..crypto import verify_signature
 from ...ports.repositories import FactAppendRequest
 from .authority import (
     RootBootstrapRequest,
@@ -59,8 +62,8 @@ SERVICE_GRANT_PERMISSIONS = frozenset(
     }
 )
 
-_RUNTIME_PUBLIC_API_VERSION = "1.0.0"
-_HARNESS_CONTRACT_VERSION = "1.0.0"
+_RUNTIME_PUBLIC_API_VERSION = "1.6.0"
+_HARNESS_CONTRACT_VERSION = "1.1.0"
 _CAPABILITY_CONTRACT_VERSION = "1.0.0"
 
 
@@ -193,7 +196,12 @@ class CoreBootstrapRequest:
     service_public_key: bytes
     recovery_code_hash: str
     builtin_artifacts: Mapping[str, str]  # name → artifact_id (CAS already staged)
+    builtin_storage_paths: Mapping[str, str]
     command_id: str = ""
+    root_grant_id: str | None = None
+    service_certificate: bytes | None = None
+    service_certificate_artifact_id: str | None = None
+    service_certificate_storage_path: str | None = None
 
 
 def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> dict[str, Any]:
@@ -203,6 +211,19 @@ def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> d
     function registers the artifact rows. Returns the bootstrap receipt.
     """
 
+    certificate_fields = (request.service_certificate, request.service_certificate_artifact_id, request.service_certificate_storage_path)
+    if any(value is not None for value in certificate_fields):
+        if not all(value is not None for value in certificate_fields):
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="bootstrap Service certificate inputs are incomplete")
+        if not isinstance(request.service_certificate_storage_path, str) or not request.service_certificate_storage_path:
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="bootstrap Service certificate storage identity is invalid")
+        ExecutionTokenVerifier(root_principal_id=request.root_principal_id, root_public_key=request.root_public_key,
+            realm_id=request.realm_id, epoch_id=request.epoch_id, certificate=request.service_certificate, verify_signature=verify_signature)
+        import json
+        payload = json.loads(request.service_certificate)["certificate"]
+        if (payload["service_principal_id"] != request.service_principal_id or payload["public_key"] != request.service_public_key.hex()
+                or request.service_certificate_artifact_id != "artifact://sha256/" + hashlib.sha256(request.service_certificate).hexdigest()):
+            raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="bootstrap Service certificate identity/content differs")
     conn.execute("BEGIN IMMEDIATE")
     try:
         now_us = _store_now(conn)
@@ -261,7 +282,8 @@ def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> d
                     request.root_principal_id,
                     now_us,
                     canonical_json([]),
-                    canonical_json({"builtin": name, "size_bytes": len(body)}),
+                    canonical_json({"builtin": name, "size_bytes": len(body),
+                                    "storage_relpath": request.builtin_storage_paths[name]}),
                 ),
             )
             fact(
@@ -270,7 +292,7 @@ def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> d
             )
 
         # -- steps 5/6/8a: realm epoch, Root Principal, Root Grant, recovery
-        bootstrap_root(
+        root_receipt = bootstrap_root(
             RootBootstrapRequest(
                 realm_id=request.realm_id,
                 epoch_id=request.epoch_id,
@@ -280,6 +302,7 @@ def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> d
                 constitution_artifact_id=request.builtin_artifacts["constitution"],
                 meta_root_artifact_id=request.builtin_artifacts["schema_registry"],
                 ordinal=0,
+                grant_id=request.root_grant_id,
             )
         )(txn)
 
@@ -330,6 +353,14 @@ def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> d
             source_fact_id=service_fact,
         )
 
+        if request.service_certificate is not None:
+            certificate_id = request.service_certificate_artifact_id
+            conn.execute("INSERT INTO artifacts(artifact_id,kind,media_type,size_bytes,schema_version,created_by,created_at_us,parents_json,manifest_json,integrity_status) "
+                "VALUES (?,'authority_certificate','application/json',?,1,?,?,?,?,'VALID')",
+                (certificate_id, len(request.service_certificate), request.root_principal_id, now_us, canonical_json([]),
+                 canonical_json({"storage_relpath": request.service_certificate_storage_path, "size_bytes": len(request.service_certificate)})))
+            fact("artifact", certificate_id, "artifact_registered", {"kind": "authority_certificate", "service_principal_id": request.service_principal_id})
+
         # -- step 9: composition_refs revision-0 READY sentinel (no pseudo row)
         conn.execute(
             "INSERT INTO composition_refs(realm_id, desired_revision,"
@@ -347,8 +378,9 @@ def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> d
                 "epoch_id": request.epoch_id,
                 "root_principal_id": request.root_principal_id,
                 "service_principal_id": request.service_principal_id,
-                "root_grant_id": service_grant.grant_id,
+                "root_grant_id": root_receipt["grant_id"],
                 "builtin_artifacts": dict(request.builtin_artifacts),
+                **({"service_certificate_artifact_id": request.service_certificate_artifact_id} if request.service_certificate is not None else {}),
             },
         )
         fact(
@@ -403,6 +435,7 @@ def bootstrap_core(conn: sqlite3.Connection, request: CoreBootstrapRequest) -> d
         "realm_id": request.realm_id,
         "epoch_id": request.epoch_id,
         "root_principal_id": request.root_principal_id,
+        "root_grant_id": root_receipt["grant_id"],
         "service_principal_id": request.service_principal_id,
         "service_grant_id": grant_id,
         "builtin_artifacts": dict(request.builtin_artifacts),

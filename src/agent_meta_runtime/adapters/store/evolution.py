@@ -169,6 +169,12 @@ def submit_proposal(request: SubmitProposalRequest):
     """Record one Proposal (FR-MEVO-001: separated from Experiment/Evidence)."""
 
     def mutator(txn: "_SqliteStoreTransaction") -> dict[str, Any]:
+        _require(
+            txn._conn,
+            "SELECT 1 FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (request.target_composition_id, request.realm_id),
+            "target composition not found",
+        )
         proposal_id = "proposal://" + new_uuid7()
         body = {
             "hypothesis": request.hypothesis,
@@ -232,14 +238,15 @@ def create_change_set(request: CreateChangeSetRequest):
     def mutator(txn: "_SqliteStoreTransaction") -> dict[str, Any]:
         _require(
             txn._conn,
-            "SELECT 1 FROM evolution_objects WHERE object_id = ? AND realm_id = ?",
+            "SELECT 1 FROM evolution_objects WHERE object_id = ? AND realm_id = ?"
+            " AND object_type = 'PROPOSAL'",
             (request.proposal_id, request.realm_id),
             "proposal not found",
         )
         _require(
             txn._conn,
-            "SELECT 1 FROM compositions WHERE composition_id = ?",
-            (request.baseline_id,),
+            "SELECT 1 FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (request.baseline_id, request.realm_id),
             "baseline composition not found",
         )
         body = {
@@ -300,8 +307,8 @@ def register_candidate(request: RegisterCandidateRequest):
         cs_body = _load_json(change_set_row[2])
         baseline_row = _require(
             txn._conn,
-            "SELECT body_json FROM compositions WHERE composition_id = ?",
-            (cs_body["baseline_id"],),
+            "SELECT body_json FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (cs_body["baseline_id"], request.realm_id),
             "baseline composition not found",
         )
         change_set = ChangeSet(
@@ -427,8 +434,8 @@ def create_experiment(request: CreateExperimentRequest):
         )
         _require(
             txn._conn,
-            "SELECT 1 FROM compositions WHERE composition_id = ?",
-            (request.baseline_id,),
+            "SELECT 1 FROM compositions WHERE composition_id = ? AND realm_id = ?",
+            (request.baseline_id, request.realm_id),
             "baseline composition not found",
         )
         _require(

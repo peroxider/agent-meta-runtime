@@ -16,6 +16,7 @@ from typing import Callable, TypeVar
 
 from ...domain.deadline import Deadline
 from ...domain.errors import ErrorCode, StableError
+from ...domain.meta_schema import META_SCHEMA_VERSION
 
 __all__ = [
     "APPLICATION_ID",
@@ -28,7 +29,7 @@ __all__ = [
 ]
 
 APPLICATION_ID = 1095586388  # ASCII "AMRT"
-USER_VERSION = 1
+USER_VERSION = META_SCHEMA_VERSION
 
 PRAGMA_PROFILE: tuple[tuple[str, str], ...] = (
     ("foreign_keys", "ON"),

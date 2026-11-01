@@ -16,6 +16,7 @@ import sqlite3
 from typing import TYPE_CHECKING, Any
 
 from ...domain.canonical import canonical_json
+from ...domain.authority import ScopeTarget, authorize
 from ...domain.errors import ErrorCode, StableError
 from ...domain.surface import (
     GrantProjectionEntry,
@@ -53,21 +54,22 @@ def authority_boundary_for_principal(conn, principal_id: str) -> tuple[int, list
     return boundary, rows
 
 
-def resolve_or_create_surface(
-    txn: "_SqliteStoreTransaction",
+def build_surface_snapshot(
+    conn,
     *,
+    realm_id: str,
     composition_id: str,
     actor_id: str,
     backend_profile_hash: str,
+    now_us: int,
+    pending_use: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Resolve or create the capability surface for one Task acceptance.
+    """Read-only surface preimage; may predict one signed admission use.
 
-    Returns ``{"surface_revision", "surface_artifact_id", "reused"}``.
+    The caller stages these exact bytes in CAS outside the transaction. The
+    accepting transaction recomputes and compares the full snapshot before it
+    registers any reference. A changed authority snapshot is a conflict.
     """
-
-    conn = txn._conn
-    realm_id = txn._envelope.realm_id
-    now_us = txn.recorded_at_us
     realm_row = conn.execute(
         "SELECT epoch_id FROM realms WHERE realm_id = ?", (realm_id,)
     ).fetchone()
@@ -81,11 +83,20 @@ def resolve_or_create_surface(
         g
         for g in grants
         if g.status == "ACTIVE"
+        and g.epoch_id == epoch_id
         and (g.expires_at_us is None or g.expires_at_us > now_us)
+        and (g.constraints.expires_at_us is None or g.constraints.expires_at_us > now_us)
         and (
             g.constraints.not_before_us is None or g.constraints.not_before_us <= now_us
         )
     ]
+    predict = pending_use is not None and not conn.execute(
+        "SELECT 1 FROM authority_uses WHERE grant_id=? AND action_id=? AND use_kind='command'", pending_use
+    ).fetchone()
+    if predict:
+        revision = conn.execute("SELECT current_meta_revision FROM realms WHERE realm_id=?", (realm_id,)).fetchone()[0]
+        boundary = max(boundary, revision + 1)
+    uses_by_grant = {}
 
     projection: list[GrantProjectionEntry] = []
     for grant in valid:
@@ -93,6 +104,9 @@ def resolve_or_create_surface(
             "SELECT COUNT(*) FROM authority_uses WHERE grant_id = ?",
             (grant.grant_id,),
         ).fetchone()[0]
+        if predict and grant.grant_id == pending_use[0]:
+            uses += 1
+        uses_by_grant[grant.grant_id] = uses
         max_uses = grant.constraints.max_uses
         remaining = max_uses - uses if max_uses is not None else None
         scope_text = grant.scope.canonical_bytes().decode("utf-8")
@@ -114,19 +128,6 @@ def resolve_or_create_surface(
         authority_history_boundary_meta_revision=boundary,
         grant_projection=projection,
     )
-
-    hit = conn.execute(
-        "SELECT surface_revision, artifact_id FROM capability_surfaces WHERE"
-        " realm_id = ? AND composition_id = ? AND authority_fingerprint = ?"
-        " AND backend_profile_hash = ?",
-        (realm_id, composition_id, fingerprint, backend_profile_hash),
-    ).fetchone()
-    if hit is not None:
-        return {
-            "surface_revision": int(hit[0]),
-            "surface_artifact_id": hit[1],
-            "reused": True,
-        }
 
     comp_row = conn.execute(
         "SELECT body_json FROM compositions WHERE composition_id = ?",
@@ -154,7 +155,13 @@ def resolve_or_create_surface(
             matched_scope = None
             if required:
                 covering = [
-                    g for g in valid if required <= g.permissions
+                    g for g in valid if required <= g.permissions and all(
+                        authorize(g, subject_id=actor_id, permission=permission,
+                                  resource_realm=realm_id,
+                                  resource_target=ScopeTarget("CAPABILITY", slot.get("capability_id", "")),
+                                  epoch_id=epoch_id, now_us=now_us, uses_count=uses_by_grant[g.grant_id]) is None
+                        for permission in required
+                    )
                 ]
                 if not covering:
                     continue  # authority filter: operation stays out of the surface
@@ -182,6 +189,22 @@ def resolve_or_create_surface(
             )
 
     artifact_body, artifact_id = build_surface_artifact(operations)
+    return {"content": artifact_body, "artifact_id": artifact_id, "authority_fingerprint": fingerprint,
+            "backend_profile_hash": backend_profile_hash, "composition_id": composition_id}
+
+
+def resolve_or_create_surface(txn, *, composition_id, actor_id, backend_profile_hash, prepared=None):
+    conn, realm_id, now_us = txn._conn, txn._envelope.realm_id, txn.recorded_at_us
+    snapshot = build_surface_snapshot(conn, realm_id=realm_id, composition_id=composition_id,
+        actor_id=actor_id, backend_profile_hash=backend_profile_hash, now_us=now_us)
+    if prepared is not None and any(snapshot[name] != prepared[name] for name in snapshot):
+        raise StableError(code=ErrorCode.REVISION_CONFLICT, message="surface authority snapshot changed before admission")
+    artifact_body, artifact_id = snapshot["content"], snapshot["artifact_id"]
+    fingerprint = snapshot["authority_fingerprint"]
+    hit = conn.execute("SELECT surface_revision,artifact_id FROM capability_surfaces WHERE realm_id=? AND composition_id=? AND authority_fingerprint=? AND backend_profile_hash=?",
+                       (realm_id, composition_id, fingerprint, backend_profile_hash)).fetchone()
+    if hit is not None:
+        return {"surface_revision": hit[0], "surface_artifact_id": hit[1], "reused": True}
     try:
         conn.execute(
             "INSERT INTO artifacts(artifact_id, kind, media_type, size_bytes,"
@@ -195,7 +218,7 @@ def resolve_or_create_surface(
                 actor_id,
                 now_us,
                 canonical_json([]),
-                canonical_json({}),
+                canonical_json(prepared["manifest"] if prepared is not None else {}),
             ),
         )
     except sqlite3.IntegrityError as exc:

@@ -68,6 +68,7 @@ class RootBootstrapRequest:
     constitution_artifact_id: str = ""
     meta_root_artifact_id: str = ""
     ordinal: int = 0
+    grant_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +271,9 @@ def bootstrap_root(request: RootBootstrapRequest):
                 message="Root Principal already exists; init is not repeatable",
                 details={"principal_id": request.principal_id},
             )
+        realm = conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (request.realm_id,)).fetchone()
+        if realm is None or realm[0] != request.epoch_id or request.realm_id != txn._envelope.realm_id:
+            raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="Root bootstrap epoch differs from its Realm")
         conn.execute(
             "INSERT INTO epochs(epoch_id, realm_id, ordinal,"
             " constitution_artifact_id, meta_root_artifact_id,"
@@ -302,7 +306,7 @@ def bootstrap_root(request: RootBootstrapRequest):
                 now_us,
             ),
         )
-        grant_id = f"grant://{new_uuid7()}"
+        grant_id = request.grant_id or f"grant://{new_uuid7()}"
         grant = Grant(
             grant_id=grant_id,
             epoch_id=request.epoch_id,
@@ -384,6 +388,29 @@ def create_grant(request: CreateGrantRequest):
                 message="parent grant lacks authority.delegate",
                 details={"parent_grant_id": parent.grant_id},
             )
+        epoch = conn.execute("SELECT epoch_id FROM realms WHERE realm_id=?", (txn._envelope.realm_id,)).fetchone()
+        action_key = f"command://{txn._envelope.command_id.split('://', 1)[-1]}"
+        command_reserved = (txn._envelope.payload_type == "authority.delegate/v1"
+            and txn._envelope.authority_grant_id == parent.grant_id
+            and conn.execute("SELECT 1 FROM authority_uses WHERE grant_id=? AND action_id=? AND use_kind='command'",
+                (parent.grant_id, txn._envelope.command_id)).fetchone() is not None)
+        # One signed command may delegate a reviewed batch of scoped Grants.
+        # Its own reservation is idempotent across that batch, not extra uses.
+        uses_count = conn.execute(
+            "SELECT COUNT(*) FROM authority_uses WHERE grant_id=? AND NOT(action_id=? AND use_kind='delegate')",
+            (parent.grant_id, action_key),
+        ).fetchone()[0]
+        if command_reserved:
+            uses_count -= 1
+        reason = authorize(
+            parent, subject_id=issuer_id, permission="authority.delegate",
+            resource_realm=txn._envelope.realm_id,
+            resource_target=request.scope.targets[0] if request.scope.targets else None,
+            epoch_id=epoch[0] if epoch else "", now_us=now_us, uses_count=uses_count,
+        )
+        if reason is not None:
+            raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED if reason == "CONSTRAINT_USES" else ErrorCode.AUTHORITY_DENIED,
+                              message="delegation issuer is not authorized", details={"reason_code": reason})
         child_depth = validate_delegation(
             parent,
             child_permissions=request.permissions,
@@ -392,10 +419,6 @@ def create_grant(request: CreateGrantRequest):
             child_delegable=request.delegable,
         )
         # Delegation consumes one parent use under the command's action key.
-        uses_count = conn.execute(
-            "SELECT COUNT(*) FROM authority_uses WHERE grant_id = ?",
-            (parent.grant_id,),
-        ).fetchone()[0]
         max_uses = parent.constraints.max_uses
         if max_uses is not None and uses_count >= max_uses:
             raise StableError(
@@ -403,13 +426,8 @@ def create_grant(request: CreateGrantRequest):
                 message="parent grant use counter exhausted",
                 details={"parent_grant_id": parent.grant_id},
             )
-        action_key = f"command://{txn._envelope.command_id.split('://', 1)[-1]}"
-        if not _reserve_use_row(txn, parent.grant_id, action_key, "delegate", {}):
-            raise StableError(
-                code=ErrorCode.RESOURCE_EXHAUSTED,
-                message="parent grant use counter exhausted",
-                details={"parent_grant_id": parent.grant_id},
-            )
+        if not command_reserved:
+            _reserve_use_row(txn, parent.grant_id, action_key, "delegate", {})
         grant_id = request.grant_id or f"grant://{new_uuid7()}"
         child = Grant(
             grant_id=grant_id,
