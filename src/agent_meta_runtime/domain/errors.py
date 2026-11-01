@@ -106,7 +106,7 @@ RETRYABLE_CODES: dict[str, bool | None] = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class StableError(Exception):
     """A stable, serializable error carrying a registry code."""
 
@@ -117,6 +117,10 @@ class StableError(Exception):
     def __post_init__(self) -> None:
         if self.code not in ErrorCode.ALL:
             raise ValueError(f"unknown error code: {self.code!r}")
+        # Python/contextlib must be able to attach __traceback__, __cause__
+        # and __context__ while propagating an exception. A frozen dataclass
+        # prevents that and replaces the original stable error with TypeError.
+        Exception.__init__(self, self.message)
 
     @property
     def retryable(self) -> bool | None:

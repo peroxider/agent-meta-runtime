@@ -297,6 +297,8 @@ def authorize(
         return "PERMISSION"  # unknown permission fails closed
     if grant.status != "ACTIVE":
         return "STATUS" if grant.status == "REVOKED" else "REVOKED"
+    if grant.epoch_id != epoch_id:
+        return "EPOCH"
     if grant.subject_id != subject_id:
         return "SUBJECT"
     if permission not in grant.permissions:
@@ -369,12 +371,18 @@ def validate_delegation(
             raise deny("RESOURCE_CEILING")
     if pc.max_uses is not None and (cc.max_uses is None or cc.max_uses > pc.max_uses):
         raise deny("MAX_USES")
-    if parent.delegation_depth <= 0:
+    parent_depth = min(parent.delegation_depth, pc.delegation_depth_remaining) if pc.delegation_depth_remaining is not None else parent.delegation_depth
+    if parent_depth <= 0:
         raise deny("DEPTH_EXHAUSTED")
-    if child_delegable and parent.delegation_depth - 1 <= 0:
+    child_depth = parent_depth - 1
+    if cc.delegation_depth_remaining is not None:
+        if cc.delegation_depth_remaining > child_depth:
+            raise deny("DEPTH_EXHAUSTED")
+        child_depth = cc.delegation_depth_remaining
+    if child_delegable and child_depth <= 0:
         # A child that is itself delegable needs one remaining depth to spare.
         raise deny("DEPTH_EXHAUSTED")
-    return parent.delegation_depth - 1
+    return child_depth
 
 
 def command_signature_preimage(

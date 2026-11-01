@@ -56,6 +56,7 @@ ENTITY_EVENT_TYPES: dict[str, frozenset[str]] = {
             "harness_deactivated",
             "harness_uninstalled",
             "harness_contract_rejected",
+            "provider_configured",
         }
     ),
     "composition": frozenset(
@@ -78,6 +79,7 @@ ENTITY_EVENT_TYPES: dict[str, frozenset[str]] = {
     ),
     "authority": frozenset(
         {
+            "principal_registered",
             "grant_created",
             "grant_delegated",
             "grant_revoked",
@@ -105,6 +107,9 @@ ENTITY_EVENT_TYPES: dict[str, frozenset[str]] = {
             "invocation_created",
             "invocation_attempted",
             "invocation_finished",
+            "provider_cost_reserved",
+            "provider_cost_settled",
+            "provider_dispatch_authorized",
             "late_completion_observed",
         }
     ),
@@ -195,7 +200,7 @@ ENTITY_ID_SCHEMES: dict[str, frozenset[str]] = {
     "capability": frozenset({"capability"}),
     "composition": frozenset({"composition"}),
     "state": frozenset({"state", "state-revision"}),
-    "authority": frozenset({"grant"}),
+    "authority": frozenset({"grant", "principal"}),
     "task": frozenset({"task"}),
     "action": frozenset({"action"}),
     "invocation": frozenset({"invocation"}),

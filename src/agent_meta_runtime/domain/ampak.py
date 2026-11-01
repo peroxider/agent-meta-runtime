@@ -160,6 +160,8 @@ def _validate_no_duplicates(entries: tuple[PackageEntry, ...]) -> None:
                 raise AmpakError("DIRECTORY entries use permission_class DATA")
             if entry.size != 0:
                 raise AmpakError("DIRECTORY entries have size 0")
+            if entry.sha256 != "":
+                raise AmpakError("DIRECTORY entries have an empty sha256")
         else:
             if entry.size < 0 or entry.size > MAX_FILE_BYTES:
                 raise AmpakError(f"file size out of range for {entry.path!r}")
@@ -272,6 +274,8 @@ def validate_manifest(manifest: PackageManifest) -> None:
         raise AmpakError(f"package exceeds {MAX_ENTRIES} entries")
     _validate_meta(manifest.package)
     _validate_no_duplicates(manifest.entries)
+    if list(manifest.entries) != sorted(manifest.entries, key=lambda e: e.path.encode("utf-8")):
+        raise AmpakError("entries must be sorted by path UTF-8 bytes ascending")
 
 
 def encode_package(manifest: PackageManifest, files: Mapping[str, bytes]) -> bytes:
@@ -328,6 +332,9 @@ def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _parse_meta(raw: Any) -> PackageMeta:
     if not isinstance(raw, dict) or set(raw) != set(_PACKAGE_FIELDS):
         raise AmpakError("package object must contain exactly the fixed fields")
+    for field in ("state_schema_artifact_ids", "migration_artifact_ids"):
+        if not isinstance(raw[field], list):
+            raise AmpakError(f"{field} must be an array")
     return PackageMeta(
         name=raw["name"],
         version=raw["version"],
@@ -350,6 +357,8 @@ def _parse_entries(raw: Any) -> tuple[PackageEntry, ...]:
     for item in raw:
         if not isinstance(item, dict) or set(item) != set(_ENTRY_FIELDS):
             raise AmpakError("entry must contain exactly the fixed fields")
+        if not all(isinstance(item[field], str) for field in ("path", "kind", "permission_class", "sha256")):
+            raise AmpakError("entry path/kind/permission_class/sha256 must be strings")
         size = item["size"]
         if not isinstance(size, int) or isinstance(size, bool):
             raise AmpakError("entry size must be an integer")
@@ -390,8 +399,13 @@ def decode_package(data: bytes) -> tuple[PackageManifest, dict[str, bytes]]:
         raise AmpakError(f"manifest is not valid JSON: {exc}") from exc
     if not isinstance(body, dict) or set(body) != {"format_version", "package", "entries"}:
         raise AmpakError("manifest must contain exactly format_version/package/entries")
-    if body["format_version"] != 1:
+    if type(body["format_version"]) is not int or body["format_version"] != 1:
         raise AmpakError("unsupported package format_version")
+    try:
+        if canonical_json(body) != data[start:end]:
+            raise AmpakError("manifest must be RFC 8785 canonical JSON")
+    except CanonicalJsonError as exc:
+        raise AmpakError("manifest is not canonicalizable") from exc
     manifest = PackageManifest(
         package=_parse_meta(body["package"]), entries=_parse_entries(body["entries"])
     )

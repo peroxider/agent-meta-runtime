@@ -17,6 +17,7 @@ import hashlib
 import math
 import time
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any
 
 __all__ = [
@@ -116,7 +117,7 @@ def _serialize(value: Any, out: list[str]) -> None:
                 out.append(",")
             _serialize(item, out)
         out.append("]")
-    elif isinstance(value, dict):
+    elif isinstance(value, (dict, MappingProxyType)):
         if not all(isinstance(k, str) for k in value):
             raise CanonicalJsonError("object keys must be strings")
         out.append("{")

@@ -14,9 +14,13 @@ model-call (no cost) so cancellation cannot bypass the quota.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from .errors import ErrorCode, StableError
+from .canonical import canonical_json
+from .harness import is_artifact_id
 from .semantics import TaskBudget
 
 __all__ = [
@@ -54,6 +58,22 @@ class TextPart:
 class JsonPart:
     value: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        # Snapshot the JSON payload now. A caller mutating the original dict
+        # must not change an accepted model response or persisted replay input.
+        if not isinstance(self.value, (dict, MappingProxyType)):
+            raise ValueError("JSON content must be an object")
+        copied = json.loads(canonical_json(self.value))
+        object.__setattr__(self, "value", _immutable_json(copied))
+
+
+def _immutable_json(value):
+    if isinstance(value, dict):
+        return MappingProxyType({key: _immutable_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_immutable_json(item) for item in value)
+    return value
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactPart:
@@ -90,6 +110,11 @@ class ModelResponse:
     finish_reason: str
     usage: ProviderUsage | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.parts, (list, tuple)):
+            raise ValueError("model response parts must be an ordered array")
+        object.__setattr__(self, "parts", tuple(self.parts))
+
 
 @dataclass(frozen=True, slots=True)
 class TerminalResult:
@@ -97,6 +122,11 @@ class TerminalResult:
 
     parts: tuple[Any, ...]
     result_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parts, (list, tuple)):
+            raise ValueError("terminal result parts must be an ordered array")
+        object.__setattr__(self, "parts", tuple(self.parts))
 
 
 def _part_kind(part: Any) -> str:
@@ -117,6 +147,10 @@ def validate_response(response: ModelResponse) -> tuple[str, ...]:
     """Host-side response validation; returns sorted issue strings."""
 
     issues: list[str] = []
+    if not isinstance(response, ModelResponse):
+        return ("loop.response_type",)
+    if not isinstance(response.parts, (tuple, list)):
+        return ("loop.parts_type",)
     if not isinstance(response.finish_reason, str) or not response.finish_reason:
         issues.append("loop.finish_reason")
     tool_calls = [p for p in response.parts if isinstance(p, ToolCallPart)]
@@ -124,21 +158,61 @@ def validate_response(response: ModelResponse) -> tuple[str, ...]:
     if len(tool_calls) > MAX_TOOL_CALLS_PER_RESPONSE:
         issues.append(f"loop.too_many_tool_calls:{len(tool_calls)}")
     call_ids = [c.call_id for c in tool_calls]
-    if len(call_ids) != len(set(call_ids)):
+    if not all(isinstance(value, str) and value for value in call_ids):
+        issues.append("loop.call_id")
+    elif len(call_ids) != len(set(call_ids)):
         issues.append("loop.duplicate_call_id")
+    for call in tool_calls:
+        if not isinstance(call.name, str) or not call.name:
+            issues.append("loop.tool_name")
+        try:
+            def object_without_duplicates(pairs):
+                body = {}
+                for key, value in pairs:
+                    if key in body:
+                        raise ValueError("duplicate tool argument key")
+                    body[key] = value
+                return body
+
+            if not isinstance(call.arguments_json, str):
+                raise ValueError("tool arguments must be JSON text")
+            arguments = json.loads(call.arguments_json, object_pairs_hook=object_without_duplicates)
+            if not isinstance(arguments, dict):
+                raise ValueError("tool arguments must be an object")
+            canonical_json(arguments)
+        except (ValueError, TypeError, UnicodeError):
+            issues.append("loop.tool_arguments")
     if call_ids:
-        if response.finish_reason not in TOOL_CALL_FINISH_REASONS:
+        if not isinstance(response.finish_reason, str) or response.finish_reason not in TOOL_CALL_FINISH_REASONS:
             issues.append("loop.tool_call_finish_reason")
     else:
         if tool_results:
             # tool_result parts without tool_calls are illegal in a response
             issues.append("loop.stray_tool_result")
-        if response.finish_reason not in TERMINAL_FINISH_REASONS:
+        if not isinstance(response.finish_reason, str) or response.finish_reason not in TERMINAL_FINISH_REASONS:
             issues.append("loop.terminal_finish_reason")
     kinds = [_part_kind(p) for p in response.parts]
     if "unknown" in kinds:
         issues.append("loop.unknown_part")
-    return tuple(sorted(issues))
+    for part in response.parts:
+        if isinstance(part, TextPart) and not isinstance(part.text, str):
+            issues.append("loop.text")
+        if isinstance(part, ArtifactPart) and not is_artifact_id(part.artifact_id):
+            issues.append("loop.artifact_id")
+    if not tool_calls and not any(
+        isinstance(part, JsonPart) or isinstance(part, ArtifactPart) and is_artifact_id(part.artifact_id)
+        or isinstance(part, TextPart) and isinstance(part.text, str) and bool(part.text)
+        for part in response.parts
+    ):
+        issues.append("loop.empty_response")
+    if response.usage is not None:
+        if not isinstance(response.usage, ProviderUsage):
+            issues.append("loop.usage")
+        elif any(value is not None and (type(value) is not int or value < 0) for value in (
+            response.usage.input_tokens, response.usage.output_tokens, response.usage.cost_microunits,
+        )):
+            issues.append("loop.usage")
+    return tuple(sorted(set(issues)))
 
 
 def tool_calls_in_order(response: ModelResponse) -> list[ToolCallPart]:

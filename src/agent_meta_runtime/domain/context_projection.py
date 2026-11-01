@@ -82,27 +82,33 @@ def allocate_budget(budget_tokens: int, ladder: BudgetLadder) -> Allocation:
     over-budgeting (§41.44.4).
     """
 
+    if type(budget_tokens) is not int or budget_tokens < 0:
+        raise ValueError("budget_tokens must be a non-negative integer")
     granted: dict[str, int] = {}
-    remaining = budget_tokens
-    for name, fraction, required_full in BUDGET_LADDER:
+    carry = 0
+    for (name, _, required_full), base in zip(BUDGET_LADDER, ladder_quotas(budget_tokens)):
         need = ladder.needs.get(name)
+        cap = base + carry
         if need is None:
             granted[name] = 0
+            carry = cap
             continue
-        if need < 0:
+        if type(need) is not int or need < 0:
             raise ValueError(f"segment {name} need must be non-negative")
-        cap = int(budget_tokens * fraction)
         if required_full and need > cap:
             return Allocation(
                 total_budget=budget_tokens, granted=dict(granted), rejected=name
             )
-        take = min(need, cap, remaining)
+        take = min(need, cap)
         granted[name] = take
-        remaining -= take
-    # Roll any unused quota into the last segment (facts).
-    if remaining > 0:
-        granted["facts"] = granted.get("facts", 0) + remaining
+        carry = cap - take
     return Allocation(total_budget=budget_tokens, granted=granted)
+
+
+def ladder_quotas(budget_tokens: int) -> tuple[int, ...]:
+    """Integer-only base quotas; rounding remainder belongs to the last segment."""
+    first = tuple(budget_tokens * percent // 100 for percent in (20, 30, 20, 15))
+    return (*first, budget_tokens - sum(first))
 
 
 def select_facts(
@@ -122,12 +128,12 @@ def select_facts(
         raise ValueError("tokens_per_fact must be positive")
     if budget_tokens < 0:
         raise ValueError("budget_tokens must be non-negative")
-    seen: set[str] = set()
-    unique = []
+    seen = {}
     for fact in candidates:
-        if fact.fact_id not in seen:
-            seen.add(fact.fact_id)
-            unique.append(fact)
+        if fact.fact_id in seen and seen[fact.fact_id] != fact:
+            raise StableError(code=ErrorCode.INTEGRITY_ERROR, message="conflicting context Fact revisions")
+        seen[fact.fact_id] = fact
+    unique = list(seen.values())
     unique.sort(key=lambda f: (f.causal_distance, -f.seq, f.fact_id))
     max_facts = budget_tokens // tokens_per_fact
     return tuple(unique[:max_facts])
@@ -201,10 +207,9 @@ class ProjectionManifest:
             if not key.startswith("x_"):
                 raise ValueError("extension fields must start with x_")
 
-    def identity_hash(self) -> str:
-        """Hash over required fields only; extensions never included."""
-
-        body = {
+    def required_fields(self) -> dict:
+        """The exact language-neutral ProjectionManifest v1 required fields."""
+        return {
             "budget_tokens": self.budget_tokens,
             "composition_id": self.composition_id,
             "meta_revision": self.meta_revision,
@@ -214,7 +219,7 @@ class ProjectionManifest:
             "sections": [
                 {
                     "output_artifact_id": s.output_artifact_id,
-                    "renderer_artifact_id": s.renderer_artifact_id,
+                    "renderer": s.renderer_artifact_id,
                     "section_id": s.section_id,
                     "token_count": s.token_count,
                 }
@@ -227,7 +232,9 @@ class ProjectionManifest:
             "tokenizer_id": self.tokenizer_id,
             "total_tokens": self.total_tokens,
         }
-        return sha256_hex(canonical_json(body))
+    def identity_hash(self) -> str:
+        """Hash over required fields only; extensions never included."""
+        return sha256_hex(canonical_json(self.required_fields()))
 
 
 def render_sections(bodies: Sequence[bytes]) -> bytes:

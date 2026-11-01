@@ -52,7 +52,7 @@ class CommandEnvelope:
         if self.causal_parent_action_id is not None:
             validate_id(self.causal_parent_action_id)
         if self.expected_meta_revision is not None and (
-            not isinstance(self.expected_meta_revision, int)
+            type(self.expected_meta_revision) is not int
             or self.expected_meta_revision < 0
         ):
             raise ValueError(
@@ -64,7 +64,7 @@ class CommandEnvelope:
             or not _PAYLOAD_TYPE_RE.match(self.payload_type)
         ):
             raise ValueError("payload_type must be a registry token, e.g. task.submit/v1")
-        if self.payload_schema_version < 1:
+        if type(self.payload_schema_version) is not int or self.payload_schema_version < 1:
             raise ValueError("payload_schema_version must be >= 1")
         object.__setattr__(self, "payload", _freeze_json(self.payload))
         auth_triple = (self.auth_nonce, self.auth_issued_at_us, self.auth_signature)
