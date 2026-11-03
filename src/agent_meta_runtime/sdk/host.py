@@ -18,8 +18,15 @@ from ..domain.loop import (
     TextPart, ToolCallPart, ToolResultPart, terminal_result, validate_response,
 )
 from ..domain.semantics import TaskBudget
+from ..domain.resource_contract import ArtifactRead, ArtifactPut, StateRead, StateWrite, ResourceReceipt, ResourceAdapter
+from ..domain.scratch_execution import ScratchCreate, ScratchExecution, ScratchRelease, ScratchBindings, ScratchInspect
+from ..domain.scratch_export_plan import ScratchExportCandidate
 
 __all__ = [
+    "ScratchCreate", "ScratchExecution", "ScratchRelease",
+    "ScratchBindings", "ScratchInspect",
+    "ScratchExportCandidate",
+    "ArtifactRead", "ArtifactPut", "StateRead", "StateWrite", "ResourceReceipt", "ResourceAdapter",
     "ContextSnapshot", "FrozenContextSource",
     "CapabilityInvocation", "ContextProjection", "HarnessAdapter", "InvocationResult",
     "HealthProbeInvocation", "HealthStatus",

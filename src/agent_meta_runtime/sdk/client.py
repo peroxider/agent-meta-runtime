@@ -466,6 +466,59 @@ class AgentMetaClient:
             raise StableError(code=ErrorCode.INTEGRITY_ERROR, message="Artifact content response failed verification") from exc
         return content
 
+    # -- Managed State -------------------------------------------------------
+    def build_state_create(self, *, realm_id: str, actor_id: str, owner_id: str, schema_id: str,
+            content_artifact_id: str, state_id: str | None = None, purpose: str = 'GENERAL',
+            redaction_policy_artifact_id: str | None = None, command_id: str | None = None,
+            causal_parent_action_id: str | None = None) -> str:
+        from ..domain.state_contract import state_payload
+        payload={'state_id':state_id or 'state://'+new_uuid7(),'owner_id':owner_id,
+            'schema_id':schema_id,'content_artifact_id':content_artifact_id,'purpose':purpose}
+        if redaction_policy_artifact_id is not None:
+            payload['redaction_policy_artifact_id']=redaction_policy_artifact_id
+        return self.build_envelope_jcs(realm_id=realm_id,actor_id=actor_id,payload_type='state.create/v1',
+            payload=state_payload('state.create/v1',payload),command_id=command_id,causal_parent_action_id=causal_parent_action_id)
+
+    async def create_state(self, *, realm_id: str, actor_id: str, owner_id: str, schema_id: str,
+            content_artifact_id: str, state_id: str | None = None, purpose: str = 'GENERAL',
+            redaction_policy_artifact_id: str | None = None, causal_parent_action_id: str | None = None) -> MutationResult:
+        return await self.execute_command('agent_meta.public.v1.State.Create',self.build_state_create(
+            realm_id=realm_id,actor_id=actor_id,owner_id=owner_id,schema_id=schema_id,content_artifact_id=content_artifact_id,
+            state_id=state_id,purpose=purpose,redaction_policy_artifact_id=redaction_policy_artifact_id,
+            causal_parent_action_id=causal_parent_action_id))
+
+    def build_state_read(self, *, realm_id: str, actor_id: str, state_id: str,
+            state_revision_id: str | None = None, command_id: str | None = None) -> str:
+        from ..domain.state_contract import state_payload
+        payload={'state_id':state_id}
+        if state_revision_id is not None:
+            payload['state_revision_id']=state_revision_id
+        return self.build_envelope_jcs(realm_id=realm_id,actor_id=actor_id,payload_type='state.read/v1',
+            payload=state_payload('state.read/v1',payload),command_id=command_id)
+
+    async def get_state(self, *, realm_id: str, actor_id: str, state_id: str, state_revision_id: str | None = None) -> dict[str, Any]:
+        """Fresh audited snapshot; persist build_state_read for response-loss replay."""
+        result=await self.execute_command('agent_meta.public.v1.State.Get',self.build_state_read(
+            realm_id=realm_id,actor_id=actor_id,state_id=state_id,state_revision_id=state_revision_id))
+        return dict(result.resource)
+
+    def build_state_write(self, *, realm_id: str, actor_id: str, state_id: str,
+            expected_state_revision_id: str, expected_cas_revision: int, schema_id: str,
+            content_artifact_id: str, command_id: str | None = None, causal_parent_action_id: str | None = None) -> str:
+        from ..domain.state_contract import state_payload
+        payload={'state_id':state_id,'expected_state_revision_id':expected_state_revision_id,
+            'expected_cas_revision':expected_cas_revision,'schema_id':schema_id,'content_artifact_id':content_artifact_id}
+        return self.build_envelope_jcs(realm_id=realm_id,actor_id=actor_id,payload_type='state.write/v1',
+            payload=state_payload('state.write/v1',payload),command_id=command_id,causal_parent_action_id=causal_parent_action_id)
+
+    async def write_state(self, *, realm_id: str, actor_id: str, state_id: str, expected_state_revision_id: str,
+            expected_cas_revision: int, schema_id: str, content_artifact_id: str,
+            causal_parent_action_id: str | None = None) -> MutationResult:
+        return await self.execute_command('agent_meta.public.v1.State.Write',self.build_state_write(
+            realm_id=realm_id,actor_id=actor_id,state_id=state_id,expected_state_revision_id=expected_state_revision_id,
+            expected_cas_revision=expected_cas_revision,schema_id=schema_id,content_artifact_id=content_artifact_id,
+            causal_parent_action_id=causal_parent_action_id))
+
     # -- Composition ---------------------------------------------------------
     async def validate_composition(
         self, body_artifact_id: str

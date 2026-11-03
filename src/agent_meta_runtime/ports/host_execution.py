@@ -31,6 +31,12 @@ class HostActivityRunner(Protocol):
     async def invoke(self, *, task, invocation_id, kind, capability_id, operation, content, execute) -> HostCallValue: ...
 
 
+class ScratchResourceHost(Protocol):
+    """Root-owned async resource edge; never a package-provided callback."""
+    async def prepare(self, *, task, invocation_id, request): ...
+    async def failed(self, *, task, invocation_id, request): ...
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedProviderCall:
     """Runtime-only preparation; never returned through the public facade."""

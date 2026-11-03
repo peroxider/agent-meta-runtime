@@ -24,6 +24,7 @@ from ..adapters.store.service_certificates import load_service_execution_trust
 from ..adapters.credentials import service_signing_authority
 from ..adapters.memory_host import MemoryHostActivities
 from ..adapters.configured_provider import ControlledConfiguredProviderHost
+from ..adapters.scratch_resources import OwnedScratchResources
 from ..adapters.store.reconciliation import SqliteReconcilePersistence
 from ..application.config import ConfigError, load_config, write_effective_config
 from ..application.readiness import ReadinessEvaluator
@@ -67,6 +68,7 @@ class RuntimeDaemon:
             raise StableError(code=ErrorCode.INVALID_ARGUMENT,message='controlled Provider test anchor is invalid')
         self._provider_test_ca = controlled_provider_test_ca
         self._providers = None
+        self._scratch = None
         if not all(isinstance(item, str) and len(item) == 64 and set(item) <= set("0123456789abcdef") for item in trusted_publishers):
             raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="trusted publisher fingerprints must be lowercase SHA-256")
         self._trusted_publishers = frozenset(trusted_publishers)
@@ -144,7 +146,8 @@ class RuntimeDaemon:
                 backend_profile_hash=profile_hash,
                 context_profile_for=lambda composition_id: self._catalog.binding(composition_id).context_profile_artifact_id)
             self._catalog = InstalledHarnessCatalog(self._conn, cas=cas, realm_id=self.realm_id,
-                service_id=self._service_id, run_command=self._run_control, validate_package=self._handlers._validate_package)
+                service_id=self._service_id, run_command=self._run_control, validate_package=self._handlers._validate_package,
+                drain_resources=self._drain_scratch)
             probe_runner = ProbeRunner(transport=self._catalog.probe)
             reconciler = Reconciler(self._conn, realm_id=self.realm_id, actor_id=self._service_id,
                 persistence=SqliteReconcilePersistence(run_command=self._run_control),
@@ -180,7 +183,10 @@ class RuntimeDaemon:
             self._dispatcher = OutboxDispatcher(self._conn, instance_id=self.instance_id, clock=self._clock,
                 handlers={"RECONCILE_REQUEST": self._control.deliver, "BACKEND_TERMINAL_ACK": acknowledge})
             self._dispatcher.recover_foreign_leases()
-            self._task_host = TaskHost(execution, self._catalog, self._activities, self._providers)
+            self._scratch = OwnedScratchResources(execution, data_dir=self.data_dir, instance_id=self.instance_id,
+                allow_insecure=self._allow_insecure)
+            self._scratch.recover()
+            self._task_host = TaskHost(execution, self._catalog, self._activities, self._providers, self._scratch)
             self._server = LocalApiServer(self.data_dir, handlers=self._handlers.handlers(),
                 instance_id=self.instance_id, response_sent=self._response_sent)
             await self._server.start()
@@ -195,6 +201,11 @@ class RuntimeDaemon:
         except BaseException:
             await self.close()
             raise
+
+    async def _drain_scratch(self, composition_id, request):
+        if self._scratch is None:
+            raise StableError(code=ErrorCode.BACKEND_UNAVAILABLE, message="Scratch owner is unavailable for drain")
+        await self._scratch.drain(composition_id, reconcile_id=request["reconcile_id"])
 
     def readiness(self):
         snapshot = self._readiness.evaluate()
@@ -312,6 +323,9 @@ class RuntimeDaemon:
             if self._providers is not None:
                 await self._providers.close()
                 self._providers = None
+            if self._scratch is not None:
+                await self._scratch.close()
+                self._scratch = None
             if self._catalog is not None:
                 self._catalog.close()
                 self._catalog = None

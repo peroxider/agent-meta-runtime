@@ -89,7 +89,7 @@ async def _connect(args: argparse.Namespace) -> AgentMetaClient:
         if args.actor == operator["actor_id"]:
             authority = CommandAuthority(operator["actor_id"], operator["authority_grant_id"], signer)
     except StableError:
-        if args.command in {"authority", "task", "artifact", "composition", "harness", "evolution", "operations", "stop"}:
+        if args.command in {"authority", "task", "artifact", "state", "composition", "harness", "evolution", "operations", "stop"}:
             await connection.close()
             raise
     return AgentMetaClient(LocalTransport(connection), authority=authority)
@@ -135,6 +135,9 @@ def _emit_result(args: argparse.Namespace, result: Any) -> int:
 #: Static dry-run declaration of the authority each mutation requires
 #: (§41.52: plans must state required permissions/capabilities).
 _REQUIRED_PERMISSIONS: dict[str, tuple[str, ...]] = {
+    'state.create/v1':('state.write','capability.invoke'),
+    'state.read/v1':('state.read',),
+    'state.write/v1':('state.write','capability.invoke'),
     "authority.principal.create/v1": ("authority.grant",),
     "authority.delegate/v1": ("authority.delegate",),
     "authority.revoke/v1": ("authority.revoke",),
@@ -220,12 +223,30 @@ async def cmd_info(client: AgentMetaClient, args: argparse.Namespace) -> int:
 async def cmd_start(args: argparse.Namespace) -> int:
     from ..daemon import RuntimeDaemon
 
+    test_ca = None
+    if args.controlled_provider_test_ca is not None:
+        try:
+            path = args.controlled_provider_test_ca
+            if not path.is_file():
+                raise ValueError('test anchor must be a regular file')
+            with path.open('rb') as stream:
+                test_ca = stream.read(65537)
+            if not 0 < len(test_ca) <= 65536:
+                raise ValueError('test anchor size')
+        except (OSError, ValueError):
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message='controlled Provider test TLS anchor is invalid or unavailable') from None
+        from ...adapters.configured_provider import validate_test_tls_anchor
+        validate_test_tls_anchor(test_ca)
+        if args.execution_backend == 'in_memory':
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message='controlled Provider tests require the trusted in-process Host')
     if args.dry_run:
         return _emit_result(args, {"dry_run": True, "data_dir": str(args.data_dir.resolve()),
-                                  "foreground": True, "trusted_publishers": sorted(args.trusted_publisher)})
+                                  "foreground": True, "trusted_publishers": sorted(args.trusted_publisher),
+                                  "provider_execution": "CONTROLLED_TEST_ONLY" if test_ca is not None else "UNAVAILABLE"})
     daemon = RuntimeDaemon(args.data_dir, config_path=args.config,
         allow_insecure_credentials=args.insecure_dev_credential_file,
-        trusted_publishers=args.trusted_publisher, execution_backend=args.execution_backend)
+        trusted_publishers=args.trusted_publisher, execution_backend=args.execution_backend,
+        controlled_provider_test_ca=test_ca)
     try:
         status = await daemon.start()
         _emit_result(args, status)
@@ -442,6 +463,28 @@ async def cmd_artifact_verify(client: AgentMetaClient, args: argparse.Namespace)
 async def cmd_composition_validate(client: AgentMetaClient, args: argparse.Namespace) -> int:
     valid, issues = await client.validate_composition(args.body_artifact)
     return _emit_result(args, {"valid": valid, "issues": issues})
+
+
+async def cmd_state(client: AgentMetaClient, args: argparse.Namespace) -> int:
+    common={'realm_id':args.realm,'actor_id':args.actor,'state_id':getattr(args,'state_id',None)}
+    if args.state_command=='create':
+        envelope=client.build_state_create(**common,owner_id=args.owner_id,schema_id=args.schema_id,
+            content_artifact_id=args.content_artifact,purpose=args.purpose,
+            redaction_policy_artifact_id=args.redaction_policy)
+        method='agent_meta.public.v1.State.Create'
+    elif args.state_command=='get':
+        envelope=client.build_state_read(**common,state_revision_id=args.revision)
+        method='agent_meta.public.v1.State.Get'
+    else:
+        envelope=client.build_state_write(**common,expected_state_revision_id=args.expected_revision,
+            expected_cas_revision=args.expected_cas,schema_id=args.schema_id,content_artifact_id=args.content_artifact)
+        method='agent_meta.public.v1.State.Write'
+    if args.dry_run:
+        payload_type={'create':'state.create/v1','get':'state.read/v1','write':'state.write/v1'}[args.state_command]
+        return _emit_result(args,{'dry_run':True,'would_change':True,'method':method,'command_envelope_jcs':envelope,
+            'required_permissions':list(_REQUIRED_PERMISSIONS[payload_type]),'requires_server_validation':True})
+    result=await client.execute_command(method,envelope)
+    return _emit_result(args,{'receipt':dict(result.receipt),'resource':dict(result.resource)})
 
 
 async def cmd_composition_commit(client: AgentMetaClient, args: argparse.Namespace) -> int:
@@ -776,6 +819,8 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--config", type=Path, default=None)
     start.add_argument("--trusted-publisher", action="append", default=[], help="explicitly trusted publisher SHA-256 fingerprint")
     start.add_argument("--execution-backend", choices=("trusted_in_process", "in_memory"), default=None, help="select the Host execution backend; overrides execution.host_backend")
+    start.add_argument("--controlled-provider-test-ca", type=Path, default=None,
+        help="explicit native test mode: TLS CA file for loopback-only Provider execution with TEST prices; never real Provider support")
     start.set_defaults(func=cmd_start)
     stop = sub.add_parser("stop", help="request signed shutdown of the connected daemon instance")
     stop.add_argument("--reason", default="operator_stop")
@@ -846,6 +891,28 @@ def build_parser() -> argparse.ArgumentParser:
     verify = art_sub.add_parser("verify")
     verify.add_argument("artifact_id")
     verify.set_defaults(func=cmd_artifact_verify)
+
+    state = sub.add_parser('state',help='signed State commands; get records an audited snapshot')
+    state_sub=state.add_subparsers(dest='state_command',required=True)
+    state_create=state_sub.add_parser('create')
+    state_create.add_argument('--state-id',default=None)
+    state_create.add_argument('--owner-id',required=True)
+    state_create.add_argument('--schema-id',required=True)
+    state_create.add_argument('--content-artifact',required=True)
+    state_create.add_argument('--purpose',choices=('GENERAL','SESSION_TRANSCRIPT','SESSION_JOURNAL'),default='GENERAL')
+    state_create.add_argument('--redaction-policy',default=None)
+    state_create.set_defaults(func=cmd_state)
+    state_get=state_sub.add_parser('get',help='consume one authorized read and return a durable snapshot')
+    state_get.add_argument('state_id')
+    state_get.add_argument('--revision',default=None)
+    state_get.set_defaults(func=cmd_state)
+    state_write=state_sub.add_parser('write')
+    state_write.add_argument('state_id')
+    state_write.add_argument('--expected-revision',required=True)
+    state_write.add_argument('--expected-cas',type=int,required=True)
+    state_write.add_argument('--schema-id',required=True)
+    state_write.add_argument('--content-artifact',required=True)
+    state_write.set_defaults(func=cmd_state)
 
     comp = sub.add_parser("composition")
     comp_sub = comp.add_subparsers(dest="composition_command", required=True)
@@ -991,6 +1058,13 @@ async def _run(args: argparse.Namespace) -> int:
         return cmd_init(args)  # init bootstraps locally; no daemon connection
     if args.func is cmd_start:
         return await cmd_start(args)
+    if args.func is cmd_state and args.dry_run:
+        operator,signer=operator_signing_authority(args.data_dir,allow_insecure=args.insecure_dev_credential_file)
+        if args.actor is None:
+            args.actor=operator['actor_id']
+        authority=(CommandAuthority(operator['actor_id'],operator['authority_grant_id'],signer)
+            if args.actor==operator['actor_id'] else None)
+        return await cmd_state(AgentMetaClient(None,authority=authority),args)
     client = await _connect(args)
     try:
         return await args.func(client, args)

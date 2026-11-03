@@ -27,7 +27,7 @@ from ...adapters.crypto import (
 )
 from ...adapters.daemon_lock import acquire_daemon_lock
 from ...adapters.credentials import (
-    InsecureDevCredentialStore, WindowsCredentialStore, open_key_store, write_store_config,
+    InsecureDevCredentialStore, WindowsCredentialStore, verify_bootstrap_credentials, write_store_config,
 )
 from ...adapters.private_paths import secure_private_path
 from ...adapters.store import initialize_store
@@ -170,7 +170,7 @@ def _bootstrap_transaction(
     from ...domain.canonical import now_us
     certificate = issue_service_certificate({"service_principal_id": service_principal_id,
         "public_key": service_pair.public_bytes_raw().hex(), "realm_id": REALM_ID, "epoch_id": epoch_id,
-        "permissions": ["capability.invoke", "model.invoke"], "not_after": now_us() + 365 * 86_400_000_000},
+        "permissions": ["capability.invoke", "model.invoke", "scratch.create", "scratch.execute", "scratch.inspect", "scratch.release"], "not_after": now_us() + 365 * 86_400_000_000},
         root_principal_id=root_actor_id, signer=root_pair.sign)
     certificate_path = cas.put(certificate)
     certificate_id = "artifact://sha256/" + hashlib.sha256(certificate).hexdigest()
@@ -250,20 +250,10 @@ def _reinit(data_dir: Path, db_path: Path, *, allow_insecure: bool) -> InitRepor
             load_service_execution_trust(conn, FilesystemCas(data_dir), realm_id=row[0])
     finally:
         conn.close()
-    store, handles = open_key_store(data_dir, allow_insecure=allow_insecure)
-    operator = json.loads((data_dir / "keys/store.json").read_bytes())["operator"]
-    if (operator["actor_id"] != initialization["root_principal_id"]
-            or operator["authority_grant_id"] != initialization["root_grant_id"]
-            or operator["public_key_hex"] != identities["root"].get("public_key_hex")):
-        raise StableError(code=ErrorCode.KEY_UNAVAILABLE, message="operator metadata differs from the committed bootstrap identity")
-    # Existence and decryptability are checked without exposing private bytes.
-    for name, handle in handles.items():
-        with store.get_for_scoped_use(handle, purpose=f"{name}.ed25519") as value:
-            if len(value) != 32:
-                raise StableError(code=ErrorCode.KEY_UNAVAILABLE, message="signing credential has invalid size")
-            public_key = Ed25519KeyPair.from_private_bytes(bytes(value)).public_bytes_raw().hex()
-            if identities[name].get("algorithm") != "Ed25519" or identities[name].get("public_key_hex") != public_key:
-                raise StableError(code=ErrorCode.KEY_UNAVAILABLE, message="signing credential differs from committed public identity")
+    profile, handles = verify_bootstrap_credentials(data_dir, allow_insecure=allow_insecure,
+        expected_operator={"actor_id":initialization["root_principal_id"],
+            "authority_grant_id":initialization["root_grant_id"],"public_key_hex":identities["root"].get("public_key_hex")},
+        expected_identities=identities)
     _clear_init_orphans(data_dir)
     return InitReport(
         realm_id=row[0],
@@ -272,7 +262,7 @@ def _reinit(data_dir: Path, db_path: Path, *, allow_insecure: bool) -> InitRepor
         core_ready=True,
         serving_ready=False,
         builtin_artifacts={},
-        feature_summary=_feature_summary(store.profile),
+        feature_summary=_feature_summary(profile),
         recovery_code=None,
         reinitialized=True,
         details={"key_handles": handles},

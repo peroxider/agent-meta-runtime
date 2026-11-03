@@ -213,6 +213,9 @@ class PublicApiHandlers:
             "agent_meta.public.v1.Artifact.BeginPut": self.artifact_begin_put,
             "agent_meta.public.v1.Artifact.PutChunk": self.artifact_put_chunk,
             "agent_meta.public.v1.Artifact.Put": self.artifact_put,
+            'agent_meta.public.v1.State.Create':self.state_create,
+            'agent_meta.public.v1.State.Get':self.state_get,
+            'agent_meta.public.v1.State.Write':self.state_write,
             "agent_meta.public.v1.Artifact.GetManifest": self.artifact_get_manifest,
             "agent_meta.public.v1.Artifact.GetContent": self.artifact_get_content,
             "agent_meta.public.v1.Artifact.Verify": self.artifact_verify,
@@ -753,6 +756,29 @@ class PublicApiHandlers:
         except StableError as exc:
             return pub.VerifyArtifactResponse(ok=False, reason_code=exc.code)
         return pub.VerifyArtifactResponse(ok=True, reason_code="OK")
+
+    # -- Managed State -------------------------------------------------------
+    async def _state_command(self, request, payload_type):
+        from ...domain.state_contract import state_payload
+        from ...adapters.store.state_management import manage
+        envelope, payload = self._parse_envelope(request)
+        if envelope.payload_type != payload_type:
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT,message='State method and payload differ')
+        state_payload(payload_type,dict(payload))
+        # A committed command recovers its original resource without touching
+        # current owner refs, content/schema bytes or mutable authorization.
+        mutator = (lambda txn: {}) if self._command_status(envelope.command_id)=='COMMITTED' else manage(self._cas,envelope)
+        receipt, resource = self._run_command(envelope,mutator)
+        return pub.MutationResponse(receipt_jcs=canonical_json(receipt),resource_jcs=_resource('managed-state/v1',resource))
+
+    async def state_create(self, request: pub.CommandRequest, deadline_us: int) -> pub.MutationResponse:
+        return await self._state_command(request,'state.create/v1')
+
+    async def state_get(self, request: pub.CommandRequest, deadline_us: int) -> pub.MutationResponse:
+        return await self._state_command(request,'state.read/v1')
+
+    async def state_write(self, request: pub.CommandRequest, deadline_us: int) -> pub.MutationResponse:
+        return await self._state_command(request,'state.write/v1')
 
     # -- Composition ---------------------------------------------------------
     async def composition_validate(
