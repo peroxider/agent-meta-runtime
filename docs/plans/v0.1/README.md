@@ -48,10 +48,13 @@
 | S05 | [First Capability Toolset](seed-harness/Seed_Harness_05_Capability_Toolset.md) | 首批工具Capability、schema校验、redaction |
 | S06 | [Conversation Session Model](seed-harness/Seed_Harness_06_Conversation_Sessions.md) | 会话=Managed State、消息→Task、Context预算 |
 | S07 | [Evolution Capability](seed-harness/Seed_Harness_07_Evolution_Capability.md) | Proposal/ChangeSet生成、隔离实验、自迭代闭环、按S03流程发布 |
+| S08 | [Tool/Skill Artifact Evolution](seed-harness/Seed_Harness_08_Tool_Skill_Evolution.md) | 工具/skill制品自改进（REPLACE_ARTIFACT白名单）、事件驱动有界触发、可选真实模型metric |
+| S09 | [Harness Code Self-Evolution](seed-harness/Seed_Harness_09_Harness_Code_Evolution.md) | 代码候选→新AMPAK版本、复用S03门禁与§41.60.5升级路径、签名激活 |
 
 Seed步骤只依赖已发布的Runtime公共SDK/Contract或显式CI输入，不读取Runtime私有源码路径。Runtime CI不得反向执行这些步骤。
 
-Seed顺序为`S00 → S01 → S01A → S02 → S03 → S04 → S05 → S06 → S07`。S03发布fake Provider/echo最小版；S04～S07各自累积新增profile、关闭所需Runtime依赖并复用S03流程发布新版本。缺公开接口先由Runtime按既有ADR/Contract规则交付，不通过Seed私有导入或新增未登记RPC补洞。
+Seed顺序为`S00 → S01 → S01A → S02 → S03 → S04 → S05 → S06 → S07 → S08 → S09`。S03发布fake Provider/echo最小版；S04～S09各自累积新增profile、关闭所需Runtime依赖并复用S03流程发布新版本。缺公开接口先由Runtime按既有ADR/Contract规则交付，不通过Seed私有导入或新增未登记RPC补洞。
+自迭代按风险递增分三层解锁：S07配置修复（`REWIRE`/`SET_POLICY`）→ S08工具/skill制品（`REPLACE_ARTIFACT`/`ADD_SLOT`白名单、事件驱动触发、可选真实模型metric）→ S09 harness代码（新包版本走S03门禁）；Evaluator独立、签名门禁保留、实验不改serving等不变式贯穿全部梯度。
 
 ## 变更规则
 
