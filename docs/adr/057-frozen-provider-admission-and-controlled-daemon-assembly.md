@@ -45,7 +45,7 @@ Unsupported wire billing semantics retain unknown usage rather than zero.
 
 ## Explicit test boundary
 
-Only an embedded Root constructor with an explicit bounded
+At this checkpoint, only an embedded Root constructor with an explicit bounded
 `controlled_provider_test_ca` assembles this path. It has a separate frozen Host
 profile hash, `provider_execution=CONTROLLED_TEST_ONLY`, loopback-only network
 ranges and synthetic `TEST` pricing. Public HTTPS, other currencies, missing
@@ -53,6 +53,9 @@ exact tokenizer/pricing and mismatched Context tokenizer fail preflight. The
 normal daemon configuration and ordinary CLI cannot select this test assembly.
 InMemory plus this test option is refused. Default Host profiles remain
 unchanged and do not execute configured Providers.
+
+[ADR 058](058-explicit-native-provider-test-launch.md) subsequently adds an
+explicit native test launcher for independent consumers, preserving these gates.
 
 The external package still runs in the explicitly trusted in-process Host.
 Native worker ownership and protected store use do not provide a Managed

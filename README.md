@@ -241,6 +241,14 @@ unready profile executable. Frozen pricing/usage primitives and the remaining
 execution work are described in [ADR 055](docs/adr/055-provider-profile-approval-and-frozen-pricing.md).
 
 Public API 1.9 adds read-only validation and a reviewable configuration CLI.
+The native `agent-meta-restore --source <absolute-backup> --data-dir <absolute-target>`
+bootstrap console verifies a sealed private backup in sibling staging before
+publishing a complete absent/empty data directory. It refuses path aliases,
+links, corrupt content, identity/boundary mismatches and unavailable signing
+credentials. Non-Windows fixture recovery requires the explicit
+`--insecure-dev-credential-file` option. It is separate from the ordinary RPC
+CLI and model tools. See ADR 075; installed/independent recovery gates remain open.
+
 The separate native `agent-meta-provider-credential` entry point imports a
 credential into a Realm-scoped protected store and returns only its handle.
 See [the operator procedure](docs/provider-operator-workflow.md) and
@@ -252,6 +260,38 @@ Tasks through the native worker and independent wire-usage settlement. Its
 separate Host profile and limits are described in
 [ADR 057](docs/adr/057-frozen-provider-admission-and-controlled-daemon-assembly.md).
 The default daemon and real Provider readiness remain unchanged.
+
+Independent test consumers can select that same loopback-only assembly through
+the explicit native startup flag in
+[ADR 058](docs/adr/058-explicit-native-provider-test-launch.md).
+
+Public API 1.10 preserves bounded HTTP status/retry hints and exposes the
+Fact-checked Provider reservation/settlement through `Task.GetExecution`.
+See [ADR 059](docs/adr/059-provider-terminal-observation-and-public-accounting.md).
+
+Task-scoped Artifact/State plans and atomic Meta resource tool terminals are
+under development in Public execution SPI 1.11 / Capability contract 1.1.
+See [ADR 060](docs/adr/060-task-scoped-meta-resource-host.md). Runtime-owned
+daemon tests do not establish installed Seed or Scratch support.
+
+Public API 1.12 adds signed State create/get/write commands with audited read
+snapshots, explicit revision/CAS guards, pinned schema/redaction policy and
+controller-owned session State ([ADR 061](docs/adr/061-public-managed-state-commands.md)).
+
+Ordinary callback tools also receive child Actions and bind their InMemory
+execution tokens to those children; models retain the Task root binding.
+See [ADR 062](docs/adr/062-tool-child-actions-and-execution-bindings.md).
+These development mechanisms do not establish Scratch or Managed isolation.
+
+Public API 1.15 adds typed Scratch create/execute/bindings/inspect/export/release
+plans through the asynchronous Root resource port. Native work uses an optional
+independent trusted kernel; observations use bounded static reflection and
+Root-derived Source/Action metadata. Source-only export publishes a
+`trusted_candidate` package and provenance after authority/output checks; it
+does not install or promote it. See [ADR 068](docs/adr/068-public-async-scratch-create-execute-release.md),
+[ADR 069](docs/adr/069-public-bounded-scratch-observation.md) and
+[ADR 070](docs/adr/070-public-source-only-scratch-export.md). Complete Seed,
+lifecycle fault and release gates remain open.
 
 ```
 src/agent_meta_runtime/

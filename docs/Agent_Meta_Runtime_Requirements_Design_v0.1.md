@@ -5058,6 +5058,27 @@ Promotion 的唯一入口是 `Evolution.Promote`：重跑 Artifact/Compatibility
 
 Serializer v1：JSON state 使用 JCS 和 JSON Schema；binary state 必须声明 media type、serializer Artifact、serializer version 和 architecture portability。Pickle、marshal、任意 Python object graph 不允许作为 portable Managed State；只能标记 Opaque，并提供 impact/backup/recovery policy。Migration 按 41.31。
 
+Public execution SPI 1.11依[ADR 060](adr/060-task-scoped-meta-resource-host.md)增加
+`ArtifactRead/ArtifactPut/StateRead/StateWrite/ResourceReceipt/ResourceAdapter`。
+`HarnessAdapter.resource_tools`通过纯计划与回执normalization绑定资源operation；
+签名descriptor和冻结Surface含`resource_contract`（Capability Contract 1.1）。
+Root先验证Actor和冻结安装代Service的capability与实际resource scope，再预留一次
+budget/grant use；Meta写入、child Action、Invocation terminal和provenance Fact原子提交。
+confirmed replay不再运行回调、不再写State或重复计数。`artifact.put`进入effect registry；
+PURE `state.read`计tool step而不计mutation effect。State写入还校验源Artifact种类的读取权限。
+State Realm归属来自不可变initial revision Fact；冻结View记录CAS revision，读取只使用
+冻结revision或本Task已提交overlay，写入严格CAS且不merge。会话transcript/journal State
+的保留purpose来自birth Fact；普通模型工具不能写入。JSON/UTF-8内容及结果上限1 MiB，
+normalize/schema → frozen redaction → schema验证均在publication之前完成。缺失serializer、
+restricted内容或Scratch placement能力时fail closed；这些入口不声明Managed隔离或RP-04关闭。
+
+普通PURE callback工具依[ADR 062](adr/062-tool-child-actions-and-execution-bindings.md)同样
+在admission事务内创建独立child Action；Invocation的part_of/produced与child的
+caused_by/authorized_by/used构成因果链。InMemory execution token绑定实际child，
+model仍绑定Task root；Root签发前和授权提交时验证同一Task/Actor/Realm/Composition/
+target/parent及已验证token的预期Action。完成重放复用原child；失败、取消和UNKNOWN
+恢复终止child，不遗留RUNNING Action。旧的已确认root-bound结果保持历史身份。
+
 ### 41.44.2 RuntimeView snapshot
 
 `GetView` 在一个 SQLite read transaction 中先读取 `realms.current_meta_revision` 和 `realms.next_seq-1`，再读取 refs、Composition、capabilities、state refs、Authority summary、Backend profile snapshot 与 readiness。返回：
@@ -5140,7 +5161,8 @@ Filesystem target 必须在 workspace root 下通过 handle-relative/openat 类�
 | `harness.uninstall/v1` | `harness_id, expected_meta_revision, expected_status, reason_code` |
 | `composition.commit/v1` | `composition_body_artifact_id, expected_meta_revision, expected_desired_revision` |
 | `state.create/v1` | `state_id, owner_id, schema_id, content_artifact_id` |
-| `state.write/v1` | `state_id, expected_state_revision_id, content_artifact_id, schema_id` |
+| `state.read/v1` | `state_id`；optional `state_revision_id`；签名、计一次grant use并持久化snapshot，原command重放返回原snapshot（ADR 061） |
+| `state.write/v1` | `state_id, expected_state_revision_id, expected_cas_revision, content_artifact_id, schema_id`；无全局meta guard，严格aggregate CAS（ADR 061） |
 | `authority.grant/v1` | `subject_id, permissions[], scope, constraints, delegable, expires_at_us` |
 | `authority.delegate/v1` | `parent_grant_id, subject_id, permissions[], scope, constraints, delegable, expires_at_us` |
 | `authority.revoke/v1` | `grant_id, reason_code` |
@@ -5359,6 +5381,23 @@ message PutChunkResponse { uint64 committed_offset = 1; }
 
 所有 resource JCS 的 `resource_type` 固定：`task-handle/v1`、`task-result/v1`、`artifact-manifest/v1`、`capability-descriptor/v1`、`harness-validation/v1`、`harness-installation/v1`、`composition-commit/v1`、`state-revision/v1`、`authority-grant/v1`、`proposal-result/v1`、`candidate-result/v1`、`experiment-handle/v1`、`promotion-result/v1`、`scratch-session/v1`、`scratch-execution/v1`、`operation-handle/v1`、`action-result/v1`。Reader 使用 `schema_version`，未知 optional field 忽略并 round-trip；未知 required semantic 通过 schema major 失败。
 
+Public API 1.12依[ADR 061](adr/061-public-managed-state-commands.md)增加签名
+`State.Create/Get/Write`（现有`CommandRequest/MutationResponse`）。`managed-state/v1`
+资源给出选中revision/content/schema、当前head与CAS、owner、purpose、controller及固定redaction policy引用；
+历史读取的CAS对应同snapshot中的current head，不能把历史revision伪作当前head写入。
+`State.Get`为审计快照命令，使用`state.read/v1`、消耗一次授权use并写`state_accessed`；
+原命令重放保持原snapshot。创建/写入要求owner的`state.write`及实际schema/content（创建时还含自选policy）
+Artifact种类的`capability.invoke`；只使用envelope中的同一明确Grant，未实现的金额ceiling拒绝。
+创建派生controller身份并固定schema/redaction，purpose仅GENERAL/SESSION_TRANSCRIPT/SESSION_JOURNAL；
+保留State仅允许controller或当前Epoch Root通过管理命令读写，模型资源工具一律拒绝。
+内容仅支持JSON、至多1 MiB（脱敏后再次检查）；schema/data结构分别限制2048/8192节点，
+schema depth 32、data depth 48。Schema支持nullable type union，未知assertion fail closed；
+enum/const校验缓存仅限一次调用。State revision schema引用和birth Fact中的policy引用均为GC root。
+write允许同Realm且同Actor/Root授权的`causal_parent_action_id`，并记录新revision的supersedes、
+derived_from及可选caused_by边；不改动既有why/lineage方向。CLI `state create/get/write`
+及本地`--dry-run`、SDK envelope builders均不要求全局meta guard，严格使用revision+CAS。
+此接口不关闭S05/S06、RP-04/RP-05，也不宣称Scratch、migration、rollback或Managed支持。
+
 Public API 1.2依[ADR 040](adr/040-public-task-execution-inspection.md)新增`Task.GetExecution`
 （现有`GetTaskRequest/ResourceResponse`消息）与`task-execution/v1`资源。它在同owner本地管理边界
 只读返回真实Task/Invocation/Projection引用、规范化usage和预算元数据；不返回原始Artifact内容、
@@ -5428,6 +5467,16 @@ Task实际冻结View、当前批准、完整profile closure、handle、request�
 Root以原始wire usage和冻结计价替换包的usage声明；规范化失败仍保留已知费用，unknown不填0，overrun阻止成功交付。
 显式测试CA只由embedded Root constructor选择，使用独立Host profile hash；不开放公开CLI选择，不宣称Managed/真实上游/RP-03关闭。
 
+[ADR 058](adr/058-explicit-native-provider-test-launch.md)进一步增加native启动参数
+`agent-meta start --controlled-provider-test-ca <file>`，供独立consumer仅经已安装console入口选择该测试装配。
+launcher先进行有界文件读取和PEM校验；dry-run不创建store/daemon，显式InMemory冲突拒绝。
+该增量覆盖ADR 057最初的“仅embedded constructor”限制，仍只允许loopback/TEST，不是生产Provider入口或新的RPC。
+
+Public API 1.10依[ADR 059](adr/059-provider-terminal-observation-and-public-accounting.md)为
+`task-execution/v1`的Invocation增加可选`provider`投影：冻结profile/config引用、输入/输出/成本预留、保守结算和有界HTTP terminal。
+`provider_terminal_observed` Fact与结算/Invocation终态原子提交，查询核对Fact、journal、request hash和outcome；篡改或缺Fact返回INTEGRITY_ERROR。
+429的RESOURCE_EXHAUSTED及有界`retry_after_us`持久可查，但不触发重试、不把unknown cost填0、不改变真实Provider/Managed门禁。
+
 协作式可信Host依[ADR 045](adr/045-cooperative-host-call-scheduling.md)在三个异步facade操作入口
 先于任何事务/回调让出事件循环，再检查取消、期限和授权，避免连续立即完成的调用饿死管理面。
 该调度点不跨事务持锁，不提供回调内部的硬抢占或隔离保证。
@@ -5471,6 +5520,26 @@ Task timeout 包含 durable queue 等待；`deadline_at_us` 是从接纳起生�
 `task submit --deadline-at-us`公开同一既有字段，纯dry-run使用相同校验。
 
 ## 41.54 IPython Scratch v0 Adapter
+
+[ADR 071](adr/071-owned-scratch-composition-retirement.md)的兼容修复候选将Root拥有的
+Scratch关闭/清理接入Composition drain；失败保留绑定并为重试保留旧serving/realized
+generation，不得在native owner/workspace尚未确认释放时报告退休完成。
+
+Public API 1.15候选由[ADR 070](adr/070-public-source-only-scratch-export.md)增加
+`ScratchExportCandidate`：Root授权会话Source及显式依赖闭包，构造后在成功Invocation事务中
+发布`trusted_candidate`包和provenance。导出不安装或改变serving，Experiment/Promotion、
+独立Seed消费及完整生命周期门禁仍须分别验证。
+
+Public API 1.14候选由[ADR 069](adr/069-public-bounded-scratch-observation.md)增加
+`ScratchBindings/ScratchInspect`及Root派生的Source/Action绑定来源。名称写入跟踪限于
+CPython 3.12 cell主线程；heap mutation仍为`UNKNOWN_RISK`，不完整和截断必须显式标记。
+source-only export、Seed消费验证及完整S05/RP-04仍开放。下述1.13说明保留其阶段边界。
+
+Public API 1.13候选实现由[ADR 068](adr/068-public-async-scratch-create-execute-release.md)固定
+`sdk.host.ScratchCreate/ScratchExecution/ScratchRelease`和异步Root resource port；它仅覆盖
+创建、执行与释放。公开bindings/inspect、完整binding provenance及source-only Candidate export
+尚未关闭，不得据此前三项宣布S05或RP-04完成。精确输入、权限、effects、输出分块、证书前置
+和保守binding-name标记以该ADR为准；无writer transaction跨越native kernel执行。
 
 Scratch Adapter 运行在独立 ipykernel worker，不在 daemon 进程内。v0.1 每个 Realm 最多一个显式 ScratchSession；创建需要 `scratch.execute`，session 默认 idle TTL 30 分钟、wall TTL 4 小时，daemon restart 后不恢复 kernel heap。Session identity、cell source Artifact、execution Action/Invocation 和 exported binding metadata持久化；live value 只 Observed/weak handle。
 
