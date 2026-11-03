@@ -29,7 +29,7 @@ from .evolution import (
     record_evaluation,
     record_evidence,
 )
-from .state import StateCreateRequest, create_state
+from .state import StateCreateRequest, create_state, require_state_realm
 from .uow import execute_command
 
 if TYPE_CHECKING:
@@ -142,6 +142,7 @@ def _clone_states(
         if not isinstance(spec, Mapping) or not spec.get("state_id"):
             continue
         source = str(spec["state_id"])
+        require_state_realm(txn._conn, source, txn._envelope.realm_id)
         row = txn._conn.execute(
             "SELECT owner_id, schema_id, current_revision_id FROM managed_states"
             " WHERE state_id = ?",

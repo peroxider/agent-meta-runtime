@@ -41,6 +41,9 @@ class StateCreateRequest:
     schema_id: str
     artifact_id: str
     state_id: str | None = None
+    purpose: str = 'GENERAL'
+    redaction_policy_artifact_id: str | None = None
+    controller_principal_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +128,60 @@ def _insert_revision(
     return revision_id
 
 
+def require_state_realm(conn, state_id: str, realm_id: str) -> None:
+    """The immutable initial revision Fact, never an owner name, binds Realm.
+
+    State IDs are globally unique but owner Capability IDs can occur in many
+    Realms. Ref history revision numbers are only meaningful inside their
+    source Fact's Realm. Unanchored legacy rows must not grant resource access.
+    """
+    rows = conn.execute(
+        "SELECT f.realm_id FROM facts f JOIN state_revisions r "
+        "ON r.state_id=f.entity_id AND r.state_revision_id="
+        "json_extract(CAST(f.payload_json AS TEXT),'$.state_revision_id') "
+        "JOIN transactions t ON t.transaction_id=f.transaction_id AND t.realm_id=f.realm_id "
+        "WHERE f.entity_type='state' AND f.entity_id=? AND f.event_type='state_revision_created' "
+        "AND json_extract(CAST(f.payload_json AS TEXT),'$.initial')='true' "
+        "AND r.parent_revision_id IS NULL", (state_id,),
+    ).fetchall()
+    if not rows:
+        if not conn.execute('SELECT 1 FROM managed_states WHERE state_id=?', (state_id,)).fetchone():
+            raise StableError(code=ErrorCode.NOT_FOUND, message='State not found in this Realm')
+        raise StableError(code=ErrorCode.INTEGRITY_ERROR, message='State has no authoritative Realm binding')
+    if len(rows) != 1:
+        raise StableError(code=ErrorCode.INTEGRITY_ERROR, message='State has ambiguous Realm bindings')
+    if rows[0][0] != realm_id:
+        raise StableError(code=ErrorCode.NOT_FOUND, message='State not found in this Realm')
+
+
+def current_state_bindings(conn, realm_id: str, *, owners=None, active_only=False):
+    """Read only Realm-anchored heads; shared owner IDs confer no membership."""
+    bindings = {}
+    rows = conn.execute(
+        "SELECT DISTINCT m.state_id,m.current_revision_id,m.owner_id,m.status "
+        "FROM managed_states m JOIN facts f ON f.entity_id=m.state_id "
+        "WHERE f.realm_id=? AND f.entity_type='state' AND f.event_type='state_revision_created' "
+        "AND json_extract(CAST(f.payload_json AS TEXT),'$.initial')='true'", (realm_id,),
+    )
+    for state_id, revision_id, owner_id, status in rows:
+        if (owners is not None and owner_id not in owners) or (active_only and status != 'ACTIVE'):
+            continue
+        require_state_realm(conn, state_id, realm_id)
+        head = conn.execute(
+            "SELECT 1 FROM state_revisions r JOIN state_ref_history h "
+            "ON h.state_id=r.state_id AND h.state_revision_id=r.state_revision_id "
+            "JOIN facts f ON f.fact_id=h.source_fact_id "
+            "WHERE r.state_id=? AND r.state_revision_id=? AND r.owner_id=? "
+            "AND f.realm_id=? AND f.entity_type='state' AND f.entity_id=r.state_id "
+            "AND json_extract(CAST(f.payload_json AS TEXT),'$.state_revision_id')=r.state_revision_id",
+            (state_id, revision_id, owner_id, realm_id),
+        ).fetchone()
+        if head is None:
+            raise StableError(code=ErrorCode.INTEGRITY_ERROR, message='State head lacks its Realm history binding')
+        bindings[str(state_id)] = str(revision_id)
+    return bindings
+
+
 def _state_ref_history(
     txn: "_SqliteStoreTransaction",
     *,
@@ -148,6 +205,8 @@ def create_state(request: StateCreateRequest):
     """Create a Managed State with its initial immutable revision (cas=1)."""
 
     def mutator(txn: "_SqliteStoreTransaction") -> dict[str, Any]:
+        if request.purpose not in ('GENERAL', 'SESSION_TRANSCRIPT', 'SESSION_JOURNAL'):
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message='unknown State purpose')
         state_id = request.state_id or f"state://{new_uuid7()}"
         revision_id = _insert_revision(
             txn,
@@ -175,7 +234,9 @@ def create_state(request: StateCreateRequest):
             entity_type="state",
             entity_id=state_id,
             event_type="state_revision_created",
-            payload={"state_revision_id": revision_id, "initial": "true"},
+            payload={"state_revision_id": revision_id, "initial": "true", "purpose": request.purpose,
+                **({'redaction_policy_artifact_id':request.redaction_policy_artifact_id} if request.redaction_policy_artifact_id else {}),
+                **({'controller_principal_id':request.controller_principal_id} if request.controller_principal_id else {})},
             actor_id=request.owner_id,
         )
         _state_ref_history(
@@ -203,6 +264,7 @@ def write_state_revision(request: StateWriteRequest):
 
     def mutator(txn: "_SqliteStoreTransaction") -> dict[str, Any]:
         conn = txn._conn
+        require_state_realm(conn, request.state_id, txn._envelope.realm_id)
         row = conn.execute(
             "SELECT owner_id, current_revision_id, cas_revision FROM managed_states"
             " WHERE state_id = ?",
@@ -290,6 +352,7 @@ def register_migration_target(binding: StateRevisionRegistration):
 
     def mutator(txn: "_SqliteStoreTransaction") -> dict[str, Any]:
         conn = txn._conn
+        require_state_realm(conn, binding.state_id, txn._envelope.realm_id)
         row = conn.execute(
             "SELECT owner_id, current_revision_id FROM managed_states"
             " WHERE state_id = ?",
@@ -363,6 +426,7 @@ def migrate_state_cutover(request: StateMigrationCutoverRequest):
     def mutator(txn: "_SqliteStoreTransaction") -> dict[str, Any]:
         conn = txn._conn
         for binding in request.bindings:
+            require_state_realm(conn, binding.state_id, txn._envelope.realm_id)
             cursor = conn.execute(
                 "UPDATE managed_states SET current_revision_id = ?,"
                 " cas_revision = cas_revision + 1, updated_at_us = ?"

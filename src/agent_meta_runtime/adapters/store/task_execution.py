@@ -4,6 +4,7 @@ import json
 
 from ...domain.canonical import canonical_json
 from ...domain.errors import ErrorCode, StableError
+from .provider_accounting import read_provider
 
 
 def task_execution(conn, *, realm_id, task_id):
@@ -42,6 +43,13 @@ def task_execution(conn, *, realm_id, task_id):
         for key in ("error", "usage"):
             item[key] = json.loads(item[key]) if item[key] is not None else None
         journal = json.loads(invocation[-1]) if invocation[-1] else {}
+        provider=read_provider(conn,invocation[0],journal)
+        if provider is not None:
+            reservation=provider['reservation']
+            item['provider']={'profile_artifact_id':reservation['profile_artifact_id'],
+                'configuration_fact_id':reservation.get('configuration_fact_id'),
+                'reservation':{key:reservation[key] for key in ('input_tokens','maximum_output_tokens','maximum_cost_microunits')},
+                'settlement':provider['settlement'],'terminal':journal.get('provider_terminal')}
         if journal.get("schema") == "host-invocation-journal/v1" and "backend" in journal:
             binding = journal["backend"]
             public_fields = ("backend_id", "request_id", "payload_hash", "handle_hash", "incarnation", "instance_id",

@@ -152,6 +152,11 @@ def build_surface_snapshot(
         contract = json.loads(bytes(cap_row[0]).decode("utf-8"))
         for operation in contract.get("operations", []):
             required = set(operation.get("required_permissions", []))
+            if operation.get('resource_contract') is not None:
+                from ...domain.resource_contract import RESOURCE_OPERATION_RULES, validate_resource_operation
+                validate_resource_operation(operation)
+                required -= RESOURCE_OPERATION_RULES[operation['resource_contract']][2]
+                required.add('capability.invoke')
             matched_scope = None
             if required:
                 covering = [
@@ -180,11 +185,12 @@ def build_surface_snapshot(
                     effects=tuple(operation.get("effects", ())),
                     idempotency=operation.get("idempotency", "NONE"),
                     retry_semantics=operation.get("retry_semantics", "NEVER"),
-                    required_permissions=tuple(sorted(required)),
+                    required_permissions=tuple(sorted(operation.get('required_permissions', ()))),
                     scope=matched_scope.to_json()
                     if matched_scope is not None
                     else {"realm_id": realm_id, "targets": []},
                     availability_reason="READY",
+                    resource_contract=operation.get('resource_contract'),
                 )
             )
 

@@ -9,6 +9,8 @@ hold readiness at false.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -172,6 +174,27 @@ def _check_cas_blobs(
             cas.open_blob(relpath, content_hash, size_bytes)
         except Exception as exc:  # noqa: BLE001 - doctor reports, never raises
             report.add(f"CAS blob verification failed: {exc}", blob_id=blob_id)
+
+    # Bootstrap, public artifact.put and Host records can register their
+    # ordinary content directly on artifacts, without artifact_blobs rows.
+    # They require the same verification; a self-consistent backup-file hash
+    # does not replace the immutable ArtifactId's content hash.
+    inline = conn.execute(
+        "SELECT a.artifact_id,a.size_bytes,a.manifest_json FROM artifacts a "
+        "WHERE a.integrity_status='VALID' AND NOT EXISTS "
+        "(SELECT 1 FROM artifact_blobs b WHERE b.artifact_id=a.artifact_id)"
+    )
+    for artifact_id, size_bytes, raw_manifest in inline:
+        report.blobs_checked += 1
+        try:
+            manifest = json.loads(raw_manifest)
+            if (not isinstance(artifact_id,str) or re.fullmatch(r'artifact://sha256/[0-9a-f]{64}',artifact_id) is None
+                    or not isinstance(manifest,dict) or type(manifest.get('size_bytes')) is not int
+                    or manifest['size_bytes'] != size_bytes or not isinstance(manifest.get('storage_relpath'),str)):
+                raise ValueError('invalid inline Artifact storage metadata')
+            cas.open_blob(manifest['storage_relpath'], artifact_id.rsplit('/',1)[1], size_bytes)
+        except Exception:  # noqa: BLE001 - never echo untrusted metadata/content
+            report.add('CAS inline Artifact verification failed',artifact_id=artifact_id)
 
 
 def run_integrity_doctor(db_path: Path, cas_root: Path | None = None) -> DoctorReport:

@@ -11,7 +11,7 @@ import json
 from ...domain.canonical import canonical_json
 from ...domain.errors import ErrorCode, StableError
 from ...domain.fact_catalog import validate_fact_event
-from ...domain.provider_accounting import ProviderReservation, amount, settlement
+from ...domain.provider_accounting import ProviderReservation, ProviderTerminalObservation, amount, settlement
 from ...ports.repositories import FactAppendRequest
 
 
@@ -20,10 +20,11 @@ def read_provider(conn, invocation_id, journal):
     reserved = conn.execute("SELECT payload_json FROM facts WHERE entity_id=? AND event_type='provider_cost_reserved'", (invocation_id,)).fetchall()
     settled = conn.execute("SELECT payload_json FROM facts WHERE entity_id=? AND event_type='provider_cost_settled'", (invocation_id,)).fetchall()
     dispatched = conn.execute("SELECT payload_json FROM facts WHERE entity_id=? AND event_type='provider_dispatch_authorized'", (invocation_id,)).fetchall()
+    observed = conn.execute("SELECT payload_json FROM facts WHERE entity_id=? AND event_type='provider_terminal_observed'", (invocation_id,)).fetchall()
     if type(journal) is not dict:
         raise StableError(code=ErrorCode.INTEGRITY_ERROR, message="Provider Invocation journal is invalid")
     provider = journal.get("provider")
-    if provider is None and not reserved and not settled and not dispatched:
+    if provider is None and not reserved and not settled and not dispatched and not observed and 'provider_terminal' not in journal:
         return None
     try:
         if type(provider) is not dict or set(provider) != {"reservation", "settlement"}:
@@ -42,6 +43,17 @@ def read_provider(conn, invocation_id, journal):
                 or len(dispatched) != 1 or json.loads(dispatched[0][0]) != dispatch):
             raise ValueError("dispatch Fact mismatch")
         terminal = provider["settlement"]
+        observation = journal.get('provider_terminal')
+        if observation is None:
+            if observed:
+                raise ValueError('terminal observation Fact without projection')
+        else:
+            metadata = ProviderTerminalObservation(**{key:value for key,value in observation.items()
+                if key not in ('schema','request_id','request_scope_hash')})
+            expected = {**metadata.document(),'request_id':journal['request_id'],'request_scope_hash':document['request_hash']}
+            if (observation!=expected or len(observed)!=1 or json.loads(observed[0][0])!=observation
+                    or terminal is None or terminal['outcome']!={'RESPONSE':'CONFIRMED','NOT_SENT':'NOT_SENT','UNKNOWN':'UNKNOWN'}[metadata.state]):
+                raise ValueError('terminal observation differs from its Fact or settlement')
         if terminal is None:
             if settled:
                 raise ValueError("settlement Fact without projection")
@@ -55,6 +67,31 @@ def read_provider(conn, invocation_id, journal):
     except (AttributeError, KeyError, TypeError, ValueError, StableError) as exc:
         raise StableError(code=ErrorCode.INTEGRITY_ERROR, message="Provider accounting projection differs from its Facts") from exc
     return provider
+
+
+def record_terminal_observation(txn, invocation_id, observation, *, replay):
+    if observation is None:
+        return
+    if type(observation) is not ProviderTerminalObservation:
+        raise StableError(code=ErrorCode.INVALID_RESULT,message='Provider observation requires bounded transport metadata')
+    raw=txn._conn.execute('SELECT backend_ref_json FROM invocations WHERE invocation_id=?',(invocation_id,)).fetchone()[0]
+    journal=json.loads(raw)
+    provider=journal.get('provider')
+    if provider is None or provider['settlement'] is None:
+        raise StableError(code=ErrorCode.FAILED_PRECONDITION,message='Provider observation requires a settled reservation')
+    if provider['settlement']['outcome']!={'RESPONSE':'CONFIRMED','NOT_SENT':'NOT_SENT','UNKNOWN':'UNKNOWN'}[observation.state]:
+        raise StableError(code=ErrorCode.INVALID_RESULT,message='Provider observation contradicts settlement')
+    document={**observation.document(),'request_id':journal['request_id'],
+        'request_scope_hash':provider['reservation']['request_hash']}
+    if replay:
+        if journal.get('provider_terminal')!=document:
+            raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT,message='replayed Provider observation differs')
+        return
+    if 'provider_terminal' in journal:
+        raise StableError(code=ErrorCode.INTEGRITY_ERROR,message='Provider observation precedes terminal commit')
+    journal['provider_terminal']=document
+    txn._conn.execute('UPDATE invocations SET backend_ref_json=? WHERE invocation_id=?',(canonical_json(journal),invocation_id))
+    accounting_fact(txn,invocation_id,'provider_terminal_observed',document)
 
 
 def cost_liability(conn, task_id):

@@ -22,7 +22,7 @@ from .authority import _GRANT_COLUMNS, _grant_from_row, _reserve_use_row
 from .semantic import (InvocationCreateRequest, InvocationFinishRequest, TaskTerminalRequest,
     advance_invocation, complete_task, create_invocation, finish_invocation, load_task, start_task, _append_edge)
 from .task_snapshot import register_staged_artifact
-from .provider_accounting import accounting_fact, cost_liability, read_provider, settle, update_cost_totals
+from .provider_accounting import accounting_fact, cost_liability, read_provider, settle, update_cost_totals, record_terminal_observation
 from .provider_dispatch import authorize_dispatch
 from .provider_admission import authorize_configuration
 
@@ -42,6 +42,31 @@ class HostExecutionStore:
 
     def read_artifact(self, reference):
         return self.catalog.read_artifact(reference)
+
+    def resource_value(self, task, value):
+        from .host_resources import redact_value
+        return redact_value(task, value)
+
+    def resource_request(self, task, request):
+        from .host_resources import sanitize_request
+        return sanitize_request(task, request)
+
+    def replay_resource(self, task, ordinal, capability_id, operation, content):
+        from .host_resources import replay
+        return replay(self, task, ordinal, capability_id, operation, content)
+
+    def prepare_resource(self, task, invocation_id, request):
+        from .host_resources import prepare
+        return prepare(self, task, invocation_id, request)
+
+    def commit_resource(self, task, invocation_id, request, receipt, staged, output):
+        from .host_resources import commit
+        return commit(self, task, invocation_id, request, receipt, staged, output)
+
+    def fail_resource(self, invocation_id, error, *, raise_error=True):
+        row = self.conn.execute('SELECT status FROM invocations WHERE invocation_id=?', (invocation_id,)).fetchone()
+        if row and row[0] in ('CREATED', 'DISPATCHED', 'RUNNING'):
+            self.finish_invocation(invocation_id, error=error, resource_raise_error=raise_error)
 
     def candidates(self):
         return self.conn.execute("SELECT task_id,serving_composition_id FROM tasks WHERE realm_id=? AND status IN ('ACCEPTED','RUNNING') ORDER BY accepted_at_us", (self.realm_id,)).fetchall()
@@ -130,6 +155,8 @@ class HostExecutionStore:
                     txn._conn.execute("UPDATE invocations SET usage_json=? WHERE invocation_id=?", (canonical_json(usage), invocation_id))
                 finish_invocation(InvocationFinishRequest(invocation_id, error=ErrorCode.EXTERNAL_EFFECT_UNKNOWN,
                     reason_code="OUTCOME_UNKNOWN"))(txn)
+                from .host_resources import finish_child
+                finish_child(txn, invocation_id, ErrorCode.EXTERNAL_EFFECT_UNKNOWN)
                 self._backend_unknown(txn, invocation_id)
             if pending:
                 update_cost_totals(txn, task_id)
@@ -162,28 +189,54 @@ class HostExecutionStore:
                 return grant.grant_id
         raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="Host invocation authority denied")
 
-    def reserve(self, task, *, ordinal, kind, capability_id, operation, content, projection_id=None, provider=None, provider_request=None):
+    def reserve(self, task, *, ordinal, kind, capability_id, operation, content, projection_id=None, provider=None, provider_request=None, resource_request=None, scratch_request=None):
+        from ...domain.scratch_execution import ScratchExecution
+        execution_request = scratch_request if scratch_request is not None else resource_request if type(resource_request) is ScratchExecution else None
+        if scratch_request is not None:
+            from ...domain.scratch_execution import ScratchExecution
+            if type(scratch_request) is not ScratchExecution:
+                raise StableError(code=ErrorCode.INVALID_ARGUMENT, message='Scratch intent requires its exact immutable type')
+        if scratch_request is not None and (resource_request is not None or kind != 'CAPABILITY'):
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message='Scratch intent requires an exclusive Capability resource reservation')
         if provider is not None and (kind != "MODEL" or type(provider) is not ProviderReservation):
             raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="Provider reservation requires a model invocation")
+        if resource_request is not None and kind != 'CAPABILITY':
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message='resource plan requires a Capability invocation')
         staged = self.stage(content)
         request_id = f"{task.task_id}/invocation/{ordinal}"
         def reserve(txn):
             self.check(task.task_id)
-            old = txn._conn.execute("SELECT invocation_id,status,input_artifact_id,output_artifact_id,error_json,backend_ref_json FROM invocations WHERE action_id=? AND json_extract(CAST(backend_ref_json AS TEXT),'$.ordinal')=?", (task.root_action_id, ordinal)).fetchone()
+            old = txn._conn.execute("SELECT i.invocation_id,i.status,i.input_artifact_id,i.output_artifact_id,i.error_json,i.backend_ref_json FROM invocations i JOIN actions a ON a.action_id=i.action_id WHERE a.task_id=? AND json_extract(CAST(i.backend_ref_json AS TEXT),'$.ordinal')=?", (task.task_id, ordinal)).fetchone()
             if old is not None:
                 journal = json.loads(old[5])
                 old_provider = read_provider(txn._conn, old[0], journal)
-                core = {key: value for key, value in journal.items() if key not in ("backend", "provider", "provider_dispatch")}
+                core = {key: value for key, value in journal.items() if key not in ("backend", "provider", "provider_dispatch", "provider_terminal", "resource", "scratch_dispatch")}
                 if core != {"schema": "host-invocation-journal/v1", "ordinal": ordinal, "request_id": request_id, "request_hash": sha256_hex(content)} or old[2] != staged["artifact_id"]:
                     raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message="replayed Host invocation request differs")
                 if (journal.get("provider", {}).get("reservation") != (provider.document() if provider else None)):
                     raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message="replayed Provider reservation differs")
+                if scratch_request is not None:
+                    from .host_resources import read_reservation
+                    if read_reservation(self, old[0])['request'] != scratch_request.document():
+                        raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message='replayed Scratch intent differs')
+                elif resource_request is not None:
+                    from .host_resources import read_reservation
+                    from ...domain.resource_contract import resource_request_document
+                    if read_reservation(self, old[0])['request'] != resource_request_document(resource_request):
+                        raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message='replayed resource plan differs')
+                elif 'resource' in journal:
+                    raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message='resource replay omitted its typed plan')
                 if old[1] not in ("SUCCEEDED", "FAILED"):
                     raise StableError(code=ErrorCode.EXTERNAL_EFFECT_UNKNOWN, message="dispatched invocation outcome is unknown")
                 if old_provider and old_provider["settlement"] and old_provider["settlement"]["overrun"]:
                     raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="Provider usage exceeded the admitted reservation")
+                # A callback exception/schema failure is fatal even when the
+                # Loop allows ordinary tool errors. Recover this distinction
+                # from the immutable terminal Fact for in-process activities.
+                terminal = txn._conn.execute("SELECT payload_json FROM facts WHERE entity_type='invocation' AND entity_id=? AND event_type='invocation_finished'", (old[0],)).fetchone()
+                fatal = bool(terminal and json.loads(terminal[0]).get('reason_code') == 'host_activity_exception')
                 return {"invocation_id": old[0], "replay": True, "output_artifact_id": old[3], "error": json.loads(old[4]) if old[4] else None,
-                    "raise_error": journal.get("backend", {}).get("raise_error", False)}
+                    "raise_error": fatal or journal.get("backend", {}).get("raise_error", False)}
             if provider is not None and provider.configuration_fact_id is not None:
                 if provider_request is None or getattr(provider_request,'request_id',None) != request_id:
                     raise StableError(code=ErrorCode.AUTHORITY_DENIED,message='configured Provider request identity differs')
@@ -193,12 +246,23 @@ class HostExecutionStore:
             # Both the initiating principal and the scoped Harness Service need
             # the authority. The daemon's broad bootstrap grant is excluded.
             grants = {}
-            for permission in sorted(required):
-                for subject in (task.actor_id, self.service_id):
-                    grant_id = self._grant(txn, subject, permission, capability_id, task.serving_composition_id)
-                    grants.setdefault(grant_id, set()).add(permission)
-            for grant_id, permissions in grants.items():
-                _reserve_use_row(txn, grant_id, invocation_id, "host_invocation", {"permissions": sorted(permissions)})
+            resource = None
+            if resource_request is not None or scratch_request is not None:
+                from .host_resources import admission
+                if scratch_request is not None:
+                    from .scratch_admission import admission as scratch_admission
+                    resource = scratch_admission(self, txn, task, capability_id, operation, scratch_request)
+                else:
+                    resource = admission(self, txn, task, capability_id, operation, resource_request)
+                for grant_id, claims in resource['grants'].items():
+                    _reserve_use_row(txn, grant_id, invocation_id, 'host_invocation', {'claims': claims})
+            else:
+                for permission in sorted(required):
+                    for subject in (task.actor_id, self.service_id):
+                        grant_id = self._grant(txn, subject, permission, capability_id, task.serving_composition_id)
+                        grants.setdefault(grant_id, set()).add(permission)
+                for grant_id, permissions in grants.items():
+                    _reserve_use_row(txn, grant_id, invocation_id, "host_invocation", {"permissions": sorted(permissions)})
             row = txn._conn.execute("SELECT budget_json,consumed_budget_json FROM tasks WHERE task_id=?", (task.task_id,)).fetchone()
             budget, consumed = json.loads(row[0]), json.loads(row[1])
             policy = json.loads(task.loop_policy_content)
@@ -207,7 +271,7 @@ class HostExecutionStore:
                 maximum = provider.maximum_cost_microunits if provider is not None else 0
                 if cost_liability(txn._conn, task.task_id) + maximum > ceiling:
                     raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="Provider cost reservation exceeds Task budget")
-            increments = {"steps": 1, "effects": int(set(operation["effects"]) != {"none"})}
+            increments = {"steps": 1, "effects": int(bool(set(operation["effects"]) - {'none', 'state.read'}))}
             if kind == "MODEL":
                 increments.update(turns=1, model_calls=1)
             for key, amount in increments.items():
@@ -220,22 +284,49 @@ class HostExecutionStore:
                 # must never leave an apparent zero-cost total behind.
                 consumed["cost_microunits"] = None
             register_staged_artifact(txn, staged, kind="invocation_input")
-            create_invocation(InvocationCreateRequest(invocation_id, task.root_action_id, kind,
+            action_id = task.root_action_id
+            if resource is not None:
+                from .host_resources import create_child
+                action_id = create_child(txn, task, increments)
+            elif kind == 'CAPABILITY':
+                from .host_resources import create_child
+                action_id = create_child(txn, task, increments, resource=False,
+                    grant_ids=grants, input_artifact_id=staged['artifact_id'])
+            create_invocation(InvocationCreateRequest(invocation_id, action_id, kind,
                 capability_id + "#" + operation["operation_id"], staged["artifact_id"], context_projection_id=projection_id))(txn)
             journal = {"schema": "host-invocation-journal/v1", "ordinal": ordinal, "request_id": request_id, "request_hash": sha256_hex(content)}
             if provider is not None:
                 journal["provider"] = {"reservation": provider.document(), "settlement": None}
+            if resource is not None:
+                journal['resource'] = resource
             txn._conn.execute("UPDATE invocations SET backend_ref_json=? WHERE invocation_id=?", (canonical_json(journal), invocation_id))
             if provider is not None:
                 accounting_fact(txn, invocation_id, "provider_cost_reserved", provider.document())
+            if resource is not None:
+                from .host_resources import fact
+                source = fact(txn, invocation_id, 'resource_call_reserved', resource)
+                for grant_id in resource['grants']:
+                    _append_edge(txn, fact_id=source, edge_type='authorized_by', from_id=action_id, to_id=grant_id)
+                used = {staged['artifact_id']}
+                if 'state_revision_id' in resource['binding']:
+                    used.add(resource['binding']['state_revision_id'])
+                for key in ('artifact_id', 'content_artifact_id', 'source_artifact_id'):
+                    if key in resource['request']:
+                        used.add(resource['request'][key])
+                for reference in sorted(used):
+                    _append_edge(txn, fact_id=source, edge_type='used', from_id=action_id, to_id=reference)
             txn._conn.execute("UPDATE tasks SET consumed_budget_json=? WHERE task_id=?", (canonical_json(consumed), task.task_id))
             txn._conn.execute("UPDATE actions SET consumed_budget_json=? WHERE action_id=?", (canonical_json(consumed), task.root_action_id))
             advance_invocation(invocation_id, "DISPATCHED")(txn)
             advance_invocation(invocation_id, "RUNNING")(txn)
+            if execution_request is not None:
+                from .scratch_journal import reserve_cell
+                reserve_cell(execution_request.session_id, invocation_id,
+                    source_artifact_id=execution_request.source_artifact_id, timeout_us=execution_request.timeout_us)(txn)
             return {"invocation_id": invocation_id, "replay": False}
         return self.run_command(reserve)
 
-    def finish_invocation(self, invocation_id, *, content=None, error=None, usage=None, backend_result=None, provider_outcome=None, require_undispatched=False):
+    def finish_invocation(self, invocation_id, *, content=None, error=None, usage=None, backend_result=None, provider_outcome=None, require_undispatched=False, provider_observation=None, resource_raise_error=True, raise_error=False):
         staged = self.stage(content) if content is not None else None
         def finish(txn):
             terminal_error = error
@@ -246,6 +337,7 @@ class HostExecutionStore:
                 terminal_error = ErrorCode.EXTERNAL_EFFECT_UNKNOWN
             final_usage, replay = settle(txn, invocation_id, outcome=provider_outcome, usage=usage,
                 output_artifact_id=staged["artifact_id"] if staged else None, error=terminal_error)
+            record_terminal_observation(txn,invocation_id,provider_observation,replay=replay)
             if replay:
                 return {"provider_overrun": bool(journal.get("provider", {}).get("settlement", {}).get("overrun"))}
             if backend_result is not None:
@@ -273,7 +365,10 @@ class HostExecutionStore:
                 task_id = txn._conn.execute("SELECT a.task_id FROM actions a JOIN invocations i ON i.action_id=a.action_id WHERE i.invocation_id=?", (invocation_id,)).fetchone()[0]
                 update_cost_totals(txn, task_id)
             result = finish_invocation(InvocationFinishRequest(invocation_id,
-                output_artifact_id=staged["artifact_id"] if staged else None, error=terminal_error))(txn)
+                output_artifact_id=staged["artifact_id"] if staged else None, error=terminal_error,
+                reason_code='host_activity_exception' if terminal_error and raise_error else 'completed'))(txn)
+            from .host_resources import finish_child
+            finish_child(txn, invocation_id, terminal_error, raise_error=resource_raise_error)
             provider = read_provider(txn._conn, invocation_id, self._journal(txn._conn, invocation_id)[0])
             return {**result, "provider_overrun": bool(provider and provider["settlement"]["overrun"])}
         return self.run_command(finish)
@@ -292,11 +387,11 @@ class HostExecutionStore:
         return txn.append_fact(FactAppendRequest(entity_type="execution", entity_id=instance_id, event_type=event,
             schema_version=1, payload=payload, actor_id=self.service_id, action_id=action_id, occurred_at_us=txn.recorded_at_us))
 
-    def authorize_backend(self, task, invocation_id, capability_id, audit):
+    def authorize_backend(self, task, invocation_id, capability_id, audit, *, expected_action_id, expected_operation_id):
         """Persist only verified public token audit, guarded by token.issue."""
         def record(txn):
             journal, action_id = self._journal(txn._conn, invocation_id)
-            if action_id != task.root_action_id or audit.request_id != invocation_id or "backend" in journal:
+            if action_id != expected_action_id or action_id != self.activity_action(task, invocation_id, capability_id, expected_operation_id) or audit.request_id != invocation_id or "backend" in journal:
                 raise StableError(code=ErrorCode.IDEMPOTENCY_CONFLICT, message="Host execution authorization identity conflicts")
             rows = txn._conn.execute("SELECT instance_id FROM capability_instances WHERE realm_id=? AND composition_id=? AND capability_id=? AND status IN ('ACTIVE','DRAINING')",
                 (self.realm_id, task.serving_composition_id, capability_id)).fetchall()
@@ -307,6 +402,26 @@ class HostExecutionStore:
             self._execution_fact(txn, rows[0][0], action_id, "execution_submitted", {"invocation_id": invocation_id, "request_id": audit.request_id, **result})
             return result
         return self.run_token(record)
+
+    def activity_action(self, task, invocation_id, capability_id, operation_id):
+        """Root-owned lookup used before token issuance and authorization commit.
+
+        A model runs under its Task root; an ordinary tool runs under the
+        admitted child. Caller-supplied Action IDs never select this binding.
+        Confirmed legacy root-bound tools replay without another Backend call.
+        """
+        row = self.conn.execute('SELECT i.kind,i.target,a.action_id,a.task_id,a.actor_id,a.composition_id,'
+            'a.causal_parent_action_id,a.intent,t.realm_id,t.root_action_id FROM invocations i '
+            'JOIN actions a ON a.action_id=i.action_id JOIN tasks t ON t.task_id=a.task_id WHERE i.invocation_id=?',
+            (invocation_id,)).fetchone()
+        if (row is None or row[3:6] != (task.task_id,task.actor_id,task.serving_composition_id)
+                or row[8] != task.realm_id or row[8] != self.realm_id or row[9] != task.root_action_id
+                or row[1] != capability_id + '#' + operation_id
+                or row[0] == 'MODEL' and row[2] != task.root_action_id
+                or row[0] == 'CAPABILITY' and (row[6] != task.root_action_id or row[7] != 'capability_tool')
+                or row[0] not in ('MODEL','CAPABILITY')):
+            raise StableError(code=ErrorCode.AUTHORITY_DENIED, message='Host activity Action binding is unavailable')
+        return row[2]
 
     def bind_backend(self, invocation_id, *, handle, payload_hash, audit):
         def bind(txn):

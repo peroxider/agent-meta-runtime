@@ -51,6 +51,7 @@ _ARTIFACT_ID_COLUMNS: tuple[tuple[str, str], ...] = (
     ("harness_installations", "package_artifact_id"),
     ("harness_installations", "manifest_artifact_id"),
     ("state_revisions", "artifact_id"),
+    ("state_revisions", "schema_id"),
     ("tasks", "input_artifact_id"),
     ("tasks", "capability_surface_artifact_id"),
     ("tasks", "result_artifact_id"),

@@ -24,6 +24,9 @@ def _deny(reason):
 
 def command_target(envelope, conn=None):
     payload = envelope.payload
+    if envelope.payload_type in ('state.create/v1','state.read/v1','state.write/v1') and conn is not None:
+        from .state_management import command_target as state_target
+        return state_target(conn,envelope)
     if envelope.payload_type == "authority.delegate/v1":
         scope = payload.get("scope")
         targets = scope.get("targets") if isinstance(scope, dict) else None

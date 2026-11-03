@@ -19,6 +19,8 @@ import re
 import os
 import shutil
 import sqlite3
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,10 +32,12 @@ from ...domain.facts import compute_fact_hash
 from ...domain.ids import new_uuid7
 from ..cas import CHUNK_SIZE
 from ..private_paths import require_private_path, secure_private_path
+from ..credentials import verify_bootstrap_credentials
 from .connection import APPLICATION_ID, USER_VERSION
 from .doctor import run_integrity_doctor
 from .initializer import verify_store_identity
 from .migrations import MIGRATION_VERSION
+from .backup_manifest import MAX_MANIFEST_BYTES, MAX_MANIFEST_FILES, invalid, validate_manifest
 
 __all__ = [
     "BACKUP_MANIFEST_NAME",
@@ -119,7 +123,7 @@ def check_quiescent(conn: sqlite3.Connection, data_dir: Path) -> None:
     ).fetchone():
         problems.append("LIVE_EXECUTIONS")
     if conn.execute(
-        "SELECT 1 FROM scratch_sessions WHERE status IN ('STARTING','ACTIVE') LIMIT 1"
+        "SELECT 1 FROM scratch_sessions WHERE status IN ('STARTING','ACTIVE','RELEASING') LIMIT 1"
     ).fetchone():
         problems.append("LIVE_SCRATCH")
     portable_db = Path(data_dir) / "backend" / "portable.db"
@@ -325,6 +329,9 @@ def create_backup(
             "files": files,
         }
         manifest_bytes = canonical_json(manifest)
+        if len(files) > MAX_MANIFEST_FILES or len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="backup manifest exceeds profile ceiling")
+        validate_manifest(manifest)
         (dest / BACKUP_MANIFEST_NAME).write_bytes(manifest_bytes)
     except BaseException:
         shutil.rmtree(dest, ignore_errors=True)
@@ -339,39 +346,33 @@ def create_backup(
 # -- restore ---------------------------------------------------------------------
 
 
-def _verify_manifest(manifest: dict[str, Any], source_dir: Path) -> None:
-    if manifest.get("manifest_version") != MANIFEST_VERSION:
-        raise StableError(
-            code=ErrorCode.INTEGRITY_ERROR,
-            message="backup manifest_version mismatch",
-            details={"manifest_version": str(manifest.get("manifest_version"))},
-        )
-    if manifest.get("db_schema_version") != USER_VERSION or manifest.get(
-        "migration_version"
-    ) != MIGRATION_VERSION:
-        raise StableError(
-            code=ErrorCode.FAILED_PRECONDITION,
-            message="backup schema version does not match this runtime",
-            details={
-                "backup_db_schema_version": str(manifest.get("db_schema_version")),
-                "backup_migration_version": str(manifest.get("migration_version")),
-            },
-        )
-    for entry in manifest.get("files", []):
-        path = source_dir / str(entry["relpath"])
-        if not path.is_file():
-            raise StableError(
-                code=ErrorCode.INTEGRITY_ERROR,
-                message="backup file missing",
-                details={"relpath": entry["relpath"]},
-            )
-        size, sha = _hash_file(path)
-        if size != int(entry["size_bytes"]) or sha != entry["sha256"]:
-            raise StableError(
-                code=ErrorCode.INTEGRITY_ERROR,
-                message="backup file hash mismatch",
-                details={"relpath": entry["relpath"]},
-            )
+def _ordinary_path(path: Path) -> Path:
+    """Reject observed links/reparse components before resolving a native path."""
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="restore paths must be absolute and canonical")
+    for part in (path, *path.parents):
+        try:
+            metadata = part.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400:
+            raise invalid()
+    return path.resolve()
+
+
+def _verify_manifest(manifest: dict[str, Any], source_dir: Path):
+    entries = validate_manifest(manifest)
+    for entry in entries:
+        path = _ordinary_path(source_dir / entry.relpath)
+        if not path.is_relative_to(source_dir) or not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
+            raise invalid()
+        if entry.relpath.startswith("keys/"):
+            require_private_path(path)
+        size, digest = _hash_file(path)
+        if size != entry.size_bytes or digest != entry.sha256:
+            raise StableError(code=ErrorCode.INTEGRITY_ERROR, message="backup file hash mismatch")
+    return entries
 
 
 def _append_restore_fact(
@@ -392,7 +393,7 @@ def _append_restore_fact(
     payload_hash = hashlib.sha256(payload_json).hexdigest()
     occurred_at = recorded_at = now_us()
     actor_id = f"principal://service/{new_uuid7()}"
-    transaction_id = f"txn://{new_uuid7()}"
+    transaction_id = f"transaction://{new_uuid7()}"
     fact_hash = compute_fact_hash(
         prev_hash,
         realm_id=realm_id,
@@ -440,91 +441,59 @@ def _append_restore_fact(
     return fact_id
 
 
-def restore_backup(source_dir: Path, data_dir: Path) -> dict[str, Any]:
-    """Restore a sealed backup into an empty data directory (§41.47.1)."""
+def _empty_restore_target(data_dir: Path):
+    _ordinary_path(data_dir)
+    if not data_dir.exists():
+        return None
+    if not data_dir.is_dir() or any(data_dir.iterdir()):
+        raise StableError(code=ErrorCode.FAILED_PRECONDITION, message="restore target data directory is not empty")
+    metadata = data_dir.stat()
+    return metadata.st_dev, metadata.st_ino
 
-    source_dir = Path(source_dir).resolve()
-    data_dir = Path(data_dir).resolve()
-    manifest_path = source_dir / BACKUP_MANIFEST_NAME
-    if not manifest_path.is_file():
-        raise StableError(
-            code=ErrorCode.NOT_FOUND,
-            message="backup manifest missing",
-            details={"source_dir": str(source_dir)},
-        )
-    try:
-        manifest = json.loads(manifest_path.read_bytes().decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise StableError(
-            code=ErrorCode.INTEGRITY_ERROR, message="backup manifest is not JSON"
-        ) from exc
-    if not isinstance(manifest, dict):
-        raise StableError(
-            code=ErrorCode.INTEGRITY_ERROR, message="backup manifest is not an object"
-        )
-    _verify_manifest(manifest, source_dir)
-    if data_dir.exists() and any(data_dir.iterdir()):
-        raise StableError(
-            code=ErrorCode.FAILED_PRECONDITION,
-            message="restore target data directory is not empty",
-            details={"data_dir": str(data_dir)},
-        )
-    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    secure_private_path(data_dir)
 
-    staging = data_dir / ".restore-staging"
-    staging.mkdir(mode=0o700)
-    secure_private_path(staging)
-    try:
-        for entry in manifest["files"]:
-            relpath = str(entry["relpath"])
-            target = staging / relpath
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if relpath.startswith("keys/"):
-                parent=staging/'keys'
-                for part in target.parent.relative_to(parent).parts:
-                    secure_private_path(parent)
-                    parent=parent/part
-                secure_private_path(parent)
-            shutil.copy2(source_dir / relpath, target)
-            if relpath.startswith("keys/"):
-                secure_private_path(target)
-        for entry in manifest["files"]:
-            relpath = str(entry["relpath"])
-            final = data_dir / relpath
-            final.parent.mkdir(parents=True, exist_ok=True)
-            if relpath.startswith("keys/"):
-                parent=data_dir/'keys'
-                for part in final.parent.relative_to(parent).parts:
-                    secure_private_path(parent)
-                    parent=parent/part
-                secure_private_path(parent)
-            os.replace(staging / relpath, final)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-    db_path = data_dir / "meta.db"
+def _restore_store(staging, manifest, source_dir, manifest_sha256, allow_insecure_credentials):
+    """Verify input boundary and append recovery records in private staging."""
+    db_path = staging / "meta.db"
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA foreign_keys=ON")
         if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise StableError(
-                code=ErrorCode.INTEGRITY_ERROR,
-                message="restored meta.db failed integrity_check",
-            )
+            raise invalid()
         if conn.execute("PRAGMA foreign_key_check").fetchall():
-            raise StableError(
-                code=ErrorCode.INTEGRITY_ERROR,
-                message="restored meta.db failed foreign_key_check",
-            )
-        verify_store_identity(conn)
-        report = run_integrity_doctor(db_path, cas_root=data_dir)
+            raise invalid()
+        try:
+            verify_store_identity(conn)
+        except StableError:
+            raise invalid() from None
+        actual = _realm_snapshot(conn)
+        if (actual["realm_id"] != manifest["realm_id"] or actual["epoch_id"] != manifest["epoch_id"]
+                or actual["meta_revision"] != manifest["meta_revision"]
+                or actual["last_seq"] != manifest["fact_boundary"]["last_seq"]
+                or actual["fact_head_hash"] != manifest["fact_boundary"]["head_hash"]):
+            raise invalid()
+        report = run_integrity_doctor(db_path, cas_root=staging)
         if not report.ok:
-            raise StableError(
-                code=ErrorCode.INTEGRITY_ERROR,
-                message="restored store failed integrity doctor",
-                details={"findings": report.findings[:5]},
-            )
+            raise StableError(code=ErrorCode.INTEGRITY_ERROR, message="restored store failed integrity doctor")
+        initialized = conn.execute("SELECT payload_json FROM facts WHERE realm_id=? AND event_type='runtime_initialized' ORDER BY seq LIMIT 1",
+            (manifest['realm_id'],)).fetchone()
+        if initialized is None:
+            raise invalid()
+        initialization = json.loads(initialized[0])
+        if not isinstance(initialization,dict):
+            raise invalid()
+        identities = {}
+        for name in ('root','service'):
+            identity = conn.execute('SELECT public_identity_json FROM principals WHERE principal_id=? AND realm_id=?',
+                (initialization[f'{name}_principal_id'],manifest['realm_id'])).fetchone()
+            if identity is None:
+                raise invalid()
+            identities[name] = json.loads(identity[0])
+            if not isinstance(identities[name],dict):
+                raise invalid()
+        verify_bootstrap_credentials(staging,allow_insecure=allow_insecure_credentials,
+            expected_operator={'actor_id':initialization['root_principal_id'],
+                'authority_grant_id':initialization['root_grant_id'],'public_key_hex':identities['root'].get('public_key_hex')},
+            expected_identities=identities)
         realm_id = str(manifest["realm_id"])
         quarantined = conn.execute(
             "SELECT operation_id FROM operations"
@@ -545,9 +514,7 @@ def restore_backup(source_dir: Path, data_dir: Path) -> dict[str, Any]:
                 f"operation://{new_uuid7()}",
                 event_type="backup_snapshot_restored",
                 payload={
-                    "manifest_sha256": hashlib.sha256(
-                        manifest_path.read_bytes()
-                    ).hexdigest(),
+                    "manifest_sha256": manifest_sha256,
                     "source_dir": str(source_dir),
                     "quarantined_operations": len(quarantined),
                 },
@@ -562,10 +529,83 @@ def restore_backup(source_dir: Path, data_dir: Path) -> dict[str, Any]:
             "meta_revision": int(manifest["meta_revision"]),
             "fact_id": fact_id,
             "quarantined_operations": len(quarantined),
-            "data_dir": str(data_dir),
         }
+    except (sqlite3.DatabaseError, TypeError, ValueError, IndexError, KeyError):
+        raise invalid() from None
     finally:
         conn.close()
+
+
+def restore_backup(source_dir: Path, data_dir: Path, *, allow_insecure_credentials: bool = False) -> dict[str, Any]:
+    """Verify a sealed snapshot privately, then publish a complete directory."""
+    if type(allow_insecure_credentials) is not bool:
+        raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="restore credential profile must be explicit")
+    source_dir = _ordinary_path(source_dir)
+    data_dir = _ordinary_path(data_dir)
+    if source_dir.is_relative_to(data_dir) or data_dir.is_relative_to(source_dir):
+        raise StableError(code=ErrorCode.INVALID_ARGUMENT, message="backup source and restore target must be separate")
+    initial_target = _empty_restore_target(data_dir)
+    manifest_path = _ordinary_path(source_dir / BACKUP_MANIFEST_NAME)
+    if not manifest_path.is_file():
+        raise StableError(code=ErrorCode.NOT_FOUND, message="backup manifest missing")
+    require_private_path(source_dir)
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate manifest field")
+            result[key] = value
+        return result
+    with manifest_path.open("rb") as handle:
+        raw = handle.read(MAX_MANIFEST_BYTES + 1)
+    if not raw or len(raw) > MAX_MANIFEST_BYTES:
+        raise invalid()
+    try:
+        manifest = json.loads(raw, object_pairs_hook=unique,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite manifest")))
+    except (ValueError, UnicodeError, RecursionError):
+        raise invalid() from None
+    entries = _verify_manifest(manifest, source_dir)
+    data_dir.parent.mkdir(parents=True, exist_ok=True)
+    _ordinary_path(data_dir.parent)
+    staging = Path(tempfile.mkdtemp(prefix=f".{data_dir.name}.restore-", dir=data_dir.parent))
+    secure_private_path(staging)
+    try:
+        for entry in entries:
+            source = _ordinary_path(source_dir / entry.relpath)
+            target = staging / entry.relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if entry.relpath.startswith("keys/"):
+                for parent in reversed((target.parent, *target.parent.parents)):
+                    if parent.is_relative_to(staging / "keys"):
+                        secure_private_path(parent)
+            shutil.copy2(source, target)
+            if entry.relpath.startswith("keys/"):
+                secure_private_path(target)
+        _verify_manifest(manifest, staging)
+        result = _restore_store(staging, manifest, source_dir, hashlib.sha256(raw).hexdigest(), allow_insecure_credentials)
+        if not run_integrity_doctor(staging / "meta.db", cas_root=staging).ok:
+            raise invalid()
+        if _empty_restore_target(data_dir) != initial_target:
+            raise StableError(code=ErrorCode.REVISION_CONFLICT, message="restore target changed during verification")
+        if initial_target is not None:
+            data_dir.rmdir()  # only the same, still-empty directory observed above
+        try:
+            os.rename(staging, data_dir)
+        except OSError:
+            if initial_target is not None and not data_dir.exists():
+                data_dir.mkdir(mode=0o700)
+                secure_private_path(data_dir)
+            raise
+        return {**result, "data_dir": str(data_dir)}
+    except OSError:
+        raise StableError(code=ErrorCode.BACKEND_UNAVAILABLE, message="restore filesystem operation failed") from None
+    finally:
+        if staging.exists():
+            # Staging is an exclusive tempfile child of this exact parent.
+            resolved = _ordinary_path(staging)
+            if resolved.parent == data_dir.parent and resolved.name.startswith(f".{data_dir.name}.restore-"):
+                shutil.rmtree(resolved)
 
 
 # -- upgrade preflight (§41.47.2) ---------------------------------------------------

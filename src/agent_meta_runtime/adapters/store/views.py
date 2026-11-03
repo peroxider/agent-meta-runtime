@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from ...domain.errors import ErrorCode, StableError
+from .state import current_state_bindings, require_state_realm
 
 __all__ = ["RuntimeView", "get_current_view", "get_historical_view"]
 
@@ -135,12 +136,7 @@ def get_current_view(conn, realm_id: str, *, now_us: int | None = None) -> Runti
         surface_rev, surface_artifact, backend_profile_hash = (
             _latest_capability_surface(conn, realm_id)
         )
-        bindings = {
-            str(state_id): str(revision_id)
-            for state_id, revision_id in conn.execute(
-                "SELECT state_id, current_revision_id FROM managed_states"
-            ).fetchall()
-        }
+        bindings = current_state_bindings(conn, realm_id)
         serving_ready, serving_reasons = _serving_readiness(reconcile_status)
         view = RuntimeView(
             realm_id=realm_id,
@@ -208,10 +204,15 @@ def get_historical_view(conn, realm_id: str, meta_revision: int) -> RuntimeView:
     else:
         desired, serving, realized, reconcile_status = refs
     bindings_rows = conn.execute(
-        "SELECT state_id, state_revision_id, MAX(meta_revision)"
-        " FROM state_ref_history WHERE meta_revision <= ? GROUP BY state_id",
-        (meta_revision,),
+        "SELECT h.state_id,h.state_revision_id,MAX(h.meta_revision) "
+        "FROM state_ref_history h JOIN facts f ON f.fact_id=h.source_fact_id "
+        "WHERE f.realm_id=? AND f.entity_type='state' AND f.entity_id=h.state_id "
+        "AND json_extract(CAST(f.payload_json AS TEXT),'$.state_revision_id')=h.state_revision_id "
+        "AND h.meta_revision<=? GROUP BY h.state_id",
+        (realm_id, meta_revision),
     ).fetchall()
+    for state_id, _, _ in bindings_rows:
+        require_state_realm(conn, state_id, realm_id)
     bindings = {str(state_id): str(rev_id) for state_id, rev_id, _ in bindings_rows}
     boundary_row = conn.execute(
         "SELECT MAX(f.seq) FROM facts f"

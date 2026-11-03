@@ -8,6 +8,7 @@ import json
 
 from ...domain.canonical import canonical_json, sha256_hex
 from ...domain.errors import ErrorCode, StableError
+from .state import current_state_bindings
 
 
 def acceptance_view(conn, *, realm_id, actor_id, composition_id, serving_revision,
@@ -20,7 +21,7 @@ def acceptance_view(conn, *, realm_id, actor_id, composition_id, serving_revisio
         raise StableError(code=ErrorCode.REVISION_CONFLICT, message="serving snapshot changed before admission")
     body = json.loads(composition[0])
     owners = {composition_id, *(slot["capability_id"] for slot in body.get("slots", {}).values())}
-    states = {row[0]: row[1] for row in conn.execute("SELECT state_id,current_revision_id,owner_id FROM managed_states WHERE status='ACTIVE'") if row[2] in owners}
+    states = current_state_bindings(conn, realm_id, owners=owners, active_only=True)
     packages = conn.execute(
         "SELECT DISTINCT h.manifest_artifact_id,h.package_artifact_id,h.harness_id FROM harness_installations h "
         "JOIN harness_installation_history x ON x.harness_id=h.harness_id WHERE x.composition_id=? AND h.realm_id=? AND h.status!='UNINSTALLED'",
@@ -34,6 +35,10 @@ def acceptance_view(conn, *, realm_id, actor_id, composition_id, serving_revisio
         "backend_profile_hash": backend_profile_hash,
         "harness_manifest_artifact_id": packages[0][0] if packages else None,
         "package_artifact_id": packages[0][1] if packages else None}
+    if states:
+        value['state_cas_snapshot'] = {state_id: conn.execute(
+            'SELECT cas_revision FROM managed_states WHERE state_id=?', (state_id,)).fetchone()[0]
+            for state_id in sorted(states)}
     if len(packages)==1:
         from .provider_configuration import provider_configuration
         provider=provider_configuration(conn,realm_id,packages[0][2])
@@ -51,7 +56,7 @@ def acceptance_view(conn, *, realm_id, actor_id, composition_id, serving_revisio
     return {"content": content, "artifact_id": "artifact://sha256/" + sha256_hex(content), "value": value}
 
 
-def register_staged_artifact(txn, staged, *, kind="host_record", parents=()):
+def register_staged_artifact(txn, staged, *, kind="host_record", parents=(), media_type="application/json"):
     txn._conn.execute(
-        "INSERT OR IGNORE INTO artifacts(artifact_id,kind,media_type,size_bytes,schema_version,created_by,created_at_us,parents_json,manifest_json,integrity_status) VALUES (?,?, 'application/json',?,1,?,?,?,?, 'VALID')",
-        (staged["artifact_id"], kind, len(staged["content"]), txn._envelope.actor_id, txn.recorded_at_us, canonical_json(list(parents)), canonical_json(staged["manifest"])))
+        "INSERT OR IGNORE INTO artifacts(artifact_id,kind,media_type,size_bytes,schema_version,created_by,created_at_us,parents_json,manifest_json,integrity_status) VALUES (?,?,?,?,1,?,?,?,?, 'VALID')",
+        (staged["artifact_id"], kind, media_type, len(staged["content"]), txn._envelope.actor_id, txn.recorded_at_us, canonical_json(list(parents)), canonical_json(staged["manifest"])))
