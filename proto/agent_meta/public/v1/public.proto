@@ -21,6 +21,11 @@
 // MutationResponse; ordinary configuration contains handles, never secrets.
 // Public API 1.9 adds read-only Harness.ValidateProviderConfiguration with
 // CommandRequest/ResourceResponse; it validates but never claims the command.
+// Public API 1.11 adds Task-scoped Meta resource plans (execution SPI only).
+// Public API 1.12 adds State.Create/Get/Write using CommandRequest/MutationResponse.
+// State.Get is a signed audited snapshot command (ADR 061), not a free query.
+// Public API 1.10 adds optional bounded Provider accounting/terminal metadata
+// to Task.GetExecution's JSON resource; no new proto field numbers.
 
 syntax = "proto3";
 

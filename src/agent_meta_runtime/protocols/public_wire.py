@@ -37,7 +37,7 @@ __all__ = [
 ]
 
 PUBLIC_API_MAJOR = 1
-PUBLIC_API_MINOR = 9
+PUBLIC_API_MINOR = 15
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 HELLO_TIMEOUT_S = 5.0
@@ -81,6 +81,9 @@ METHODS: dict[str, tuple[Any, Any]] = {
         _m("Artifact", "GetManifest", pub.GetArtifactRequest, pub.ArtifactManifestResponse),
         _m("Artifact", "GetContent", pub.GetArtifactRequest, pub.ResourceResponse),
         _m("Artifact", "Verify", pub.VerifyArtifactRequest, pub.VerifyArtifactResponse),
+        _m("State", "Create", pub.CommandRequest, pub.MutationResponse),
+        _m("State", "Get", pub.CommandRequest, pub.MutationResponse),
+        _m("State", "Write", pub.CommandRequest, pub.MutationResponse),
         _m("Composition", "Validate", pub.ValidateCompositionRequest, pub.ValidateCompositionResponse),
         _m("Composition", "Commit", pub.CommandRequest, pub.MutationResponse),
         _m("Composition", "GetRefs", pub.GetRefsRequest, pub.GetRefsResponse),
@@ -110,6 +113,7 @@ METHODS: dict[str, tuple[Any, Any]] = {
 }
 
 METHOD_MINORS = {"agent_meta.public.v1.Runtime.Stop": 1, "agent_meta.public.v1.Task.GetExecution": 2,
+    'agent_meta.public.v1.State.Create':12,'agent_meta.public.v1.State.Get':12,'agent_meta.public.v1.State.Write':12,
     "agent_meta.public.v1.Artifact.GetContent": 3,
     "agent_meta.public.v1.Authority.CreatePrincipal": 4, "agent_meta.public.v1.Authority.Delegate": 4,
     "agent_meta.public.v1.Authority.Revoke": 4, "agent_meta.public.v1.Task.GetTrace": 5}
