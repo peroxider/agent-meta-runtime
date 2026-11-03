@@ -14,6 +14,40 @@ from agent_meta_runtime.protocols.public_wire import encode_frame, parse_envelop
 from test_local_server import ACTOR, _raw_hello, run_env
 
 
+@pytest.mark.parametrize('times', [(300, 100, 200), (42, 42, 42)])
+def test_creation_fact_order_survives_clock_regression_and_equal_timestamps(semantic_env, times):
+    # Runtime-owned query fixture, not evidence of actual model execution.
+    # Canonical mutators create the immutable Facts; no private row injection.
+    import sqlite3
+    from agent_meta_runtime.adapters.store import InvocationCreateRequest, advance_invocation, create_invocation, execute_command
+    from agent_meta_runtime.domain.deadline import Deadline
+    from conftest import make_command
+    from test_semantic_tasks import _accept
+
+    conn, realm, composition, input_artifact, surface = semantic_env
+    accepted = _accept(conn, realm, composition, input_artifact, surface)
+    ids = ['invocation://' + new_uuid7() for _ in range(3)][::-1]
+    for index, (identity, now) in enumerate(zip(ids, times)):
+        def reserve(txn):
+            create_invocation(InvocationCreateRequest(identity, accepted['root_action_id'],
+                'CAPABILITY' if index == 1 else 'MODEL', 'query-order-fixture', input_artifact))(txn)
+            advance_invocation(identity, 'DISPATCHED')(txn)
+            return advance_invocation(identity, 'RUNNING')(txn)
+        committed = execute_command(conn, make_command(realm), reserve, deadline=Deadline.after(5_000_000), now_us=now)
+        assert not hasattr(committed, 'error')
+    changes = conn.total_changes
+    def inspect(connection):
+        return json.loads(task_execution(connection, realm_id=realm, task_id=accepted['task_id']))
+    result = inspect(conn)
+    assert [row['invocation_id'] for row in result['invocations']] == ids
+    assert [row['kind'] for row in result['invocations']] == ['MODEL', 'CAPABILITY', 'MODEL']
+    assert [row['started_at_us'] for row in result['invocations']] == list(times)
+    assert inspect(conn) == result and conn.total_changes == changes
+    database = conn.execute('PRAGMA database_list').fetchone()[2]
+    with sqlite3.connect(database) as reopened:
+        assert inspect(reopened) == result
+
+
 def test_missing_and_foreign_realm_inspection_never_return_task_records(tmp_path):
     async def scenario(env):
         client = await connect(env.tmp_path, authority=env.authority)

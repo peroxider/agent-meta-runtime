@@ -30,7 +30,10 @@ def task_execution(conn, *, realm_id, task_id):
     invocations = conn.execute("SELECT i.invocation_id,i.action_id,i.kind,i.target,i.attempt,i.input_artifact_id,"
         "i.context_projection_id,i.status,i.started_at_us,i.completed_at_us,i.output_artifact_id,i.error_json,i.usage_json,i.latency_us,i.backend_ref_json "
         "FROM invocations i JOIN actions a ON a.action_id=i.action_id WHERE a.task_id=? "
-        "ORDER BY i.started_at_us,i.invocation_id LIMIT 1001", (task_id,)).fetchall()
+        "ORDER BY coalesce((SELECT f.seq FROM facts f WHERE f.realm_id=? "
+        "AND f.entity_type='invocation' AND f.entity_id=i.invocation_id "
+        "AND f.event_type='invocation_created' ORDER BY f.seq LIMIT 1),9223372036854775807),"
+        "i.started_at_us,i.invocation_id LIMIT 1001", (task_id, realm_id)).fetchall()
     projections = conn.execute("SELECT projection_id,action_id,manifest_json,rendered_artifact_id,created_at_us "
         "FROM context_projections WHERE task_id=? ORDER BY created_at_us,projection_id LIMIT 65", (task_id,)).fetchall()
     if len(invocations) > 1000 or len(projections) > 64:
