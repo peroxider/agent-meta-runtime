@@ -1,0 +1,104 @@
+// AgentOS Execution Kernel — resource domain records (§35.12, §35.13).
+//
+// Field numbers are frozen ABI (v1). Dependency direction: imports types only.
+
+syntax = "proto3";
+
+package agentos.kernel.v1;
+
+import "agentos/kernel/v1/common.proto";
+import "agentos/kernel/v1/types.proto";
+import "google/protobuf/timestamp.proto";
+
+// §35.12: ResourceRequestRecord.
+message ResourceRequestRecord {
+  ObjectRef ref = 1;
+  string activity_name = 2;
+  ResourceRequestState state = 3;
+  ResourceBundleSpec bundle = 4;
+  uint64 queue_seq = 5;
+  optional KernelError failure = 6;
+  // K5 (planning/v0.5 02 K5.LG1.1): request-side two-phase reservation state;
+  // value registry `pending|confirmed|rolled_back` (no proto enum — registry
+  // two-track ban, ADR-038). NULL/unset = single-node path (no PENDING
+  // window; K1..K4 behavior byte for byte).
+  optional string reserve_state = 7;
+}
+
+// §35.12: LeaseRecord.
+message LeaseRecord {
+  ObjectRef ref = 1;
+  string request_name = 2;
+  string activity_name = 3;
+  string resource_class = 4;
+  string resource_key = 5;
+  ResourceQuantity quantity = 6;
+  LeaseState state = 7;
+  optional google.protobuf.Timestamp expires_at = 8;
+  EnforcementLevel enforcement = 9;
+  // K2 (planning/v0.2 07 K2.M1): partial-degrade marker (FR-RES-013).
+  optional bool degraded = 10;
+  // K2: per-instance sub-allocations for split grants (FR-RES-010); empty
+  // when the lease was granted whole against a single instance.
+  repeated LeaseAllocation allocations = 11;
+  // K5 (planning/v0.5 02 K5.LG2.1): fencing epoch issued by the placement
+  // authority for the lease scope; 0/unset = no fencing (local path,
+  // K1..K4 behavior). Stale-epoch operations are deterministically rejected
+  // with a `lease.fencing_rejected` fact (FR-CLUS-002, ADR-039).
+  optional uint64 fencing_epoch = 12;
+  // K5: node holding this lease (NULL/unset = the local node). A lease is
+  // still the same four-stage object — the field only records where the
+  // holder runs (FR-RES-026).
+  optional string owner_node = 13;
+}
+
+// K2: split allocation of one lease against a concrete instance (07 K2.M1).
+message LeaseAllocation {
+  string resource_key = 1;
+  ResourceQuantity quantity = 2;
+  uint64 generation = 3;
+}
+
+// §35.13: ResourceInstanceRecord.
+message ResourceInstanceRecord {
+  ObjectRef ref = 1;
+  string resource_class = 2;
+  string resource_key = 3;
+  ResourceSemantics semantics = 4;
+  ResourceQuantity capacity = 5;
+  ResourceQuantity allocated = 6;
+  EnforcementLevel enforcement = 7;
+  string adapter_kind = 8;
+  ResourceInstanceState state = 9;
+  map<string, string> labels = 10;
+  // K3 (planning/v0.3 01 K3.M2.3 ADR-027 / 02 K3.BS1.2 ADR-029): the
+  // instance-declared support level, verbatim from the config declaration
+  // (FR-RES-021 honesty: the kernel forwards it without translation).
+  // Empty when the instance declares none; K3 legal value is
+  // "cancel_and_restart" ("transparent" is reserved and fails instance
+  // loading, UT-BRW-SUPPORT-LEVEL-VALIDATE-001).
+  optional string support_level = 11;
+}
+
+// §35.13: ExecutionSlotRecord.
+message ExecutionSlotRecord {
+  ObjectRef ref = 1;
+  string realm_name = 2;
+  string adapter_kind = 3;
+  repeated string capabilities = 4;
+  ExecutionSlotState state = 5;
+  string bound_activity_name = 6;
+}
+
+// K2 (planning/v0.2 03 K2.P4.2): one cpu_partition placement as observed
+// by the realization actor — the declared mask from the instance labels,
+// the effective mask read back from `cpuset.cpus.effective`, and the
+// NFR-K36 violated flag (effective ⊄ declared ⇒ QUARANTINED realization).
+message CpuPlacementRecord {
+  ObjectRef ref = 1;
+  string partition_key = 2;
+  string activity_name = 3;
+  string declared_cpus = 4;
+  string effective_cpus = 5;
+  bool violated = 6;
+}

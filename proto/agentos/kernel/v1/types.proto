@@ -1,0 +1,775 @@
+// AgentOS Execution Kernel — shared types (§35.10 enum registry, §35.11/35.12/35.13 aux).
+//
+// ABI note: §35.10 fixes enum *wire numbers*; because proto3 scopes enum value
+// names to the enclosing package (C++ scoping rules), every value carries an
+// <ENUM_NAME_> prefix. Numbers — the actual wire contract — are frozen.
+
+syntax = "proto3";
+
+package agentos.kernel.v1;
+
+import "agentos/kernel/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Enum registry (§35.10) — wire numbers frozen, *_UNSPECIFIED=0 per §35.10 rule
+// ---------------------------------------------------------------------------
+
+enum KernelState {
+  KERNEL_STATE_UNSPECIFIED = 0;
+  KERNEL_STATE_STARTING = 1;
+  KERNEL_STATE_RECOVERING = 2;
+  KERNEL_STATE_READY = 3;
+  KERNEL_STATE_DEGRADED = 4;
+  KERNEL_STATE_DRAINING = 5;
+  KERNEL_STATE_STOPPED = 6;
+}
+
+enum ProcessState {
+  PROCESS_STATE_UNSPECIFIED = 0;
+  PROCESS_STATE_NEW = 1;
+  PROCESS_STATE_STARTING = 2;
+  PROCESS_STATE_RUNNING = 3;
+  PROCESS_STATE_RESTARTING = 4;
+  PROCESS_STATE_STOPPING = 5;
+  PROCESS_STATE_KILLING = 6;
+  PROCESS_STATE_STOPPED = 7;
+  PROCESS_STATE_FAILED = 8;
+  PROCESS_STATE_LOST = 9;
+  PROCESS_STATE_QUARANTINED = 10;
+}
+
+enum ActivityState {
+  ACTIVITY_STATE_UNSPECIFIED = 0;
+  ACTIVITY_STATE_NEW = 1;
+  ACTIVITY_STATE_READY = 2;
+  ACTIVITY_STATE_RUNNING = 3;
+  ACTIVITY_STATE_BLOCKED = 4;
+  ACTIVITY_STATE_SUSPENDED = 5;
+  ACTIVITY_STATE_CANCELLING = 6;
+  ACTIVITY_STATE_KILLING = 7;
+  ACTIVITY_STATE_COMPLETED = 8;
+  ACTIVITY_STATE_FAILED = 9;
+  ACTIVITY_STATE_CANCELLED = 10;
+  ACTIVITY_STATE_TIMED_OUT = 11;
+  ACTIVITY_STATE_KILLED = 12;
+}
+
+enum RealmState {
+  REALM_STATE_UNSPECIFIED = 0;
+  REALM_STATE_NEW = 1;
+  REALM_STATE_CREATING = 2;
+  REALM_STATE_READY = 3;
+  REALM_STATE_DEGRADED = 4;
+  REALM_STATE_DESTROYING = 5;
+  REALM_STATE_DESTROYED = 6;
+  REALM_STATE_FAILED = 7;
+  REALM_STATE_LOST = 8;
+  REALM_STATE_QUARANTINED = 9;
+}
+
+enum ResourceRequestState {
+  RESOURCE_REQUEST_STATE_UNSPECIFIED = 0;
+  RESOURCE_REQUEST_STATE_NEW = 1;
+  RESOURCE_REQUEST_STATE_QUEUED = 2;
+  RESOURCE_REQUEST_STATE_RESERVED = 3;
+  RESOURCE_REQUEST_STATE_SATISFIED = 4;
+  RESOURCE_REQUEST_STATE_RELEASING = 5;
+  RESOURCE_REQUEST_STATE_REJECTED = 6;
+  RESOURCE_REQUEST_STATE_CANCELLED = 7;
+  RESOURCE_REQUEST_STATE_TIMED_OUT = 8;
+  RESOURCE_REQUEST_STATE_FAILED = 9;
+}
+
+enum LeaseState {
+  LEASE_STATE_UNSPECIFIED = 0;
+  LEASE_STATE_RESERVED = 1;
+  LEASE_STATE_ACTIVATING = 2;
+  LEASE_STATE_ACTIVE = 3;
+  LEASE_STATE_RELEASING = 4;
+  LEASE_STATE_RELEASED = 5;
+  LEASE_STATE_EXPIRED = 6;
+  LEASE_STATE_PREEMPTING = 7;
+  LEASE_STATE_PREEMPTED = 8;
+  LEASE_STATE_LOST = 9;
+  LEASE_STATE_QUARANTINED = 10;
+  // K2 (planning/v0.2 02 K2.B4): BUDGET pool exhausted — append-only wire
+  // number per 07 K2.M1.
+  LEASE_STATE_EXHAUSTED = 11;
+}
+
+enum WaitHandleState {
+  WAIT_HANDLE_STATE_UNSPECIFIED = 0;
+  WAIT_HANDLE_STATE_ARMED = 1;
+  WAIT_HANDLE_STATE_SATISFIED = 2;
+  WAIT_HANDLE_STATE_TIMED_OUT = 3;
+  WAIT_HANDLE_STATE_CANCELLED = 4;
+  WAIT_HANDLE_STATE_PEER_GONE = 5;
+  WAIT_HANDLE_STATE_FAILED = 6;
+}
+
+enum WaitKind {
+  WAIT_KIND_UNSPECIFIED = 0;
+  WAIT_KIND_RESOURCE = 1;
+  WAIT_KIND_CHANNEL_SEND = 2;
+  WAIT_KIND_CHANNEL_RECEIVE = 3;
+  WAIT_KIND_TIMER = 4;
+  WAIT_KIND_PROCESS_READINESS = 5;
+  WAIT_KIND_CHILD_EXIT = 6;
+}
+
+enum ExecutionSlotState {
+  EXECUTION_SLOT_STATE_UNSPECIFIED = 0;
+  EXECUTION_SLOT_STATE_AVAILABLE = 1;
+  EXECUTION_SLOT_STATE_PROPOSED = 2;
+  EXECUTION_SLOT_STATE_BOUND = 3;
+  EXECUTION_SLOT_STATE_RELEASING = 4;
+  EXECUTION_SLOT_STATE_LOST = 5;
+  EXECUTION_SLOT_STATE_DRAINING = 6;
+  EXECUTION_SLOT_STATE_STOPPED = 7;
+}
+
+enum ChannelState {
+  CHANNEL_STATE_UNSPECIFIED = 0;
+  CHANNEL_STATE_NEW = 1;
+  CHANNEL_STATE_OPENING = 2;
+  CHANNEL_STATE_OPEN = 3;
+  CHANNEL_STATE_DEGRADED = 4;
+  CHANNEL_STATE_CLOSING = 5;
+  CHANNEL_STATE_CLOSED = 6;
+  CHANNEL_STATE_LOST = 7;
+  CHANNEL_STATE_FAILED = 8;
+}
+
+enum SupervisorState {
+  SUPERVISOR_STATE_UNSPECIFIED = 0;
+  SUPERVISOR_STATE_ACTIVE = 1;
+  SUPERVISOR_STATE_RESTART_BACKOFF = 2;
+  SUPERVISOR_STATE_DEGRADED = 3;
+  SUPERVISOR_STATE_DRAINING = 4;
+  SUPERVISOR_STATE_STOPPED = 5;
+  SUPERVISOR_STATE_FAILED = 6;
+}
+
+enum CancellationState {
+  CANCELLATION_STATE_UNSPECIFIED = 0;
+  CANCELLATION_STATE_ACTIVE = 1;
+  CANCELLATION_STATE_REQUESTED = 2;
+  CANCELLATION_STATE_PROPAGATING = 3;
+  CANCELLATION_STATE_FORCING = 4;
+  CANCELLATION_STATE_COMPLETED = 5;
+  CANCELLATION_STATE_PARTIAL = 6;
+}
+
+enum TimerState {
+  TIMER_STATE_UNSPECIFIED = 0;
+  TIMER_STATE_ARMED = 1;
+  TIMER_STATE_FIRED = 2;
+  TIMER_STATE_CANCELLED = 3;
+}
+
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_PENDING = 1;
+  OPERATION_STATE_APPLYING = 2;
+  OPERATION_STATE_APPLIED = 3;
+  OPERATION_STATE_FAILED = 4;
+  OPERATION_STATE_COMPENSATING = 5;
+  OPERATION_STATE_COMPENSATED = 6;
+  OPERATION_STATE_UNKNOWN = 7;
+  OPERATION_STATE_QUARANTINED = 8;
+}
+
+enum IsolationLevel {
+  ISOLATION_LEVEL_UNSPECIFIED = 0;
+  ISOLATION_LEVEL_ACCOUNTED = 1;
+  ISOLATION_LEVEL_RESOURCE_ISOLATED = 2;
+  ISOLATION_LEVEL_PROCESS_ISOLATED = 3;
+  ISOLATION_LEVEL_SANDBOXED = 4;
+  ISOLATION_LEVEL_VM_ISOLATED = 5;
+}
+
+enum EnforcementLevel {
+  ENFORCEMENT_LEVEL_UNSPECIFIED = 0;
+  ENFORCEMENT_LEVEL_ACCOUNTED_ONLY = 1;
+  ENFORCEMENT_LEVEL_COOPERATIVE = 2;
+  ENFORCEMENT_LEVEL_HARD = 3;
+}
+
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_COMMAND_TEMPLATE = 1;
+  EXECUTION_MODE_SERIAL_SESSION = 2;
+  EXECUTION_MODE_MULTIPLEXED_SERVICE = 3;
+}
+
+enum DeliveryKind {
+  DELIVERY_KIND_UNSPECIFIED = 0;
+  DELIVERY_KIND_NONE = 1;
+  DELIVERY_KIND_STDIN_BYTES = 2;
+  DELIVERY_KIND_FRAMED_STREAM = 3;
+  DELIVERY_KIND_REQUEST_RESPONSE = 4;
+}
+
+enum CompletionKind {
+  COMPLETION_KIND_UNSPECIFIED = 0;
+  COMPLETION_KIND_PROCESS_EXIT = 1;
+  COMPLETION_KIND_FRAMED_RESULT = 2;
+  COMPLETION_KIND_HEALTH_TERMINAL = 3;
+}
+
+enum ResourceSemantics {
+  RESOURCE_SEMANTICS_UNSPECIFIED = 0;
+  RESOURCE_SEMANTICS_CAPACITY = 1;
+  RESOURCE_SEMANTICS_EXCLUSIVE = 2;
+  RESOURCE_SEMANTICS_RATE = 3;
+  RESOURCE_SEMANTICS_BUDGET = 4;
+  RESOURCE_SEMANTICS_SERVICE_CONCURRENCY = 5;
+  RESOURCE_SEMANTICS_AFFINITY_BOUND = 6;
+}
+
+enum LeaseHoldPolicy {
+  LEASE_HOLD_POLICY_UNSPECIFIED = 0;
+  LEASE_HOLD_POLICY_RELEASE_ON_BLOCK = 1;
+  LEASE_HOLD_POLICY_HOLD_WHILE_BLOCKED = 2;
+  LEASE_HOLD_POLICY_FORBID_BLOCK = 3;
+}
+
+enum OrderingMode {
+  ORDERING_MODE_UNSPECIFIED = 0;
+  ORDERING_MODE_NONE = 1;
+  ORDERING_MODE_FIFO_PER_SENDER = 2;
+  ORDERING_MODE_FIFO_GLOBAL = 3;
+}
+
+enum DeliveryMode {
+  DELIVERY_MODE_UNSPECIFIED = 0;
+  DELIVERY_MODE_AT_MOST_ONCE = 1;
+  DELIVERY_MODE_AT_LEAST_ONCE = 2;
+  DELIVERY_MODE_REQUEST_REPLY = 3;
+  DELIVERY_MODE_STREAM = 4;
+}
+
+enum BackpressureMode {
+  BACKPRESSURE_MODE_UNSPECIFIED = 0;
+  BACKPRESSURE_MODE_BLOCK_SENDER = 1;
+  BACKPRESSURE_MODE_REJECT = 2;
+  BACKPRESSURE_MODE_DROP_OLDEST = 3;
+  BACKPRESSURE_MODE_DROP_NEWEST = 4;
+  BACKPRESSURE_MODE_SPILL_DURABLE = 5;
+}
+
+enum ChannelCloseMode {
+  CHANNEL_CLOSE_MODE_UNSPECIFIED = 0;
+  CHANNEL_CLOSE_MODE_ABORT = 1;
+  CHANNEL_CLOSE_MODE_DRAIN = 2;
+}
+
+enum FactConsumerState {
+  FACT_CONSUMER_STATE_UNSPECIFIED = 0;
+  FACT_CONSUMER_STATE_ACTIVE = 1;
+  FACT_CONSUMER_STATE_EXPIRED = 2;
+  FACT_CONSUMER_STATE_REVOKED = 3;
+}
+
+enum PrincipalState {
+  PRINCIPAL_STATE_UNSPECIFIED = 0;
+  PRINCIPAL_STATE_ACTIVE = 1;
+  PRINCIPAL_STATE_DISABLED = 2;
+}
+
+enum IdentityBindingState {
+  IDENTITY_BINDING_STATE_UNSPECIFIED = 0;
+  IDENTITY_BINDING_STATE_ACTIVE = 1;
+  IDENTITY_BINDING_STATE_REVOKED = 2;
+}
+
+enum GrantState {
+  GRANT_STATE_UNSPECIFIED = 0;
+  GRANT_STATE_ACTIVE = 1;
+  GRANT_STATE_REVOKED = 2;
+  GRANT_STATE_EXPIRED = 3;
+}
+
+enum RevocationPolicy {
+  REVOCATION_POLICY_UNSPECIFIED = 0;
+  REVOCATION_POLICY_DENY_NEW = 1;
+  REVOCATION_POLICY_CANCEL_SCOPED = 2;
+  REVOCATION_POLICY_DRAIN_SCOPED = 3;
+}
+
+enum ResourceInstanceState {
+  RESOURCE_INSTANCE_STATE_UNSPECIFIED = 0;
+  RESOURCE_INSTANCE_STATE_READY = 1;
+  RESOURCE_INSTANCE_STATE_DEGRADED = 2;
+  RESOURCE_INSTANCE_STATE_DRAINING = 3;
+  RESOURCE_INSTANCE_STATE_STOPPED = 4;
+  RESOURCE_INSTANCE_STATE_LOST = 5;
+}
+
+// §35.11: RestartMode fixed as UNSPECIFIED=0, NEVER=1, ON_FAILURE=2, ALWAYS=3.
+enum RestartMode {
+  RESTART_MODE_UNSPECIFIED = 0;
+  RESTART_MODE_NEVER = 1;
+  RESTART_MODE_ON_FAILURE = 2;
+  RESTART_MODE_ALWAYS = 3;
+}
+
+// K2 (planning/v0.2 07 K2.M1): supervision restart strategy (06 K2.V1.1).
+// UNSPECIFIED ≡ ONE_FOR_ONE (K1 behavior); K1 deployments are unaffected.
+enum RestartStrategy {
+  RESTART_STRATEGY_UNSPECIFIED = 0;
+  RESTART_STRATEGY_ONE_FOR_ALL = 1;
+  RESTART_STRATEGY_REST_FOR_ONE = 2;
+}
+
+// §35.13 auxiliary enum.
+enum ChannelRole {
+  CHANNEL_ROLE_UNSPECIFIED = 0;
+  CHANNEL_ROLE_OWNER = 1;
+  CHANNEL_ROLE_SENDER = 2;
+  CHANNEL_ROLE_RECEIVER = 3;
+  CHANNEL_ROLE_REQUESTER = 4;
+  CHANNEL_ROLE_RESPONDER = 5;
+}
+
+// §35.13: QuarantineAction fixed as UNSPECIFIED=0, REINSPECT=1, FORCE_RECLAIM=2,
+// ADOPT_OBSERVED=3, MARK_LOST=4.
+enum QuarantineAction {
+  QUARANTINE_ACTION_UNSPECIFIED = 0;
+  QUARANTINE_ACTION_REINSPECT = 1;
+  QUARANTINE_ACTION_FORCE_RECLAIM = 2;
+  QUARANTINE_ACTION_ADOPT_OBSERVED = 3;
+  QUARANTINE_ACTION_MARK_LOST = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Shared spec / aux messages (§35.11 field numbers frozen)
+// ---------------------------------------------------------------------------
+
+message ResourceRequirement {
+  string resource_class = 1;
+  string resource_key = 2;
+  ResourceQuantity quantity = 3;
+  LeaseHoldPolicy hold_policy = 4;
+  EnforcementLevel minimum_enforcement = 5;
+  bool renewable = 6;
+  bool preemptible = 7;
+  map<string, string> selector_labels = 8;
+  // K2 (planning/v0.2 07 K2.M1): cross-instance split upper bound; unset = no split.
+  optional uint32 max_split_instances = 9;
+  // K2: minimum acceptable quantity for partial degrade; unset = no degrade.
+  optional ResourceQuantity degrade_min = 10;
+}
+
+message ResourceBundleSpec {
+  repeated ResourceRequirement requirements = 1;
+  optional google.protobuf.Timestamp deadline = 2;
+  // K2: all-or-nothing bundle group; same gang_key solved in one transaction.
+  optional string gang_key = 3;
+  // K2: incremental acquisition declared in (class, key) byte order (FR-RES-016).
+  optional bool incremental = 4;
+  // K5 (planning/v0.5 02 K5.LG3.1): allow bundle members to spread across
+  // cluster nodes; solving goes through the two-phase reservation
+  // (FR-RES-025). Unset/false = K2 single-node behavior byte for byte.
+  optional bool allow_cross_node = 5;
+  // K5: cross-node gang upper bound (member count beyond one node's 16-cap
+  // extends to max_gang_nodes × 16, default 16 nodes). Unset = 1 node.
+  optional uint32 max_nodes = 6;
+}
+
+message SchedulingHints {
+  string scheduling_class = 1;
+  bool preemptible = 2;
+  map<string, string> labels = 3;
+}
+
+message WorkloadEntrypoint {
+  repeated string argv = 1;
+  string cwd = 2;
+  map<string, string> env = 3;
+  ExecutionMode execution_mode = 4;
+  DeliveryKind delivery_kind = 5;
+  CompletionKind completion_kind = 6;
+  uint32 max_inflight = 7;
+  uint64 max_payload_bytes = 8;
+  uint32 initial_pty_rows = 9;
+  uint32 initial_pty_columns = 10;
+  // K2 (planning/v0.2 07 K2.M1): persistent output capture declaration;
+  // unset or mode=INLINE keeps K1 inline-capture behavior byte-for-byte.
+  optional OutputCapturePolicy output_capture = 11;
+}
+
+// K2: OutputCapture mode registry (planning/v0.2 06 K2.V4.1).
+enum OutputCaptureMode {
+  OUTPUT_CAPTURE_MODE_UNSPECIFIED = 0;
+  // K1 behavior: inline capture with the 1MiB ceiling and honest truncation.
+  OUTPUT_CAPTURE_MODE_INLINE = 1;
+  // K2 persistent artifact store (07 K2.M2 migrations/0010).
+  OUTPUT_CAPTURE_MODE_PERSISTENT = 2;
+}
+
+message OutputCapturePolicy {
+  OutputCaptureMode mode = 1;
+  bool capture_stdout = 2;
+  bool capture_stderr = 3;
+  uint64 max_bytes = 4;
+}
+
+message RestartPolicy {
+  RestartMode mode = 1;
+  uint32 max_attempts = 2;
+  google.protobuf.Duration window = 3;
+  google.protobuf.Duration initial_backoff = 4;
+  google.protobuf.Duration max_backoff = 5;
+  // Only backoff multiplier/jitter may use double (§35.11); never accounting.
+  double multiplier = 6;
+  double jitter_ratio = 7;
+}
+
+message ChannelParticipant {
+  string principal_name = 1;
+  ChannelRole role = 2;
+}
+
+message Envelope {
+  // Uppercase canonical ULID local token, not a URI (ADR-007 rule 6).
+  string message_id = 1;
+  string channel_name = 2;
+  string sender_principal_name = 3;
+  uint64 sender_sequence = 4;
+  string schema_ref = 5;
+  bytes payload = 6;
+  google.protobuf.Timestamp created_at = 7;
+  string correlation_id = 8;
+}
+
+message OutputCapture {
+  bytes inline_data = 1;
+  string artifact_name = 2;
+  bool truncated = 3;
+  uint64 total_bytes = 4;
+}
+
+message UsageSnapshot {
+  uint64 cpu_nanos = 1;
+  uint64 memory_peak_bytes = 2;
+  uint64 io_read_bytes = 3;
+  uint64 io_write_bytes = 4;
+  map<string, ResourceQuantity> adapter_usage = 5;
+  google.protobuf.Timestamp observed_at = 6;
+  bool partial = 7;
+  repeated string missing_fields = 8;
+}
+
+message RestartAttempt {
+  uint32 attempt_no = 1;
+  ObjectRef child = 2;
+  google.protobuf.Timestamp attempted_at = 3;
+  string outcome = 4;
+}
+
+// ---------------------------------------------------------------------------
+// KernelFact transactional fact log (§26.4.1, §35.12)
+// ---------------------------------------------------------------------------
+
+message KernelFact {
+  uint64 seq = 1;
+  // Uppercase canonical ULID local token, not a URI (ADR-007 rule 6).
+  string fact_id = 2;
+  ObjectScope scope = 3;
+  string event_type = 4;
+  OpaquePayload payload = 5;
+  string cause_operation_name = 6;
+  uint64 aggregate_generation = 7;
+  uint64 aggregate_revision = 8;
+  google.protobuf.Timestamp timestamp = 9;
+  string delivery_cursor_token = 10;
+  uint64 kernel_revision = 11;
+}
+
+// Watermark proves the server fully scanned through scanned_through_seq;
+// not a KernelFact, occupies no seq, never written to the database (§35.5).
+message FactWatermark {
+  uint64 scanned_through_seq = 1;
+  google.protobuf.Timestamp server_time = 2;
+  string delivery_cursor_token = 3;
+}
+
+message WatchFactsResponse {
+  oneof item {
+    KernelFact fact = 1;
+    FactWatermark watermark = 2;
+  }
+}
+
+// Structured fact payloads (§35.13) carried inside KernelFact.payload.
+message StateTransitionFactPayload {
+  ObjectRef object = 1;
+  string old_state = 2;
+  string new_state = 3;
+  string trigger = 4;
+  optional KernelError error = 5;
+  repeated ObjectRef related_objects = 6;
+  map<string, string> attributes = 7;
+}
+
+message OperationalFactPayload {
+  string action = 1;
+  string outcome = 2;
+  optional ObjectRef target = 3;
+  optional KernelError error = 4;
+  map<string, string> attributes = 5;
+  optional OpaquePayload detail = 6;
+}
+
+// Send receipt (§35.13).
+message ChannelSendReceipt {
+  string message_id = 1;
+  uint64 sender_sequence = 2;
+  google.protobuf.Timestamp accepted_at = 3;
+}
+
+// ---------------------------------------------------------------------------
+// K3 increments (planning/v0.3 05 K3.SC1 — additive only, NFR-K30)
+// ---------------------------------------------------------------------------
+
+// K3 (planning/v0.3 04 K3.RW1.1, ADR-033): single-node remote worker
+// registration. `transport` must be the literal "local_transport" — the
+// K3 boundary freezes hosting to the local trust boundary; cross-node
+// transports are K5 (grpc_remote/ stays an empty placeholder).
+message RemoteWorkerRegistration {
+  string worker_name = 1;
+  // resource key of the `remote_worker` instance this worker leases.
+  string resource_key = 2;
+  string transport = 3;
+  map<string, string> capabilities = 4;
+}
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_REGISTERED = 1;
+  WORKER_STATE_ACTIVE = 2;
+  WORKER_STATE_LOST = 3;
+}
+
+// K3 (planning/v0.3 04 K3.RW1.1): observed remote worker state. The lease
+// itself rides the unchanged §32 LeaseState machine — WorkerState is the
+// adapter-layer health projection only.
+message RemoteWorkerStatus {
+  string worker_name = 1;
+  string resource_key = 2;
+  WorkerState state = 3;
+  uint64 heartbeat_seq = 4;
+  optional google.protobuf.Timestamp last_heartbeat_at = 5;
+}
+
+// K3 (planning/v0.3 04 K3.RW2, ADR-034): explicit safe-point checkpoint
+// reference. `state` is one of writing | final | missing (fail-closed:
+// missing ⇒ standard cancel-and-restart, never a fake recoverability claim).
+message WorkerCheckpointRef {
+  string checkpoint_id = 1;
+  string artifact_ref = 2;
+  string state = 3;
+}
+
+// ---------------------------------------------------------------------------
+// K4 increments (planning/v0.4 01 K4.C5 / 02 K4.Q6 / 03 K4.S5 — additive only, NFR-K30)
+// ---------------------------------------------------------------------------
+
+// K4 (planning/v0.4 01 K4.C1.1.1): durability is a channel-level declaration,
+// never per-envelope; mixing delivery semantics within one channel is
+// forbidden. MEMORY (default) keeps the K1/K2 in-memory semantics byte for
+// byte; DURABLE requires the SPILL_DURABLE backpressure family and the
+// `channel.durable.at_least_once` negotiation key (ADR-019).
+enum ChannelDurability {
+  CHANNEL_DURABILITY_UNSPECIFIED = 0;
+  CHANNEL_DURABILITY_MEMORY = 1;
+  CHANNEL_DURABILITY_DURABLE = 2;
+}
+
+// K4 (planning/v0.4 01 K4.C5.1): durable view fields surfaced on
+// ChannelRecord. `delivered_unacked` counts envelopes marked DELIVERED whose
+// ack cursor has not reached them; only those are eligible for redelivery
+// (at-least-once, AC-K26).
+message DurableDepth {
+  // Rows persisted but not yet handed to any receiver (PENDING).
+  uint64 pending_delivery = 1;
+  // Rows marked DELIVERED but not yet covered by an ack cursor.
+  uint64 delivered_unacked = 2;
+  // Spill bytes charged against the global byte budget (K4.C2.1.1).
+  uint64 spill_bytes = 3;
+}
+
+// K4 (planning/v0.4 01 K4.C1.1.3): one cursor of the explicit AckChannel RPC.
+// `acked_through_seq` is the inclusive per-sender sequence through which the
+// receiver has durably processed; rows ≤ this cursor become recyclable.
+// Cursors are generation-bound (THR-K4-10): a cursor for a closed generation
+// is rejected, never applied.
+message AckCursor {
+  string sender_principal_name = 1;
+  uint64 acked_through_seq = 2;
+}
+
+// K4 (planning/v0.4 01 K4.C3.1.3, FR-KERN-005): recovery progress for one
+// aggregate-type segment (realm/process/activity/lease/channel/tenant).
+message RecoverySegmentProgress {
+  // Segment name in the fixed registry byte order ("activity", "channel",
+  // "lease", "process", "realm", "tenant").
+  string segment = 1;
+  uint64 completed = 2;
+  uint64 total = 3;
+  // Compensation actions executed inside this segment (FR-SUP-009 audit).
+  uint64 compensation_actions = 4;
+}
+
+// K4 (planning/v0.4 01 K4.C3.1.3): whole-recovery progress snapshot; exposed
+// on KernelStatus while KERNEL_STATE_RECOVERING and emitted as a KernelFact
+// at least every 5s (NFR-K51).
+message RecoveryProgress {
+  repeated RecoverySegmentProgress segments = 1;
+  // Rough remaining-work estimate in aggregate objects; advisory only.
+  uint64 remaining_estimate = 2;
+  // True once every segment has reconciled and the kernel is about to leave
+  // RECOVERING; admission semantics are those of K1 until then.
+  bool draining = 3;
+}
+
+// K4 (planning/v0.4 01 K4.C4.1.2, ADR-021): one adapter-side compensation
+// step. `action` is an adapter-registry key (probe/terminate/re-attach
+// family), `params` are adapter-interpreted; the daemon executes only
+// registered plans and never invents adapter intelligence.
+message CompensationStep {
+  string action = 1;
+  map<string, string> params = 2;
+}
+
+// K4 (planning/v0.4 01 K4.C4.1.1, FR-SUP-009): registration shape for
+// adapter-specific compensation. The plan fires when an object in the
+// adapter's own realm is observed in `trigger_state` (degraded|lost|
+// recovering) with the declared workload kind. Execution is bounded by
+// `compensation_max_actions_per_segment` (NFR-K57); overflow quarantines.
+message CompensationPlanSpec {
+  string requested_name = 1;
+  // Adapter principal registering the plan; execution runs under this
+  // principal's authority (K4.C4.1.3) and is confined to its own realm
+  // (K4.C4.2.3).
+  string adapter_principal_name = 2;
+  string adapter_kind = 3;
+  // Workload type match (e.g. "generic_command", "structured_stream"); the
+  // descriptor registry keys, not free text.
+  string workload_kind = 4;
+  // degraded | lost | recovering (K4.C4.1.2 trigger registry).
+  string trigger_state = 5;
+  repeated CompensationStep steps = 6;
+  // Idempotency key template; the same key never re-executes a step after
+  // crash recovery (K4.C4.2.2 audit + retry bound).
+  string idempotency_key = 7;
+  uint64 timeout_ms = 8;
+}
+
+// K4: query/audit record for a registered compensation plan.
+message CompensationPlanRecord {
+  ObjectRef ref = 1;
+  CompensationPlanSpec spec = 2;
+  // active | revoked (revocation stops future firing, registration rows stay
+  // auditable).
+  string state = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+// K4 (planning/v0.4 02 K4.Q2.2.1, FR-TEN-003): burst declaration. Burst
+// borrowing only relaxes the tenant's own quota judgment — the physical
+// capacity decision (K1/K2 broker) always follows independently (K4.Q2.2.2).
+message QuotaBurstPolicy {
+  // Extra allowance above base, per dimension (same dimension registry as
+  // QuotaSpec).
+  map<string, ResourceQuantity> allowance_by_dimension = 1;
+  // Window length; after the window closes the borrowed amount is repaid no
+  // later than the next quota period (NFR-K55).
+  uint64 window_ms = 2;
+}
+
+// K4 (planning/v0.4 02 K4.Q2.1.1, FR-TEN-002): per-tenant quota declaration.
+// Every field is optional; an unset dimension is unlimited for that tenant.
+// Enforcement points: admission (Submit/Create/Lease acquire) and durable
+// counting-change points — rejections return RESOURCE_EXHAUSTED with
+// QuotaExhaustedDetail, never silent degradation (fail closed).
+message QuotaSpec {
+  optional uint32 max_realms = 1;
+  optional uint32 max_activities = 2;
+  optional uint32 max_leases = 3;
+  // Resource-holding ceiling per K2 resource class.
+  map<string, ResourceQuantity> resource_classes = 4;
+  optional uint32 dispatch_concurrency = 5;
+  // Lease-time accumulation budget per burst window, milliseconds.
+  optional uint64 lease_time_per_window_ms = 6;
+  optional uint64 channel_bytes = 7;
+  optional uint64 artifact_bytes = 8;
+  // Soft accounting ceiling (FR-TEN-006): the usage stream records it, the
+  // quota enforcement decides — the billing stream itself never adjudicates.
+  optional ResourceQuantity cost_per_window = 9;
+  optional QuotaBurstPolicy burst = 10;
+}
+
+// K4 (planning/v0.4 02 K4.Q2): runtime usage view of one tenant's quotas;
+// exposed for inspection, never authoritative over the store TX.
+message QuotaUsage {
+  string tenant_name = 1;
+  // Current runtime counters (fast-path view; the store TX is authoritative
+  // and divergence raises a reconcile Fact, THR-K4-03).
+  map<string, uint64> current_by_dimension = 2;
+  // Borrowed burst amounts not yet repaid.
+  map<string, uint64> burst_borrowed_by_dimension = 3;
+}
+
+// K4 (planning/v0.4 02 K4.Q4.1, FR-TEN-006): one per-tenant usage event.
+// Record-only: the stream feeds billing/export and never makes policy.
+message TenantUsageEvent {
+  string tenant_name = 1;
+  // dispatch_count | lease_time_ms | channel_bytes | artifact_bytes
+  string kind = 2;
+  uint64 amount = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+  map<string, string> attributes = 5;
+}
+
+// K4 (planning/v0.4 02 K4.Q5.2, FR-RES-018): one lease migration inside a
+// defragmentation proposal. Execution happens only after the lease holder's
+// explicit consent; no consent, no migration (ADR-013 consequence upheld).
+message DefragMigration {
+  string lease_name = 1;
+  string resource_class = 2;
+  string from_key = 3;
+  string to_key = 4;
+  ResourceQuantity quantity = 5;
+}
+
+// K4 (planning/v0.4 02 K4.Q5.2): read-only proposal output of
+// ProposeDefrag. ExecuteDefrag runs the consented subset in a single TX;
+// any failure rolls the whole execution back (no partial migration).
+message DefragProposal {
+  string proposal_id = 1;
+  ObjectScope scope = 2;
+  repeated DefragMigration migrations = 3;
+  // Expected reclaimed headroom in bytes; advisory (packing estimate).
+  uint64 expected_gain_bytes = 4;
+  repeated string consented_lease_names = 5;
+  repeated string awaiting_lease_names = 6;
+  // rejected = consent timeout treated as refusal (K4.Q5.2).
+  repeated string rejected_lease_names = 7;
+}
+
+// K4 (planning/v0.4 03 K4.S1, FR-SUC-001): candidate realm lifecycle states.
+// The kernel never judges candidate quality (v0.1 §14); evaluation stays in
+// the Meta-Runtime.
+enum CandidateState {
+  CANDIDATE_STATE_UNSPECIFIED = 0;
+  CANDIDATE_STATE_NEW = 1;
+  CANDIDATE_STATE_BOOTING = 2;
+  CANDIDATE_STATE_READY = 3;
+  CANDIDATE_STATE_FAILED = 4;
+  CANDIDATE_STATE_TERMINATING = 5;
+  CANDIDATE_STATE_TERMINATED = 6;
+}

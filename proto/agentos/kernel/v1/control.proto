@@ -1,0 +1,602 @@
+// AgentOS Execution Kernel — control domain specs and records (§35.12, §35.13).
+//
+// Field numbers are frozen ABI (v1). Dependency direction: imports common/types
+// (and resources for Snapshot assembly in service.proto only).
+
+syntax = "proto3";
+
+package agentos.kernel.v1;
+
+import "agentos/kernel/v1/common.proto";
+import "agentos/kernel/v1/types.proto";
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Realm (§35.12)
+// ---------------------------------------------------------------------------
+
+message RealmSpec {
+  string requested_name = 1;
+  string principal_name = 2;
+  string adapter_kind = 3;
+  IsolationLevel minimum_isolation = 4;
+  repeated string required_capabilities = 5;
+  OpaquePayload filesystem_policy = 6;
+  OpaquePayload network_policy = 7;
+  ResourceBundleSpec hard_limits = 8;
+  // K5 (planning/v0.5 01 K5.RT2.1): declared realization node; empty = the
+  // local node (K1..K4 behavior byte for byte). target_node does not add a
+  // lifecycle state — the v0.1 §29.7 state machine is unchanged and only the
+  // realization location moves (FR-REALM-003, ADR-036).
+  optional string target_node = 9;
+}
+
+message RealmRecord {
+  ObjectRef ref = 1;
+  string principal_name = 2;
+  string adapter_kind = 3;
+  IsolationLevel isolation_level = 4;
+  repeated string capabilities = 5;
+  RealmState state = 6;
+  RealmState desired_state = 7;
+  optional KernelError failure = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  // K5 (planning/v0.5 01 K5.RT2.1): node the realm actually resides on. An
+  // observation dimension outside the canonical URI (agentos://<instance>/
+  // realms/<ulid> is unchanged, K5.RT2.1 MUST 3); empty = local node.
+  optional string home_node = 11;
+}
+
+// ---------------------------------------------------------------------------
+// Process (§35.12)
+// ---------------------------------------------------------------------------
+
+message ProcessSpec {
+  string requested_name = 1;
+  string principal_name = 2;
+  string realm_name = 3;
+  string supervisor_name = 4;
+  WorkloadEntrypoint entrypoint = 5;
+  ResourceBundleSpec resources = 6;
+  RestartPolicy restart_policy = 7;
+  string adapter_kind = 8;
+  map<string, string> labels = 9;
+}
+
+message ProcessRecord {
+  ObjectRef ref = 1;
+  string principal_name = 2;
+  string realm_name = 3;
+  string supervisor_name = 4;
+  ProcessState state = 5;
+  ProcessState desired_state = 6;
+  WorkloadEntrypoint entrypoint = 7;
+  optional int32 exit_code = 8;
+  optional KernelError failure = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+// ---------------------------------------------------------------------------
+// Activity (§35.12)
+// ---------------------------------------------------------------------------
+
+message ActivitySpec {
+  string requested_name = 1;
+  string process_name = 2;
+  string parent_activity_name = 3;
+  string realm_name = 4;
+  ResourceBundleSpec resources = 5;
+  SchedulingHints scheduling = 6;
+  optional google.protobuf.Timestamp hard_deadline = 7;
+  string cancellation_token_name = 8;
+  OpaquePayload payload = 9;
+}
+
+message ActivityResult {
+  ActivityState terminal_state = 1;
+  CompletionKind completion_kind = 2;
+  optional int32 exit_code = 3;
+  OpaquePayload payload = 4;
+  OutputCapture stdout = 5;
+  OutputCapture stderr = 6;
+  UsageSnapshot usage = 7;
+  optional KernelError error = 8;
+  google.protobuf.Timestamp completed_at = 9;
+}
+
+message ActivityRecord {
+  ObjectRef ref = 1;
+  string process_name = 2;
+  string parent_activity_name = 3;
+  string principal_name = 4;
+  string realm_name = 5;
+  ActivityState state = 6;
+  ActivityState desired_state = 7;
+  string wait_handle_name = 8;
+  string execution_slot_name = 9;
+  optional google.protobuf.Timestamp hard_deadline = 10;
+  optional ActivityResult result = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+  string input_channel_name = 14;
+  string output_channel_name = 15;
+}
+
+// ---------------------------------------------------------------------------
+// WaitHandle (§35.12)
+// ---------------------------------------------------------------------------
+
+message WaitHandleRecord {
+  ObjectRef ref = 1;
+  string activity_name = 2;
+  WaitKind kind = 3;
+  WaitHandleState state = 4;
+  string wake_key = 5;
+  optional google.protobuf.Timestamp deadline = 6;
+  optional OpaquePayload metadata = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Channel (§35.12)
+// ---------------------------------------------------------------------------
+
+message ChannelSpec {
+  string requested_name = 1;
+  repeated ChannelParticipant participants = 2;
+  OrderingMode ordering = 3;
+  DeliveryMode delivery = 4;
+  BackpressureMode backpressure = 5;
+  uint32 buffer_limit = 6;
+  string schema_ref = 7;
+  string transport_kind = 8;
+  uint64 max_buffer_bytes = 9;
+  // K4 (planning/v0.4 01 K4.C1.1.1): channel-level durability declaration;
+  // unset = MEMORY (K1/K2 semantics byte for byte). DURABLE requires the
+  // SPILL_DURABLE backpressure family and the channel.durable.at_least_once
+  // negotiation key (ADR-019); same-channel mixed durability is rejected.
+  optional ChannelDurability durability = 10;
+  // K4 (planning/v0.4 01 K4.C1.1.3): DELIVERED rows whose receiver stays
+  // silent past this deadline re-enter redelivery. Unset = config default
+  // (channel.durable.ack_deadline_ms, 30000).
+  optional uint64 ack_deadline_ms = 11;
+  // K4 (planning/v0.4 03 K4.S2.2): shadow-channel declaration — this channel
+  // mirrors the named production channel for candidate evaluation. Shadow
+  // output is invisible to production receivers by the authorization model,
+  // not by convention (FR-SUC-002); requires the succession feature gate.
+  optional string shadow_of = 12;
+  // K5 (planning/v0.5 03 K5.XC1.1): cross-node delivery declaration on a
+  // durable channel. transport_kind gains no cross-node token — cross-node is
+  // a delivery dimension of the durable channel, not a new transport
+  // (registry two-track ban). Requires k5.crossnode_channel (FR-IPC-011).
+  optional bool cross_node = 13;
+}
+
+message ChannelRecord {
+  ObjectRef ref = 1;
+  ChannelSpec spec = 2;
+  ChannelState state = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  optional KernelError failure = 6;
+  // K4 (planning/v0.4 01 K4.C5.1): durable view fields; set only when the
+  // channel opened with DURABLE durability.
+  optional DurableDepth durable_depth = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor (§35.12)
+// ---------------------------------------------------------------------------
+
+message SupervisorSpec {
+  string requested_name = 1;
+  string parent_supervisor_name = 2;
+  string owner_process_name = 3;
+  RestartPolicy restart_policy = 4;
+  OpaquePayload failure_propagation = 5;
+  // K2 (planning/v0.2 07 K2.M1): restart strategy; unset = ONE_FOR_ONE.
+  optional RestartStrategy restart_strategy = 6;
+  // K4 (planning/v0.4 01 K4.C3.2.2, FR-SUP-008): reconcile batch upper bound
+  // for this supervisor's decision loop; unset = config default
+  // (recovery.batch_size, 256). Batched decisions must equal per-node
+  // decisions (determinism, IT-SUP-BATCH-RECONCILE-001).
+  optional uint32 reconcile_batch_size = 7;
+}
+
+message SupervisorRecord {
+  ObjectRef ref = 1;
+  SupervisorSpec spec = 2;
+  SupervisorState state = 3;
+  repeated ObjectRef children = 4;
+  repeated RestartAttempt restart_attempts = 5;
+}
+
+// §35.13: SupervisorTreeNode.
+message SupervisorTreeNode {
+  SupervisorRecord supervisor = 1;
+  repeated SupervisorTreeNode child_supervisors = 2;
+  repeated ProcessRecord child_processes = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation token (§35.12/35.13)
+// ---------------------------------------------------------------------------
+
+message CancellationTokenSpec {
+  string requested_name = 1;
+  ObjectScope scope = 2;
+  bool include_future_children = 3;
+  uint64 scope_generation = 4;
+}
+
+message CancellationTokenRecord {
+  ObjectRef ref = 1;
+  string owner_principal_name = 2;
+  string scope_kind = 3;
+  string scope_name = 4;
+  bool include_future_children = 5;
+  CancellationState state = 6;
+  optional OpaquePayload report = 7;
+  uint64 scope_generation = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Operation journal (§26.2, §35.12)
+// ---------------------------------------------------------------------------
+
+message OperationResult {
+  OpaquePayload result = 1;
+  repeated OperationStep steps = 2;
+  repeated ObjectRef remaining = 3;
+}
+
+message OperationStep {
+  string name = 1;
+  OperationState state = 2;
+  optional KernelError error = 3;
+}
+
+message OperationRecord {
+  ObjectRef ref = 1;
+  string principal_name = 2;
+  string request_id = 3;
+  string kind = 4;
+  optional ObjectRef target = 5;
+  OperationState state = 6;
+  optional OperationResult result = 7;
+  optional KernelError error = 8;
+  uint32 attempt_count = 9;
+  optional google.protobuf.Timestamp next_retry_at = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Fact consumers (§35.13)
+// ---------------------------------------------------------------------------
+
+message FactConsumerSpec {
+  string requested_name = 1;
+  ObjectScope scope = 2;
+  uint64 start_after_seq = 3;
+}
+
+message FactConsumerRecord {
+  ObjectRef ref = 1;
+  ObjectScope scope = 2;
+  uint64 committed_seq = 3;
+  FactConsumerState state = 4;
+  google.protobuf.Timestamp pin_expires_at = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Authorization: principals, transport bindings, grants (§35.13)
+// ---------------------------------------------------------------------------
+
+message PrincipalSpec {
+  string requested_name = 1;
+  string tenant_name = 2;
+  map<string, string> labels = 3;
+}
+
+message PrincipalRecord {
+  ObjectRef ref = 1;
+  string tenant_name = 2;
+  PrincipalState state = 3;
+  map<string, string> labels = 4;
+}
+
+message TransportIdentityBindingSpec {
+  string requested_name = 1;
+  string transport_kind = 2;
+  uint32 uid = 3;
+  string principal_name = 4;
+}
+
+message TransportIdentityBindingRecord {
+  ObjectRef ref = 1;
+  TransportIdentityBindingSpec spec = 2;
+  IdentityBindingState state = 3;
+}
+
+message GrantPermission {
+  string operation = 1;
+  string scope_kind = 2;
+  string scope_name = 3;
+}
+
+message GrantConstraints {
+  repeated string allowed_adapter_kinds = 1;
+  map<string, ResourceQuantity> max_quantity_by_resource_class = 2;
+  repeated ExecutionMode allowed_execution_modes = 3;
+  uint32 max_concurrent_processes = 4;
+  uint32 max_concurrent_activities = 5;
+}
+
+message GrantSpec {
+  string requested_name = 1;
+  string subject_principal_name = 2;
+  string issuer_principal_name = 3;
+  repeated GrantPermission permissions = 4;
+  optional google.protobuf.Timestamp not_before = 5;
+  optional google.protobuf.Timestamp expires_at = 6;
+  RevocationPolicy revocation_policy = 7;
+  GrantConstraints constraints = 8;
+}
+
+message GrantRecord {
+  ObjectRef ref = 1;
+  GrantSpec spec = 2;
+  GrantState state = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel status (§35.13)
+// ---------------------------------------------------------------------------
+
+message KernelStatus {
+  KernelState state = 1;
+  string kernel_instance_id = 2;
+  string server_version = 3;
+  uint64 schema_version = 4;
+  uint64 global_revision = 5;
+  repeated string enabled_features = 6;
+  repeated KernelError health_issues = 7;
+  uint64 minimum_online_fact_seq = 8;
+  optional google.protobuf.Timestamp last_verified_backup_at = 9;
+  // K4 (planning/v0.4 01 K4.C3.1.3): segmented recovery progress; set while
+  // KERNEL_STATE_RECOVERING, cleared afterwards. Also emitted as a
+  // KernelFact at least every 5s (NFR-K51, CT-REC-PROGRESS-FACT-001).
+  optional RecoveryProgress recovery_progress = 10;
+  // K4 (planning/v0.4 03 K4.S3.1.1, ADR-024): current root-route generation;
+  // increments on every committed switch/revert. Blocking operations on the
+  // superseded route wake with ROUTE_SUPERSEDED.
+  optional uint64 route_generation = 11;
+}
+
+// ---------------------------------------------------------------------------
+// Tenant (K4 feature-gated; planning/v0.4 02 K4.Q1, ADR-022)
+// ---------------------------------------------------------------------------
+
+// K4: Tenant lifecycle (K4.Q1.1). Tenancy disabled ⇒ all tenant RPCs return
+// NOT_SUPPORTED and the tenants/ URI space stays closed (K4.Q1.4).
+enum TenantState {
+  TENANT_STATE_UNSPECIFIED = 0;
+  TENANT_STATE_ACTIVE = 1;
+  TENANT_STATE_DRAINING = 2;
+  TENANT_STATE_CLOSED = 3;
+}
+
+// K4 (planning/v0.4 02 K4.Q1.1, FR-TEN-001): persistent tenant object at
+// agentos://<kernel-instance-id>/tenants/<tenant-ulid>. Carries quota,
+// billing, fair-share, and resource accounting; the credential-boundary
+// field is declared here but enforced by K3's broker, not by K4 (K4.Q1.2).
+message TenantSpec {
+  string requested_name = 1;
+  // Human-readable display label; metric labels use the ULID only
+  // (CT-OBS-METRIC-CARDINALITY-001 cardinality rule, K4.Q4.3).
+  map<string, string> labels = 2;
+  QuotaSpec quota = 3;
+}
+
+message TenantRecord {
+  ObjectRef ref = 1;
+  TenantSpec spec = 2;
+  TenantState state = 3;
+  QuotaUsage usage = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Candidate succession (K4 feature-gated; planning/v0.4 03 K4.S1, ADR-024)
+// ---------------------------------------------------------------------------
+
+// K4 (planning/v0.4 03 K4.S1.1): spec for an isolated candidate realm. The
+// candidate inherits nothing from the production tree — whatever resources
+// or grants it needs must be declared here explicitly (isolation invariant,
+// K4.S1.2).
+message CandidateRealmSpec {
+  string requested_name = 1;
+  // Owner principal; candidate resources are accounted to this principal
+  // (and its tenant when tenancy is enabled, K4.S2.4).
+  string principal_name = 2;
+  RealmSpec realm = 3;
+  // Declares the shadow-input source: none | live_copy | replay (K4.S5.3).
+  string shadow_input_mode = 4;
+}
+
+// K4 (planning/v0.4 03 K4.S1): persistent candidate record; crash-recoverable
+// and reclaimed by the stale rule.
+message CandidateRealmRecord {
+  ObjectRef ref = 1;
+  CandidateRealmSpec spec = 2;
+  CandidateState state = 3;
+  optional KernelError failure = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// K4 (planning/v0.4 03 K4.S2.1, FR-SUC-002): structured probe result — facts,
+// not a boolean score. The Meta-Runtime evaluates; the kernel only reports.
+message CandidateHealthReport {
+  string candidate_name = 1;
+  // Boot stage the probe ran against (v0.1 §34.5 READY semantics).
+  string boot_stage = 2;
+  message HealthCheckItem {
+    string check = 1;
+    // pass | fail | skipped
+    string outcome = 2;
+    uint64 duration_ms = 3;
+    map<string, string> attributes = 4;
+  }
+  repeated HealthCheckItem items = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Credential mediation (§35.13; K3 feature-gated, RPC returns NOT_SUPPORTED in K1)
+// ---------------------------------------------------------------------------
+
+message CredentialUseSpec {
+  string provider_kind = 1;
+  string credential_name = 2;
+  string operation = 3;
+  OpaquePayload input = 4;
+  // K3 (planning/v0.3 03 K3.C2.1, ADR-032): the operation must match one
+  // of the whitelisted schemas — arbitrary code/script execution is not a
+  // legal credential use operation (SEC-CRD-OP-WHITELIST-001, fail-closed).
+  oneof operation_detail {
+    // HTTP bearer injection: the broker materializes the credential and
+    // executes the request itself; the workload never sees the raw token.
+    HttpBearerOperation http_bearer = 5;
+    // GitHub App installation token exchange: the broker performs the
+    // exchange and either holds the token for the proxy operation
+    // (exportable=false) or delivers it over the authorized channel.
+    GithubTokenOperation github_token = 6;
+  }
+  // K3 (planning/v0.3 03 K3.C1.2, ADR-031): delivery preference. PROXY is
+  // preferred; FD requires exportable=true plus explicit realm policy.
+  CredentialDelivery requested_delivery = 7;
+}
+
+// K3 (planning/v0.3 03 K3.C1.2 ADR-031): material delivery channels.
+// env/argv/plaintext-tmp are structurally forbidden (SEC-CRD-CHANNEL-
+// WHITELIST-001) and have no enum value by construction.
+enum CredentialDelivery {
+  CREDENTIAL_DELIVERY_UNSPECIFIED = 0;
+  CREDENTIAL_DELIVERY_PROXY = 1;
+  CREDENTIAL_DELIVERY_FD = 2;
+}
+
+// K3 (planning/v0.3 03 K3.C2.1, ADR-032): first-batch HTTP bearer proxy
+// operation. `headers` carries template headers; the bearer token is
+// injected by the broker, never by the caller.
+message HttpBearerOperation {
+  string endpoint = 1;
+  string method = 2;
+  map<string, string> headers = 3;
+  bytes body = 4;
+}
+
+// K3 (planning/v0.3 03 K3.C3.1, ADR-032): GitHub App installation token
+// exchange (materialize side of the GitHub token provider).
+message GithubTokenOperation {
+  string installation_id = 1;
+  repeated string repositories = 2;
+  repeated string permissions = 3;
+}
+
+message CredentialUseResult {
+  OpaquePayload output = 1;
+  optional google.protobuf.Timestamp expires_at = 2;
+  // K3 (planning/v0.3 03 K3.C1.2 ADR-031): the channel actually used —
+  // a mandatory audit field on every use response.
+  CredentialDelivery delivery = 3;
+  // K3: proxy-operation HTTP status (set when the broker executed an
+  // http_bearer operation on behalf of the workload).
+  optional uint32 status_code = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster (K5, planning/v0.5 03 K5.XC3 / 05 K5.M1)
+// ---------------------------------------------------------------------------
+
+// K5: one static cluster member as declared by `[[cluster.members]]` and
+// observed at runtime. The configuration is the sole desired source
+// (FR-CLUS-001, ADR-037 — no consensus, restart-required membership).
+message ClusterMemberRecord {
+  string node_id = 1;
+  string endpoint = 2;
+  // Certificate subject DN the member's mTLS identity must present
+  // (identity = membership whitelist ∩ CA chain, K5.RT1.2).
+  string identity_subject = 3;
+  // Runtime state registry: joining|active|lost|removed.
+  string state = 4;
+  google.protobuf.Timestamp joined_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  // K6 (planning/v0.6 02 K6.MR3, K6.M2 provenance): "static_config" |
+  // "raft_log"; unset (NULL) = K5 static path (consensus disabled).
+  optional string source = 7;
+  // K6: "voter" | "none" (no learner role exists — OQ-5 decision, K6.MR3).
+  optional string voter_role = 8;
+}
+
+// K5: read-only cluster view behind GetClusterStatus (placement-only
+// federation, ADR-041). Honest by construction: only locally observed
+// heartbeats/epochs are reported, never inferred peer state.
+message ClusterStatusRecord {
+  string local_node_id = 1;
+  bool cluster_enabled = 2;
+  repeated ClusterMemberRecord members = 3;
+  // Placement authority placement policy in effect ("local_only"|"federated").
+  string placement_policy = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Consensus (K6, planning/v0.6 02 K6.MR1 / 05 K6.M1, ADR-046/047/048)
+// ---------------------------------------------------------------------------
+
+// K6: one single-server membership change (AddMember | RemoveMember) proposed
+// through ProposeClusterMemberChange. `action` is a string registry
+// ("add"|"remove") — no proto enum, per the reserve_state registry dual-track
+// ban precedent (v0.5 ADR-038). `change_id` carries the operation-tag
+// idempotency key (v0.1 §29.12): replays return the existing outcome.
+message ClusterMemberChangeSpec {
+  // "add" | "remove" (K6.MR1.1; anything else → INVALID_ARGUMENT).
+  string action = 1;
+  // Target node id. For "add" the endpoint/identity_subject below must be
+  // declared; for "remove" only node_id is consulted.
+  string node_id = 2;
+  // Peer endpoint for added voters (mTLS, K5 [[cluster.members]] shape).
+  string endpoint = 3;
+  // Certificate subject DN for added voters (identity = whitelist ∩ CA).
+  string identity_subject = 4;
+  // Caller-chosen idempotency key for this change.
+  string change_id = 5;
+}
+
+// K6: read-only consensus view behind GetConsensusStatus (K6.MR3). Honest
+// by construction: only locally persisted term/log state is reported.
+message ConsensusStatusRecord {
+  string local_node_id = 1;
+  bool consensus_enabled = 2;
+  // "disabled" | "follower" | "candidate" | "leader" (string registry, no
+  // proto enum — same dual-track ban as ClusterMemberChangeSpec.action).
+  string role = 3;
+  // Persisted current term (consensus_state.current_term).
+  uint64 term = 4;
+  // Current known leader ("" when unknown).
+  string leader_id = 5;
+  uint64 commit_index = 6;
+  uint64 apply_index = 7;
+  // Persisted voted_for this term ("" when none).
+  string voted_for = 8;
+  // Current committed voter set (raft-log authoritative when consensus is
+  // enabled; bootstrap seed before the first commit).
+  repeated string voters = 9;
+  // True while a single-server change is pending (uncommitted) — the
+  // single-step discipline blocks further changes (K6.MR1.1 MUST 1).
+  bool pending_change = 10;
+  // Leader lease validity: false means the leader has fail-closed stopped
+  // issuing epochs/placement decisions (K6.LA1.2, ADR-049).
+  bool leader_lease_valid = 11;
+}

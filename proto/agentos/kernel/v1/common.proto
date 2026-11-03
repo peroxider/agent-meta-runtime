@@ -1,0 +1,186 @@
+// AgentOS Execution Kernel — common ABI primitives (§35.1, §35.2, §35.11).
+//
+// Dependency direction (§35.14.1): common -> types -> resources/control -> service.
+// This file is the base layer; it imports only google/protobuf well-known types.
+// Field numbers and enum wire numbers are frozen ABI (v1); never reuse or renumber.
+
+syntax = "proto3";
+
+package agentos.kernel.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Envelope (§35.1)
+// ---------------------------------------------------------------------------
+
+// Unified header present as field 1 of every ABI request (§35.1).
+message RequestMeta {
+  // Lowercase canonical UUIDv4 (36 chars); required for all RPCs.
+  string request_id = 1;
+  // ASCII [A-Za-z0-9._-]{1,64}; diagnostics/rate-limiting only, never authorization.
+  string client_id = 2;
+  // Optional canonical Principal URI; must match transport mapping when set.
+  string claimed_principal_name = 3;
+  // Fixed "v1"; must equal the version selected by Hello on this connection.
+  string abi_version = 4;
+  google.protobuf.Timestamp deadline = 5;
+  // K1 accepts only traceparent/tracestate/baggage keys; total encoding <= 8KiB.
+  map<string, string> trace_context = 6;
+  string cancellation_token_name = 7;
+}
+
+// Unified header present as field 1 of every ABI response (§35.1).
+message ResponseMeta {
+  string request_id = 1;
+  string kernel_instance_id = 2;
+  uint64 kernel_revision = 3;
+  google.protobuf.Timestamp server_time = 4;
+}
+
+// Logical handle: canonical URI + generation + revision (§35.11).
+// generation/revision must be nonzero (§35.11 ObjectRef rules).
+message ObjectRef {
+  string name = 1;
+  uint64 generation = 2;
+  uint64 revision = 3;
+}
+
+// Versioned opaque payload; never use google.protobuf.Struct (§35.12).
+message OpaquePayload {
+  string content_type = 1;
+  // External schema id: urn:agentos:schema:<domain>:<name>:v<major> (ADR-007).
+  string schema_ref = 2;
+  bytes data = 3;
+}
+
+// Scope selector for facts / snapshots (§35.13).
+message ObjectScope {
+  string kind = 1;
+  string name = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Quantities (§35.11)
+// ---------------------------------------------------------------------------
+
+message ResourceQuantity {
+  oneof value {
+    uint64 count = 1;
+    uint64 cpu_millis = 2;
+    uint64 bytes = 3;
+    uint64 tokens = 4;
+    uint64 money_micros = 5;
+    RateQuantity rate = 6;
+  }
+}
+
+message RateQuantity {
+  uint64 burst = 1;
+  uint64 refill_amount = 2;
+  google.protobuf.Duration refill_period = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Errors (§35.2)
+// ---------------------------------------------------------------------------
+
+// Wire numbers are frozen (§35.2); K0 golden descriptor test pins them.
+enum KernelErrorCode {
+  KERNEL_ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_ARGUMENT = 1;
+  NOT_FOUND = 2;
+  ALREADY_EXISTS = 3;
+  INVALID_STATE = 4;
+  PERMISSION_DENIED = 5;
+  RESOURCE_EXHAUSTED = 6;
+  ADMISSION_REJECTED = 7;
+  DEADLINE_EXCEEDED = 8;
+  CANCELLED = 9;
+  CONFLICT = 10;
+  STALE_GENERATION = 11;
+  ADAPTER_UNAVAILABLE = 12;
+  SUBSTRATE_FAILURE = 13;
+  PEER_GONE = 14;
+  LEASE_EXPIRED = 15;
+  CURSOR_EXPIRED = 16;
+  NOT_SUPPORTED = 17;
+  KERNEL_BACKPRESSURE = 18;
+  INTERNAL = 19;
+  // K4 (planning/v0.4 03 K4.S3.1.4): a root-route switch/revert committed and
+  // the caller's route generation is no longer current. Same wake family as
+  // PEER_GONE (14); append-only wire number per §35.2.
+  ROUTE_SUPERSEDED = 20;
+  // K6 (planning/v0.6 03 K6.LA1.1/K6.LA2, ADR-048/049): the receiving node is
+  // not the consensus leader — placement/epoch-issuance/membership-change
+  // authority is bound to the leader term. The response carries the current
+  // known-leader hint in `metadata["leader_hint"]`.
+  NOT_LEADER = 21;
+  // K6 (planning/v0.6 03 K6.LA2, ADR-049): quorum lost — the control plane
+  // (placement, epoch issuance, dynamic membership) is fail-closed stalled;
+  // no automatic degradation to single-node authority exists (AC-K48).
+  QUORUM_LOSS = 22;
+}
+
+message KernelError {
+  KernelErrorCode code = 1;
+  // Stable English summary without secrets; program branching uses code/details.
+  string message = 2;
+  bool retryable = 3;
+  optional google.protobuf.Duration retry_after = 4;
+  // Only registry keys allowed: cause, decision_required, operation_name, last_seq.
+  map<string, string> metadata = 5;
+  // At most one detail per type, sorted by type URL byte order (§35.2).
+  repeated google.protobuf.Any details = 6;
+}
+
+message FieldViolation {
+  string field_path = 1;
+  string reason = 2;
+}
+
+// Present on INVALID_ARGUMENT (at least one violation) (§35.2).
+message ValidationDetail {
+  repeated FieldViolation violations = 1;
+}
+
+// Present on CONFLICT/STALE_GENERATION/INVALID_STATE for object mutation (§35.2).
+message ConcurrencyDetail {
+  ObjectRef object = 1;
+  uint64 expected_generation = 2;
+  uint64 expected_revision = 3;
+  string actual_state = 4;
+}
+
+// Present on resource queue/reject/backpressure when a concrete resource exists (§35.2).
+message ResourcePressureDetail {
+  string resource_class = 1;
+  string resource_key = 2;
+  optional ResourceQuantity capacity = 3;
+  optional ResourceQuantity allocated = 4;
+  optional ResourceQuantity requested = 5;
+}
+
+// Always present on CURSOR_EXPIRED (§35.2).
+message CursorExpiredDetail {
+  uint64 minimum_available_seq = 1;
+  uint64 current_kernel_revision = 2;
+  bool snapshot_required = 3;
+}
+
+// K4 (planning/v0.4 02 K4.Q2.1.2): present on RESOURCE_EXHAUSTED when a
+// tenant quota check rejected the request. Enforcement never degrades
+// silently — the offending dimension, its current runtime value, and the
+// declared limit are always carried (FR-TEN-002).
+message QuotaExhaustedDetail {
+  string tenant_name = 1;
+  // Quota dimension that rejected (e.g. "max_realms", "resource_classes:gpu",
+  // "channel_bytes"); byte-order registry, not free text.
+  string dimension = 2;
+  uint64 current_value = 3;
+  uint64 limit_value = 4;
+  // Set when the rejection happened during burst repayment (K4.Q2.2.1).
+  bool repayment_backpressure = 5;
+}

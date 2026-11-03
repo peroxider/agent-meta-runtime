@@ -1,0 +1,1034 @@
+// AgentOS Execution Kernel — v1 service surface and RPC wrappers
+// (§35.6, §35.8, §35.13, §35.14).
+//
+// service.proto is the ONLY file declaring the AgentOSKernel service (§35.14.1).
+// Field numbers are frozen ABI (v1). Wrapper convention: request field 1 is
+// RequestMeta; create requests carry the Spec at field 2; inspect/get/delete/
+// cancel carry canonical name at field 2, expected_generation/expected_revision
+// at fields 3/4. Responses carry ResponseMeta at field 1, Record at field 2.
+
+syntax = "proto3";
+
+package agentos.kernel.v1;
+
+import "agentos/kernel/v1/common.proto";
+import "agentos/kernel/v1/control.proto";
+import "agentos/kernel/v1/resources.proto";
+import "agentos/kernel/v1/types.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Hello / feature negotiation (§35.6, §35.13 exceptions)
+// ---------------------------------------------------------------------------
+
+message HelloRequest {
+  repeated string supported_abi_versions = 1;
+  repeated string requested_features = 2;
+}
+
+message HelloResponse {
+  string selected_abi_version = 1;
+  repeated string enabled_features = 2;
+  string kernel_instance_id = 3;
+  string server_version = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot (§35.13; assembly of all record types)
+// ---------------------------------------------------------------------------
+
+message Snapshot {
+  uint64 revision = 1;
+  repeated RealmRecord realms = 2;
+  repeated ProcessRecord processes = 3;
+  repeated ActivityRecord activities = 4;
+  repeated WaitHandleRecord wait_handles = 5;
+  repeated ResourceRequestRecord resource_requests = 6;
+  repeated LeaseRecord leases = 7;
+  repeated ChannelRecord channels = 8;
+  repeated SupervisorRecord supervisors = 9;
+  repeated OperationRecord operations = 10;
+  repeated ResourceInstanceRecord resource_instances = 11;
+  repeated ExecutionSlotRecord execution_slots = 12;
+  repeated CancellationTokenRecord cancellation_tokens = 13;
+  repeated FactConsumerRecord fact_consumers = 14;
+  repeated PrincipalRecord principals = 15;
+  repeated GrantRecord grants = 16;
+  repeated TransportIdentityBindingRecord transport_identity_bindings = 17;
+  // K2 (planning/v0.2 03 K2.P4.2): cpu_partition placement observations.
+  repeated CpuPlacementRecord cpu_placement = 18;
+  // K4 (planning/v0.4 02 K4.Q6.1): tenant records; paged + authorization
+  // filtered exactly like the rest of the snapshot (SEC-TEN-ENUM-001).
+  repeated TenantRecord tenants = 19;
+  // K4 (planning/v0.4 03 K4.S5.1): candidate realm records; authorization
+  // filtered (SEC-SUC-CANDIDATE-ISOLATION-001).
+  repeated CandidateRealmRecord candidate_realms = 20;
+}
+
+// WatchSnapshot delta: UI/observability only, never authoritative (§35.8).
+message SnapshotDelta {
+  uint64 from_revision = 1;
+  uint64 to_revision = 2;
+  repeated OpaquePayload changes = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel lifecycle
+// ---------------------------------------------------------------------------
+
+message GetKernelStatusRequest {
+  RequestMeta meta = 1;
+}
+
+message GetKernelStatusResponse {
+  ResponseMeta meta = 1;
+  KernelStatus status = 2;
+}
+
+message DrainKernelRequest {
+  RequestMeta meta = 1;
+  google.protobuf.Duration grace = 2;
+  bool force = 3;
+  uint64 expected_kernel_revision = 4;
+}
+
+message OperationResponse {
+  ResponseMeta meta = 1;
+  OperationRecord operation = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Realm
+// ---------------------------------------------------------------------------
+
+message CreateRealmRequest {
+  RequestMeta meta = 1;
+  RealmSpec spec = 2;
+}
+
+message CreateRealmResponse {
+  ResponseMeta meta = 1;
+  RealmRecord realm = 2;
+}
+
+message InspectRealmRequest {
+  RequestMeta meta = 1;
+  string realm_name = 2;
+}
+
+message InspectRealmResponse {
+  ResponseMeta meta = 1;
+  RealmRecord realm = 2;
+}
+
+message DestroyRealmRequest {
+  RequestMeta meta = 1;
+  string realm_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Process
+// ---------------------------------------------------------------------------
+
+message SpawnProcessRequest {
+  RequestMeta meta = 1;
+  ProcessSpec spec = 2;
+}
+
+message SpawnProcessResponse {
+  ResponseMeta meta = 1;
+  ProcessRecord process = 2;
+}
+
+message InspectProcessRequest {
+  RequestMeta meta = 1;
+  string process_name = 2;
+}
+
+message InspectProcessResponse {
+  ResponseMeta meta = 1;
+  ProcessRecord process = 2;
+}
+
+message StopProcessRequest {
+  RequestMeta meta = 1;
+  string process_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+  google.protobuf.Duration grace = 5;
+}
+
+message KillProcessRequest {
+  RequestMeta meta = 1;
+  string process_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+  string reason = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+
+message SubmitActivityRequest {
+  RequestMeta meta = 1;
+  ActivitySpec spec = 2;
+}
+
+message SubmitActivityResponse {
+  ResponseMeta meta = 1;
+  ActivityRecord activity = 2;
+}
+
+message InspectActivityRequest {
+  RequestMeta meta = 1;
+  string activity_name = 2;
+}
+
+message InspectActivityResponse {
+  ResponseMeta meta = 1;
+  ActivityRecord activity = 2;
+}
+
+message WaitActivityRequest {
+  RequestMeta meta = 1;
+  string activity_name = 2;
+  uint64 expected_generation = 3;
+}
+
+message WaitActivityResponse {
+  ResponseMeta meta = 1;
+  ActivityRecord activity = 2;
+}
+
+message CancelActivityRequest {
+  RequestMeta meta = 1;
+  string activity_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+  string reason = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+message RequestResourceRequest {
+  RequestMeta meta = 1;
+  string activity_name = 2;
+  ResourceBundleSpec bundle = 3;
+}
+
+message RequestResourceResponse {
+  ResponseMeta meta = 1;
+  ResourceRequestRecord request = 2;
+  repeated LeaseRecord leases = 3;
+}
+
+message InspectLeaseRequest {
+  RequestMeta meta = 1;
+  string lease_name = 2;
+}
+
+message InspectLeaseResponse {
+  ResponseMeta meta = 1;
+  LeaseRecord lease = 2;
+}
+
+message RenewLeaseRequest {
+  RequestMeta meta = 1;
+  string lease_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+  google.protobuf.Duration extend_by = 5;
+}
+
+message RenewLeaseResponse {
+  ResponseMeta meta = 1;
+  LeaseRecord lease = 2;
+}
+
+message ReleaseLeaseRequest {
+  RequestMeta meta = 1;
+  string lease_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Channel
+// ---------------------------------------------------------------------------
+
+message OpenChannelRequest {
+  RequestMeta meta = 1;
+  ChannelSpec spec = 2;
+}
+
+message OpenChannelResponse {
+  ResponseMeta meta = 1;
+  ChannelRecord channel = 2;
+}
+
+message SendChannelRequest {
+  RequestMeta meta = 1;
+  string channel_name = 2;
+  Envelope envelope = 3;
+  uint64 expected_generation = 4;
+}
+
+message SendChannelResponse {
+  ResponseMeta meta = 1;
+  ChannelSendReceipt receipt = 2;
+}
+
+message ReceiveChannelRequest {
+  RequestMeta meta = 1;
+  string channel_name = 2;
+  uint32 max_messages = 3;
+  uint64 expected_generation = 4;
+}
+
+message ReceiveChannelResponse {
+  ResponseMeta meta = 1;
+  repeated Envelope envelopes = 2;
+}
+
+message CloseChannelRequest {
+  RequestMeta meta = 1;
+  string channel_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+  ChannelCloseMode mode = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor
+// ---------------------------------------------------------------------------
+
+message CreateSupervisorRequest {
+  RequestMeta meta = 1;
+  SupervisorSpec spec = 2;
+}
+
+message CreateSupervisorResponse {
+  ResponseMeta meta = 1;
+  SupervisorRecord supervisor = 2;
+}
+
+message AttachSupervisorChildRequest {
+  RequestMeta meta = 1;
+  string supervisor_name = 2;
+  ObjectRef child = 3;
+  uint64 expected_revision = 4;
+}
+
+message InspectSupervisorTreeRequest {
+  RequestMeta meta = 1;
+  string supervisor_name = 2;
+}
+
+message InspectSupervisorTreeResponse {
+  ResponseMeta meta = 1;
+  SupervisorTreeNode root = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+message CreateCancellationTokenRequest {
+  RequestMeta meta = 1;
+  CancellationTokenSpec spec = 2;
+}
+
+message CreateCancellationTokenResponse {
+  ResponseMeta meta = 1;
+  CancellationTokenRecord cancellation_token = 2;
+}
+
+message RequestCancellationRequest {
+  RequestMeta meta = 1;
+  string cancellation_token_name = 2;
+  string reason = 3;
+  uint64 expected_revision = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Credential (K3 feature-gated)
+// ---------------------------------------------------------------------------
+
+message CredentialUseRequest {
+  RequestMeta meta = 1;
+  CredentialUseSpec spec = 2;
+}
+
+message CredentialUseResponse {
+  ResponseMeta meta = 1;
+  CredentialUseResult result = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Authorization management (§35.13)
+// ---------------------------------------------------------------------------
+
+message CreatePrincipalRequest {
+  RequestMeta meta = 1;
+  PrincipalSpec spec = 2;
+}
+
+message CreatePrincipalResponse {
+  ResponseMeta meta = 1;
+  PrincipalRecord principal = 2;
+}
+
+message SetPrincipalStateRequest {
+  RequestMeta meta = 1;
+  string principal_name = 2;
+  PrincipalState desired_state = 3;
+  uint64 expected_revision = 4;
+}
+
+message BindTransportIdentityRequest {
+  RequestMeta meta = 1;
+  TransportIdentityBindingSpec spec = 2;
+}
+
+message RevokeTransportIdentityRequest {
+  RequestMeta meta = 1;
+  string binding_name = 2;
+  uint64 expected_revision = 3;
+}
+
+message CreateGrantRequest {
+  RequestMeta meta = 1;
+  GrantSpec spec = 2;
+}
+
+message CreateGrantResponse {
+  ResponseMeta meta = 1;
+  GrantRecord grant = 2;
+}
+
+message RevokeGrantRequest {
+  RequestMeta meta = 1;
+  string grant_name = 2;
+  uint64 expected_revision = 3;
+}
+
+message ResolveQuarantineRequest {
+  RequestMeta meta = 1;
+  ObjectRef target = 2;
+  QuarantineAction action = 3;
+  string reason = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot / facts / operations
+// ---------------------------------------------------------------------------
+
+message GetSnapshotRequest {
+  RequestMeta meta = 1;
+  ObjectScope scope = 2;
+  uint32 page_size = 3;
+  string page_token = 4;
+}
+
+message GetSnapshotResponse {
+  ResponseMeta meta = 1;
+  Snapshot snapshot = 2;
+  string next_page_token = 3;
+}
+
+message RegisterFactConsumerRequest {
+  RequestMeta meta = 1;
+  FactConsumerSpec spec = 2;
+}
+
+message RegisterFactConsumerResponse {
+  ResponseMeta meta = 1;
+  FactConsumerRecord consumer = 2;
+}
+
+message CommitFactCursorRequest {
+  RequestMeta meta = 1;
+  string consumer_name = 2;
+  uint64 committed_seq = 3;
+  string delivery_cursor_token = 4;
+  uint64 expected_revision = 5;
+}
+
+message CommitFactCursorResponse {
+  ResponseMeta meta = 1;
+  FactConsumerRecord consumer = 2;
+}
+
+message RevokeFactConsumerRequest {
+  RequestMeta meta = 1;
+  string consumer_name = 2;
+  uint64 expected_revision = 3;
+}
+
+message WatchFactsRequest {
+  RequestMeta meta = 1;
+  uint64 after_seq = 2;
+  ObjectScope scope = 3;
+  string consumer_name = 4;
+}
+
+message WatchSnapshotRequest {
+  RequestMeta meta = 1;
+  uint64 after_revision = 2;
+  ObjectScope scope = 3;
+}
+
+message GetOperationRequest {
+  RequestMeta meta = 1;
+  string operation_name = 2;
+}
+
+message GetOperationResponse {
+  ResponseMeta meta = 1;
+  OperationRecord operation = 2;
+}
+
+// ---------------------------------------------------------------------------
+// K2 increments (planning/v0.2 07 K2.M1 — additive only, NFR-K30)
+// ---------------------------------------------------------------------------
+
+// PTY live resize (05 K2.W3.1): the only effective resize path; resize control
+// sequences inside PTY input payloads are data, never side effects.
+message ResizePtyRequest {
+  RequestMeta meta = 1;
+  string process_name = 2;
+  uint32 rows = 3;
+  uint32 columns = 4;
+}
+
+message ResizePtyResponse {
+  ResponseMeta meta = 1;
+}
+
+// StructuredStream turn lifecycle (05 K2.W1.3). Responses come back via
+// KernelFact/stream events; the RPC only submits/cancels the wait side.
+message SubmitTurnRequest {
+  RequestMeta meta = 1;
+  string process_name = 2;
+  bytes payload = 3;
+  optional google.protobuf.Duration deadline = 4;
+}
+
+message SubmitTurnResponse {
+  ResponseMeta meta = 1;
+  string turn_id = 2;
+}
+
+message CancelTurnRequest {
+  RequestMeta meta = 1;
+  string process_name = 2;
+  string turn_id = 3;
+  string reason = 4;
+}
+
+message CancelTurnResponse {
+  ResponseMeta meta = 1;
+}
+
+// Supervisor handoff, two-phase drain→attach (06 K2.V2).
+message ReparentProcessRequest {
+  RequestMeta meta = 1;
+  string process_name = 2;
+  string target_supervisor_name = 3;
+  ReparentOptions options = 4;
+}
+
+message ReparentOptions {
+  bool restart_on_attach = 1;
+}
+
+message ReparentProcessResponse {
+  ResponseMeta meta = 1;
+  ProcessRecord process = 2;
+}
+
+// Fair-share accounting readout (01 K2.S4.1): read-only, never feeds
+// dispatch decisions (ADR-017).
+message ListPrincipalUsageRequest {
+  RequestMeta meta = 1;
+  string principal_name = 2;
+  optional google.protobuf.Duration window = 3;
+}
+
+message PrincipalUsageRecord {
+  string principal_name = 1;
+  uint64 dispatch_count = 2;
+  uint64 lease_time_millis = 3;
+  uint64 dispatch_queue_millis = 4;
+  google.protobuf.Timestamp window_start = 5;
+  google.protobuf.Timestamp window_end = 6;
+}
+
+message ListPrincipalUsageResponse {
+  ResponseMeta meta = 1;
+  repeated PrincipalUsageRecord usage = 2;
+}
+
+// Persistent artifact readback (06 K2.V4.1): per-activity-ancestry
+// authorization; never a filesystem path.
+message GetArtifactRequest {
+  RequestMeta meta = 1;
+  string artifact_id = 2;
+  uint64 offset = 3;
+  uint32 max_chunk_bytes = 4;
+}
+
+message ArtifactChunk {
+  bytes data = 1;
+  uint64 offset = 2;
+  bool final = 3;
+  string sha256 = 4;
+}
+
+// ---------------------------------------------------------------------------
+// K3 increments (planning/v0.3 05 K3.SC1 — additive only, NFR-K30)
+// ---------------------------------------------------------------------------
+
+// Remote worker hosting (planning/v0.3 04 K3.RW1.1, ADR-033): register a
+// single-node worker over the local transport. Feature-gated behind
+// `k3.remote_worker`; the lease follows the unchanged §32 lifecycle.
+message RegisterRemoteWorkerRequest {
+  RequestMeta meta = 1;
+  RemoteWorkerRegistration registration = 2;
+}
+
+message RegisterRemoteWorkerResponse {
+  ResponseMeta meta = 1;
+  RemoteWorkerStatus worker = 2;
+}
+
+// Checkpoint-preemptible remote jobs (planning/v0.3 04 K3.RW2, ADR-034):
+// request that the worker write an explicit safe-point checkpoint; the
+// durable reference lands in the `worker.checkpoint` fact and the
+// worker_checkpoints table. Feature-gated behind `k3.remote_worker`.
+message RequestWorkerCheckpointRequest {
+  RequestMeta meta = 1;
+  string activity_name = 2;
+  string worker_name = 3;
+}
+
+message RequestWorkerCheckpointResponse {
+  ResponseMeta meta = 1;
+  WorkerCheckpointRef checkpoint = 2;
+}
+
+// ---------------------------------------------------------------------------
+// K4 increments (planning/v0.4 01 K4.C5 / 02 K4.Q6 / 03 K4.S5 — additive only, NFR-K30)
+// ---------------------------------------------------------------------------
+
+// Durable channel ack (planning/v0.4 01 K4.C1.1.3): receiver-side explicit
+// acknowledgement. Cursors are per-sender, generation-bound; the resulting
+// reclaim runs in the same TX as the cursor update (ADR-018 crash matrix).
+message AckChannelRequest {
+  RequestMeta meta = 1;
+  string channel_name = 2;
+  repeated AckCursor cursors = 3;
+  uint64 expected_generation = 4;
+}
+
+message AckChannelResponse {
+  ResponseMeta meta = 1;
+  // Rows actually reclaimed by this ack (≤ delivered_unacked before the ack).
+  uint64 reclaimed = 2;
+}
+
+// Adapter compensation plan registration/audit (planning/v0.4 01 K4.C4,
+// ADR-021). Registration is authorized against the adapter principal;
+// execution later runs under the same authority.
+message RegisterCompensationPlanRequest {
+  RequestMeta meta = 1;
+  CompensationPlanSpec spec = 2;
+}
+
+message RegisterCompensationPlanResponse {
+  ResponseMeta meta = 1;
+  CompensationPlanRecord plan = 2;
+}
+
+message RevokeCompensationPlanRequest {
+  RequestMeta meta = 1;
+  string plan_name = 2;
+  uint64 expected_revision = 3;
+}
+
+message ListCompensationPlansRequest {
+  RequestMeta meta = 1;
+  // Optional filters; both unset lists everything the caller may see.
+  optional string adapter_kind = 2;
+  optional string workload_kind = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListCompensationPlansResponse {
+  ResponseMeta meta = 1;
+  repeated CompensationPlanRecord plans = 2;
+  string next_page_token = 3;
+}
+
+// Tenant CRUD (planning/v0.4 02 K4.Q1, FR-TEN-001). All tenant RPCs return
+// NOT_SUPPORTED while tenancy is disabled; listing is authorization-filtered
+// with no existence leakage (SEC-TEN-ENUM-001).
+message CreateTenantRequest {
+  RequestMeta meta = 1;
+  TenantSpec spec = 2;
+}
+
+message CreateTenantResponse {
+  ResponseMeta meta = 1;
+  TenantRecord tenant = 2;
+}
+
+message InspectTenantRequest {
+  RequestMeta meta = 1;
+  string tenant_name = 2;
+}
+
+message InspectTenantResponse {
+  ResponseMeta meta = 1;
+  TenantRecord tenant = 2;
+}
+
+message UpdateTenantQuotaRequest {
+  RequestMeta meta = 1;
+  string tenant_name = 2;
+  QuotaSpec quota = 3;
+  uint64 expected_revision = 4;
+}
+
+message UpdateTenantQuotaResponse {
+  ResponseMeta meta = 1;
+  TenantRecord tenant = 2;
+}
+
+message DestroyTenantRequest {
+  RequestMeta meta = 1;
+  string tenant_name = 2;
+  uint64 expected_generation = 3;
+  uint64 expected_revision = 4;
+}
+
+message ListTenantsRequest {
+  RequestMeta meta = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListTenantsResponse {
+  ResponseMeta meta = 1;
+  repeated TenantRecord tenants = 2;
+  string next_page_token = 3;
+}
+
+// Per-tenant usage event stream readout (planning/v0.4 02 K4.Q4.1,
+// FR-TEN-006): paged, exportable, record-only.
+message ListTenantUsageRequest {
+  RequestMeta meta = 1;
+  string tenant_name = 2;
+  // kind filter: dispatch_count | lease_time_ms | channel_bytes |
+  // artifact_bytes; unset = all kinds.
+  optional string kind = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListTenantUsageResponse {
+  ResponseMeta meta = 1;
+  repeated TenantUsageEvent events = 2;
+  string next_page_token = 3;
+}
+
+// Lease reshape (planning/v0.4 02 K4.Q5.1, FR-RES-017): explicit upsize of a
+// degraded partial grant — single TX, RESOURCE_EXHAUSTED leaves the lease
+// untouched; voluntary downsize releases the delta immediately.
+message ResizeLeaseRequest {
+  RequestMeta meta = 1;
+  string lease_name = 2;
+  // Target quantity for the lease's (class, key); upsize requires headroom.
+  ResourceQuantity quantity = 3;
+  uint64 expected_generation = 4;
+  uint64 expected_revision = 5;
+}
+
+message ResizeLeaseResponse {
+  ResponseMeta meta = 1;
+  LeaseRecord lease = 2;
+}
+
+// Defragmentation, three-phase (planning/v0.4 02 K4.Q5.2, FR-RES-018):
+// ProposeDefrag (read-only) → per-holder consent → ExecuteDefrag (single TX,
+// all-or-nothing). Migration without consent is structurally impossible.
+message ProposeDefragRequest {
+  RequestMeta meta = 1;
+  ObjectScope scope = 2;
+}
+
+message ProposeDefragResponse {
+  ResponseMeta meta = 1;
+  DefragProposal proposal = 2;
+}
+
+message ConsentDefragRequest {
+  RequestMeta meta = 1;
+  string proposal_id = 2;
+  string lease_name = 3;
+  // true = holder consents; false = explicit refusal (treated like timeout).
+  bool approve = 4;
+}
+
+message ConsentDefragResponse {
+  ResponseMeta meta = 1;
+  DefragProposal proposal = 2;
+}
+
+message ExecuteDefragRequest {
+  RequestMeta meta = 1;
+  string proposal_id = 2;
+}
+
+message ExecuteDefragResponse {
+  ResponseMeta meta = 1;
+  OperationRecord operation = 2;
+}
+
+// Candidate succession RPCs (planning/v0.4 03 K4.S1/S3, ADR-024). All
+// succession RPCs return NOT_SUPPORTED while succession is disabled; switch/
+// revert require a dedicated root-succession grant (SEC-SUC-SWITCH-AUTH-001).
+message CreateCandidateRealmRequest {
+  RequestMeta meta = 1;
+  CandidateRealmSpec spec = 2;
+}
+
+message CreateCandidateRealmResponse {
+  ResponseMeta meta = 1;
+  CandidateRealmRecord candidate = 2;
+}
+
+message BootCandidateRequest {
+  RequestMeta meta = 1;
+  string candidate_name = 2;
+}
+
+message BootCandidateResponse {
+  ResponseMeta meta = 1;
+  CandidateRealmRecord candidate = 2;
+}
+
+// Structured health probe (planning/v0.4 03 K4.S2.1): facts, never a score.
+message ProbeCandidateRequest {
+  RequestMeta meta = 1;
+  string candidate_name = 2;
+}
+
+message ProbeCandidateResponse {
+  ResponseMeta meta = 1;
+  CandidateHealthReport report = 2;
+}
+
+message TerminateCandidateRequest {
+  RequestMeta meta = 1;
+  string candidate_name = 2;
+  ChannelCloseMode mode = 3;
+  uint64 expected_generation = 4;
+  uint64 expected_revision = 5;
+}
+
+message TerminateCandidateResponse {
+  ResponseMeta meta = 1;
+  CandidateRealmRecord candidate = 2;
+}
+
+// Atomic root-route switch (planning/v0.4 03 K4.S3.1, FR-SUC-003): single
+// persistent TX — new binding + old route DRAINING + generation increment.
+// Crash at any commit point converges to exactly one live route (NFR-K56).
+message SwitchRootRouteRequest {
+  RequestMeta meta = 1;
+  string candidate_name = 2;
+}
+
+message SwitchRootRouteResponse {
+  ResponseMeta meta = 1;
+  uint64 route_generation = 2;
+}
+
+// Revert (planning/v0.4 03 K4.S3.2, FR-SUC-004): single TX back to the old
+// route binding; only before drain completes or inside revert_window_ms.
+message RevertRootRouteRequest {
+  RequestMeta meta = 1;
+}
+
+message RevertRootRouteResponse {
+  ResponseMeta meta = 1;
+  uint64 route_generation = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster (K5, planning/v0.5 03 K5.XC3 / 05 K5.M1)
+// ---------------------------------------------------------------------------
+
+message GetClusterStatusRequest {
+  RequestMeta meta = 1;
+}
+
+message GetClusterStatusResponse {
+  ResponseMeta meta = 1;
+  ClusterStatusRecord status = 2;
+}
+
+message ListClusterMembersRequest {
+  RequestMeta meta = 1;
+}
+
+message ListClusterMembersResponse {
+  ResponseMeta meta = 1;
+  repeated ClusterMemberRecord members = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Consensus (K6, planning/v0.6 02 K6.MR1/K6.MR3 / 05 K6.M1, ADR-046/047)
+// ---------------------------------------------------------------------------
+
+// Propose one single-server membership change (AddMember | RemoveMember).
+// Admin-authorized (K6.MR4.1: admin grant + audit); handled by the leader —
+// a non-leader answers NOT_LEADER with a leader_hint (K6.LA1.1). The change
+// rides the raft log and takes effect on commit, restart-free (FR-MEM-005).
+message ProposeClusterMemberChangeRequest {
+  RequestMeta meta = 1;
+  ClusterMemberChangeSpec change = 2;
+}
+
+message ProposeClusterMemberChangeResponse {
+  ResponseMeta meta = 1;
+  // Echoed change id (idempotency key; replays return the existing outcome).
+  string change_id = 2;
+  // "committed" | "pending" (proposed, awaiting quorum commit).
+  string outcome = 3;
+}
+
+// Read-only consensus status (voter set, term, commit/apply indices, leader
+// lease validity). Authorization-filtered like every other surface
+// (THR-K6-09 — no membership existence leakage to unauthorized principals).
+message GetConsensusStatusRequest {
+  RequestMeta meta = 1;
+}
+
+message GetConsensusStatusResponse {
+  ResponseMeta meta = 1;
+  ConsensusStatusRecord status = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Service surface (§35.8 — complete v1 surface; frozen)
+// ---------------------------------------------------------------------------
+
+service AgentOSKernel {
+  // Connection bootstrap; must be the first AgentOSKernel RPC (§35.6).
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  rpc GetKernelStatus(GetKernelStatusRequest) returns (GetKernelStatusResponse);
+  rpc DrainKernel(DrainKernelRequest) returns (OperationResponse);
+
+  rpc CreateRealm(CreateRealmRequest) returns (CreateRealmResponse);
+  rpc InspectRealm(InspectRealmRequest) returns (InspectRealmResponse);
+  rpc DestroyRealm(DestroyRealmRequest) returns (OperationResponse);
+
+  rpc SpawnProcess(SpawnProcessRequest) returns (SpawnProcessResponse);
+  rpc InspectProcess(InspectProcessRequest) returns (InspectProcessResponse);
+  rpc StopProcess(StopProcessRequest) returns (OperationResponse);
+  rpc KillProcess(KillProcessRequest) returns (OperationResponse);
+
+  rpc SubmitActivity(SubmitActivityRequest) returns (SubmitActivityResponse);
+  rpc InspectActivity(InspectActivityRequest) returns (InspectActivityResponse);
+  rpc WaitActivity(WaitActivityRequest) returns (WaitActivityResponse);
+  rpc CancelActivity(CancelActivityRequest) returns (OperationResponse);
+
+  rpc RequestResource(RequestResourceRequest) returns (RequestResourceResponse);
+  rpc InspectLease(InspectLeaseRequest) returns (InspectLeaseResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (OperationResponse);
+
+  rpc OpenChannel(OpenChannelRequest) returns (OpenChannelResponse);
+  rpc SendChannel(SendChannelRequest) returns (SendChannelResponse);
+  rpc ReceiveChannel(ReceiveChannelRequest) returns (ReceiveChannelResponse);
+  rpc CloseChannel(CloseChannelRequest) returns (OperationResponse);
+
+  rpc CreateSupervisor(CreateSupervisorRequest) returns (CreateSupervisorResponse);
+  rpc AttachSupervisorChild(AttachSupervisorChildRequest) returns (OperationResponse);
+  rpc InspectSupervisorTree(InspectSupervisorTreeRequest) returns (InspectSupervisorTreeResponse);
+
+  rpc CreateCancellationToken(CreateCancellationTokenRequest) returns (CreateCancellationTokenResponse);
+  rpc RequestCancellation(RequestCancellationRequest) returns (OperationResponse);
+  rpc CredentialUse(CredentialUseRequest) returns (CredentialUseResponse);
+
+  rpc CreatePrincipal(CreatePrincipalRequest) returns (CreatePrincipalResponse);
+  rpc SetPrincipalState(SetPrincipalStateRequest) returns (OperationResponse);
+  rpc BindTransportIdentity(BindTransportIdentityRequest) returns (OperationResponse);
+  rpc RevokeTransportIdentity(RevokeTransportIdentityRequest) returns (OperationResponse);
+  rpc CreateGrant(CreateGrantRequest) returns (CreateGrantResponse);
+  rpc RevokeGrant(RevokeGrantRequest) returns (OperationResponse);
+  rpc ResolveQuarantine(ResolveQuarantineRequest) returns (OperationResponse);
+
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  rpc RegisterFactConsumer(RegisterFactConsumerRequest) returns (RegisterFactConsumerResponse);
+  rpc CommitFactCursor(CommitFactCursorRequest) returns (CommitFactCursorResponse);
+  rpc RevokeFactConsumer(RevokeFactConsumerRequest) returns (OperationResponse);
+  rpc WatchFacts(WatchFactsRequest) returns (stream WatchFactsResponse);
+  rpc WatchSnapshot(WatchSnapshotRequest) returns (stream SnapshotDelta);
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+
+  // K2 increments (planning/v0.2 07 K2.M1; feature-gated, NOT_SUPPORTED
+  // until the owning stage lands).
+  rpc ResizePtyProcess(ResizePtyRequest) returns (ResizePtyResponse);
+  rpc SubmitTurn(SubmitTurnRequest) returns (SubmitTurnResponse);
+  rpc CancelTurn(CancelTurnRequest) returns (CancelTurnResponse);
+  rpc ReparentProcess(ReparentProcessRequest) returns (ReparentProcessResponse);
+  rpc ListPrincipalUsage(ListPrincipalUsageRequest) returns (ListPrincipalUsageResponse);
+  rpc GetArtifact(GetArtifactRequest) returns (stream ArtifactChunk);
+  // K3 increments (planning/v0.3 05 K3.SC1; feature-gated NOT_SUPPORTED /
+  // FeatureDisabled until enabled — planning/v0.3 02 K3.TS1).
+  rpc RegisterRemoteWorker(RegisterRemoteWorkerRequest) returns (RegisterRemoteWorkerResponse);
+  rpc RequestWorkerCheckpoint(RequestWorkerCheckpointRequest) returns (RequestWorkerCheckpointResponse);
+  // K4 increments (planning/v0.4 01 K4.C5 / 02 K4.Q6 / 03 K4.S5; feature-
+  // gated NOT_SUPPORTED until the owning config enables them).
+  rpc AckChannel(AckChannelRequest) returns (AckChannelResponse);
+  rpc RegisterCompensationPlan(RegisterCompensationPlanRequest) returns (RegisterCompensationPlanResponse);
+  rpc RevokeCompensationPlan(RevokeCompensationPlanRequest) returns (OperationResponse);
+  rpc ListCompensationPlans(ListCompensationPlansRequest) returns (ListCompensationPlansResponse);
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+  rpc InspectTenant(InspectTenantRequest) returns (InspectTenantResponse);
+  rpc UpdateTenantQuota(UpdateTenantQuotaRequest) returns (UpdateTenantQuotaResponse);
+  rpc DestroyTenant(DestroyTenantRequest) returns (OperationResponse);
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+  rpc ListTenantUsage(ListTenantUsageRequest) returns (ListTenantUsageResponse);
+  rpc ResizeLease(ResizeLeaseRequest) returns (ResizeLeaseResponse);
+  rpc ProposeDefrag(ProposeDefragRequest) returns (ProposeDefragResponse);
+  rpc ConsentDefrag(ConsentDefragRequest) returns (ConsentDefragResponse);
+  rpc ExecuteDefrag(ExecuteDefragRequest) returns (ExecuteDefragResponse);
+  rpc CreateCandidateRealm(CreateCandidateRealmRequest) returns (CreateCandidateRealmResponse);
+  rpc BootCandidate(BootCandidateRequest) returns (BootCandidateResponse);
+  rpc ProbeCandidate(ProbeCandidateRequest) returns (ProbeCandidateResponse);
+  rpc TerminateCandidate(TerminateCandidateRequest) returns (TerminateCandidateResponse);
+  rpc SwitchRootRoute(SwitchRootRouteRequest) returns (SwitchRootRouteResponse);
+  rpc RevertRootRoute(RevertRootRouteRequest) returns (RevertRootRouteResponse);
+  // K5 increments (planning/v0.5 05 K5.M1, 03 K5.XC3): read-only cluster
+  // views. authorization-filtered like every other surface (THR-K5-09 —
+  // no membership/inventory existence leakage to unauthorized principals).
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+  rpc ListClusterMembers(ListClusterMembersRequest) returns (ListClusterMembersResponse);
+  // K6 increments (planning/v0.6 05 K6.M1, 02 K6.MR1/MR3): consensus plane.
+  // ProposeClusterMemberChange is admin-authorized and leader-handled
+  // (NOT_LEADER elsewhere, K6.LA1.1); GetConsensusStatus is a read-only
+  // authorization-filtered view.
+  rpc ProposeClusterMemberChange(ProposeClusterMemberChangeRequest) returns (ProposeClusterMemberChangeResponse);
+  rpc GetConsensusStatus(GetConsensusStatusRequest) returns (GetConsensusStatusResponse);
+}
