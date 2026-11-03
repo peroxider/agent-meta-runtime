@@ -653,6 +653,7 @@ class Reconciler:
                         "reconcile_id": rid,
                         "realm_id": self._realm_id,
                         "old_serving_revision": serving_revision,
+                        "old_realized_revision": realized_revision,
                         "new_serving_revision": 0,
                     },))
             except Exception as exc:  # noqa: BLE001 - drain failure degrades
@@ -773,6 +774,7 @@ class Reconciler:
                         "reconcile_id": rid,
                         "realm_id": self._realm_id,
                         "old_serving_revision": obs.serving_revision,
+                        "old_realized_revision": obs.realized_revision,
                         "new_serving_revision": obs.desired_revision,
                     },))
             except Exception as exc:  # noqa: BLE001 - drain failure degrades

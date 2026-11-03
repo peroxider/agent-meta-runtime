@@ -26,7 +26,7 @@ from ..domain.context_contract import context_profile_references, policy_schema_
 from ..domain.provider_profile import load_profile
 
 RESOLVED_CONTRACT_VERSIONS = {
-    "public_api": "1.9.0", "harness_contract": "1.1.0", "capability_contract": "1.0.0",
+    "public_api": "1.15.0", "harness_contract": "1.1.0", "capability_contract": "1.1.0",
 }
 
 
@@ -242,6 +242,8 @@ def validate_harness_package(
                         raise _Invalid("unknown effect or permission")
                 if operation.get("idempotency") not in ("PURE", "KEYED", "NONE") or operation.get("retry_semantics") not in ("NEVER", "SAME_KEY_TRANSIENT"):
                     raise _Invalid("operation retry/idempotency contract")
+                from ..domain.resource_contract import validate_resource_operation
+                validate_resource_operation(operation)
             for field in ("provides", "requires"):
                 interfaces = descriptor.get(field, [])
                 if not isinstance(interfaces, list) or not all(isinstance(item, dict) for item in interfaces):
