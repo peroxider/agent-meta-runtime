@@ -310,6 +310,29 @@ def operator_signing_authority(data_dir: Path, *, allow_insecure: bool = False):
     return dict(operator), sign
 
 
+def verify_bootstrap_credentials(data_dir: Path, *, expected_operator, expected_identities, allow_insecure=False):
+    """Verify restored/reopened signing material without returning private bytes."""
+    from .crypto import Ed25519KeyPair
+
+    if (not isinstance(expected_operator,dict) or not isinstance(expected_identities,dict)
+            or set(expected_identities) != {"root", "service"}
+            or any(not isinstance(identity,dict) for identity in expected_identities.values())):
+        raise StableError(code=ErrorCode.KEY_UNAVAILABLE, message="committed bootstrap identities are invalid")
+    store, handles = open_key_store(data_dir, allow_insecure=allow_insecure)
+    operator = json.loads((Path(data_dir) / "keys/store.json").read_bytes())["operator"]
+    if operator != expected_operator or set(expected_identities) != {"root", "service"}:
+        raise StableError(code=ErrorCode.KEY_UNAVAILABLE, message="operator metadata differs from committed bootstrap identity")
+    for name, handle in handles.items():
+        with store.get_for_scoped_use(handle, purpose=f"{name}.ed25519") as material:
+            if len(material) != 32:
+                raise StableError(code=ErrorCode.KEY_UNAVAILABLE, message="signing credential has invalid size")
+            public_key = Ed25519KeyPair.from_private_bytes(bytes(material)).public_bytes_raw().hex()
+            identity = expected_identities[name]
+            if identity.get("algorithm") != "Ed25519" or identity.get("public_key_hex") != public_key:
+                raise StableError(code=ErrorCode.KEY_UNAVAILABLE, message="signing credential differs from committed public identity")
+    return store.profile, dict(handles)
+
+
 def service_signing_authority(data_dir: Path, *, expected_public_key: bytes, allow_insecure: bool = False):
     """Kernel-only scoped Service signer; does not read the Root private key."""
     from .crypto import Ed25519KeyPair

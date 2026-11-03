@@ -9,6 +9,7 @@ written to ``result.jcs`` — never to stdout, which is capture-only.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -58,6 +59,9 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: worker_entry <request_dir> <expected_payload_hash>", file=sys.stderr)
         return 2
+    if os.name == 'nt':
+        from ..owned_worker import join_owner_job
+        join_owner_job(os.environ.get('AGENT_META_PORTABLE_JOB'))
     request_dir = Path(argv[0])
     expected_hash = argv[1]
     raw = (request_dir / "request.jcs").read_bytes()

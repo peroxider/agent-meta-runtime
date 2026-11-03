@@ -69,6 +69,7 @@ class PortableBackend:
         self._poll_interval_s = poll_interval_s
         self._closed_sessions: set[str] = set()
         self._children: dict[str, subprocess.Popen] = {}
+        self._jobs: dict[str, Any] = {}
 
     # -- capabilities / session -------------------------------------------------
     def capabilities(self) -> dict[str, Any]:
@@ -133,7 +134,7 @@ class PortableBackend:
             workspace_relpath=str(request_dir.relative_to(self._data_dir)),
         )
         env["AGENT_META_LAUNCH_NONCE"] = nonce.hex()
-        argv = [python, "-m", worker_entry.__name__, str(request_dir), expected_hash]
+        argv = [python, "-I", "-m", worker_entry.__name__, str(request_dir), expected_hash]
         kwargs: dict[str, Any] = {
             "cwd": str(request_dir),
             "env": env,
@@ -142,19 +143,24 @@ class PortableBackend:
             "stderr": subprocess.DEVNULL,
         }
         if os.name == "nt":  # pragma: no cover - exercised on Windows
-            kwargs["creationflags"] = subprocess.CREATE_SUSPENDED
-            proc = subprocess.Popen(argv, **kwargs)
-            _assign_job_object(proc.pid)
-            import ctypes
-
-            ctypes.windll.kernel32.ResumeThread(  # type: ignore[attr-defined]
-                proc._handle  # type: ignore[attr-defined]
-            )
+            from ..owned_worker import OwnedWindowsJob
+            job = OwnedWindowsJob(kind='portable')
+            env['AGENT_META_PORTABLE_JOB'] = job.name
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            try:
+                proc = subprocess.Popen(argv, **kwargs)
+            except BaseException:
+                job.close()
+                raise
+            # Actual venv Python can have a different PID from Popen's
+            # redirector. Its fixed entrypoint joins before reading a request.
+            self._jobs[request_dir.name] = job
         else:
             proc = subprocess.Popen(argv, start_new_session=True, **kwargs)
         return proc
 
     async def submit(self, request: eb.ExecutionRequest) -> eb.ExecutionHandle:
+        self._reap_jobs()
         self._validate_request(request)
         if not request.session_id or request.session_id in self._closed_sessions:
             raise StableError(
@@ -227,6 +233,13 @@ class PortableBackend:
         while True:
             claim = worker.read_claim(request_dir)
             if claim is not None and claim.get("nonce_hash") == expected_nonce_hash:
+                if os.name == 'nt':
+                    job = self._jobs.get(request_id)
+                    actual_pid = claim.get('pid')
+                    if (job is None or type(actual_pid) is not int or not job.contains(actual_pid)):
+                        if worker.read_result(request_dir) is not None:
+                            return
+                        raise StableError(code=ErrorCode.INTEGRITY_ERROR, message='Portable worker did not establish owned Job membership')
                 self._ledger.mark_claimed(
                     request_id,
                     worker_pid=claim.get("pid", pid),
@@ -237,6 +250,12 @@ class PortableBackend:
                 break
             if worker.read_result(request_dir) is not None:
                 return  # fast-path: worker finished before claim was observed
+            child = self._children.get(request_id)
+            if child is not None and child.poll() is not None:
+                job = self._jobs.pop(request_id, None)
+                if job is not None:
+                    job.close()
+                raise StableError(code=ErrorCode.BACKEND_UNAVAILABLE, message='Portable worker exited before establishing its claim')
             if asyncio.get_running_loop().time() > deadline:
                 return  # recovery path classifies the abandoned claim later
             await asyncio.sleep(self._poll_interval_s)
@@ -349,10 +368,25 @@ class PortableBackend:
         assert current is not None
         if current["state"] == "TERMINAL":
             result_status = self._record_to_snapshot(current, request.handle).terminal.status
+            confirmed, details = True, {}
+            job = self._jobs.get(record['request_id'])
+            if job is not None:
+                try:
+                    if job.active_processes:
+                        job.terminate()
+                    child = self._children.get(record['request_id'])
+                    confirmed = job.wait_empty(cancellation.TERM_WAIT_S, child.poll if child else None)
+                    if confirmed:
+                        job.close()
+                        self._jobs.pop(record['request_id'], None)
+                    else:
+                        details = {'reason':'OWNED_TREE_EXIT_UNCONFIRMED'}
+                except OSError:
+                    confirmed, details = False, {'reason':'OWNED_TREE_EXIT_UNCONFIRMED'}
             return eb.CancelReport(
                 status=result_status or current["state"],
-                terminal_confirmed=True,
-                details_jcs=canonical_json({}),
+                terminal_confirmed=confirmed,
+                details_jcs=canonical_json(details),
             )
         pid = current["worker_pid"]
         identity = current["worker_start_identity"]
@@ -364,10 +398,21 @@ class PortableBackend:
                 str(identity),
                 mode=request.mode or "GRACEFUL",
                 reap=child.poll if child is not None else None,
+                windows_job=self._jobs.get(record['request_id']),
             )
         else:
             # Never claimed: safe to classify as cancelled without a worker.
+            job = self._jobs.pop(record['request_id'], None)
+            if job is not None:
+                # Closing prevents a still-bootstrapping fixed entrypoint from
+                # joining/reading its request, and kills any joined members.
+                job.close()
             confirmed, details = True, {"steps": ["no_claim"]}
+            if child is not None:
+                try:
+                    await asyncio.to_thread(child.wait, timeout=cancellation.TERM_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    confirmed = False
         if child is not None:
             try:
                 child.wait(timeout=1)
@@ -492,25 +537,16 @@ class PortableBackend:
         return eb.AckReport(status="ACKNOWLEDGED", retained_until_us=retained)
 
     async def close_session(self, session: eb.BackendSession) -> eb.CloseReport:
+        self._reap_jobs()
         self._closed_sessions.add(session.session_id)
         return eb.CloseReport(
             status="CLOSED", session_id=session.session_id, closed_at_us=self._clock()
         )
 
-
-def _assign_job_object(pid: int) -> None:  # pragma: no cover - Windows only
-    """Assign a (suspended) child to a kill-on-close Job Object (§41.48.3)."""
-
-    import ctypes
-
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    job = kernel32.CreateJobObjectW(None, None)
-    info = ctypes.create_string_buffer(144)
-    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION: LimitFlags (0x2000 =
-    # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) sits at offset 64 bytes.
-    struct_ptr = ctypes.cast(info, ctypes.POINTER(ctypes.c_uint64))
-    struct_ptr[8] = 0x2000
-    kernel32.SetInformationJobObject(job, 9, info, ctypes.sizeof(info))
-    handle = kernel32.OpenProcess(0x1F0FFF, False, pid)
-    kernel32.AssignProcessToJobObject(job, handle)
-    kernel32.CloseHandle(handle)
+    def _reap_jobs(self):
+        for request_id, job in tuple(self._jobs.items()):
+            child = self._children.get(request_id)
+            if job.active_processes == 0 and child is not None and child.poll() is not None:
+                job.close()
+                self._jobs.pop(request_id, None)
+                self._children.pop(request_id, None)

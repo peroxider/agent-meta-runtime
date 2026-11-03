@@ -46,6 +46,8 @@ _DROP_ENV_PREFIXES = (
     "ANTHROPIC_",
 )
 _DROP_ENV_KEYS = {
+    "SYSTEMROOT",
+    "WINDIR",
     "HOME",
     "PYTHONPATH",
     "PYTHONSTARTUP",
@@ -123,9 +125,23 @@ def build_worker_env(
         "AGENT_META_REQUEST_ID": request_id,
         "AGENT_META_WORKSPACE": workspace_relpath,
     }
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetWindowsDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+        kernel.GetWindowsDirectoryW.restype = wintypes.UINT
+        directory = ctypes.create_unicode_buffer(32768)
+        length = kernel.GetWindowsDirectoryW(directory, len(directory))
+        if not 0 < length < len(directory):
+            raise StableError(code=ErrorCode.FAILED_PRECONDITION, message='Windows system directory is unavailable')
+        # Winsock provider loading needs the OS directory even in a minimal
+        # environment. Query it from Windows rather than accept an override.
+        env['SystemRoot'] = env['WINDIR'] = directory.value
     for key, value in (allowlist or {}).items():
-        if key in _DROP_ENV_KEYS or key.startswith(_DROP_ENV_PREFIXES) or any(
-            key.endswith(s) for s in _DROP_ENV_SUFFIXES
+        normalized = key.upper()
+        if normalized in _DROP_ENV_KEYS or normalized.startswith(_DROP_ENV_PREFIXES) or any(
+            normalized.endswith(s) for s in _DROP_ENV_SUFFIXES
         ):
             raise StableError(
                 code=ErrorCode.INVALID_ARGUMENT,

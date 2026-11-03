@@ -12,11 +12,12 @@ import re
 import signal
 import select
 import sys
+import time
 import uuid
 
 from .windows_security import owner_security_descriptor
 
-_NAME = re.compile(r"Local\\agent-meta-provider-[0-9a-f]{32}\Z")
+_NAME = re.compile(r"Local\\agent-meta-(?:provider|scratch|portable)-[0-9a-f]{32}\Z")
 
 
 class _BasicLimits(ctypes.Structure):
@@ -42,6 +43,12 @@ class _SecurityAttributes(ctypes.Structure):
         ("bInheritHandle", wintypes.BOOL)]
 
 
+class _Accounting(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_int64) for name in ('TotalUserTime','TotalKernelTime',
+        'ThisPeriodTotalUserTime','ThisPeriodTotalKernelTime')] + [(name, wintypes.DWORD)
+        for name in ('TotalPageFaultCount','TotalProcesses','ActiveProcesses','TotalTerminatedProcesses')]
+
+
 def _kernel():
     if os.name != "nt":
         raise OSError("Windows worker ownership is unavailable")
@@ -63,15 +70,19 @@ def _kernel():
     kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateJobObject.restype = wintypes.BOOL
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel.WaitForSingleObject.restype = wintypes.DWORD
     return kernel
 
 
 class OwnedWindowsJob:
-    def __init__(self):
+    def __init__(self, *, kind='provider'):
+        if kind not in ('provider','scratch','portable'):
+            raise ValueError('invalid fixed worker kind')
         kernel = self._kernel = _kernel()
-        self.name = "Local\\agent-meta-provider-" + uuid.uuid4().hex
+        self.name = "Local\\agent-meta-" + kind + '-' + uuid.uuid4().hex
         self._handle = None
         with owner_security_descriptor(directory=False, access="GA") as descriptor:
             attrs = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
@@ -117,6 +128,30 @@ class OwnedWindowsJob:
                 raise ctypes.WinError(ctypes.get_last_error())
             self._handle = None
 
+    @property
+    def active_processes(self):
+        if self._handle is None:
+            raise OSError('worker Job is closed')
+        observed = _Accounting()
+        if not self._kernel.QueryInformationJobObject(self._handle, 1, ctypes.byref(observed), ctypes.sizeof(observed), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return observed.ActiveProcesses
+
+    def terminate(self):
+        if self._handle is None or not self._kernel.TerminateJobObject(self._handle, 1):
+            raise OSError('owned worker Job termination failed')
+
+    def wait_empty(self, timeout_s, reap=None):
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if reap is not None:
+                reap()
+            if self.active_processes == 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(.02)
+
     def __enter__(self):
         return self
 
@@ -143,7 +178,7 @@ def join_owner_job(name):
             raise ctypes.WinError(ctypes.get_last_error())
 
 
-def establish_owner_lifetime(*, parent_pid, job_name=None):
+def establish_owner_lifetime(*, parent_pid, job_name=None, group_supervisor=False):
     """Must succeed before a fixed Runtime worker receives its request."""
     if type(parent_pid) is not int or parent_pid <= 0:
         raise OSError("invalid worker parent identity")
@@ -152,10 +187,17 @@ def establish_owner_lifetime(*, parent_pid, job_name=None):
     elif sys.platform.startswith("linux"):
         if job_name is not None or os.getppid() != parent_pid:
             raise OSError("worker parent is no longer present")
+        if group_supervisor:
+            if os.getpgrp()!=os.getpid():
+                raise OSError('worker supervisor is not its process-group leader')
+            # Only the fixed supervisor calls this branch; no user code runs
+            # in it. Its still-live identity owns the group, so cleanup never
+            # targets a group selected from a recycled PID.
+            signal.signal(signal.SIGTERM,lambda *_: os.killpg(os.getpid(),signal.SIGKILL))
         library = ctypes.CDLL(None, use_errno=True)
         library.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
         library.prctl.restype = ctypes.c_int
-        if library.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        if library.prctl(1, signal.SIGTERM if group_supervisor else signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
             raise OSError(ctypes.get_errno(), "worker parent lifetime guard failed")
         if os.getppid() != parent_pid:
             raise OSError("worker parent changed before lifetime guard")
@@ -198,3 +240,12 @@ class WorkerProcessLifetime:
             else:
                 os.close(self._handle)
             self._handle = None
+
+    def signal(self, signum):
+        """Signal only the retained original Linux process, never a raw PID."""
+        if self._kernel is not None or self._handle is None or signum not in (signal.SIGTERM,signal.SIGKILL):
+            raise OSError('retained process signaling unavailable')
+        try:
+            signal.pidfd_send_signal(self._handle,signum)
+        except ProcessLookupError:
+            pass

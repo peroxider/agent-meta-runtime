@@ -36,7 +36,8 @@ class MemoryHostActivities:
             raise StableError(code=ErrorCode.AUTHORITY_DENIED, message="unregistered Host activity request")
         audit = self.trust.verifier.verify(bytes(request.authority_token), request_id=request.request_id,
             request_payload_hash=request.payload_hash, binding=pending["binding"], now_us=now_us())
-        pending["audit"] = self.store.authorize_backend(pending["task"], request.request_id, pending["capability_id"], audit)
+        pending["audit"] = self.store.authorize_backend(pending["task"], request.request_id, pending["capability_id"], audit,
+            expected_action_id=pending['binding'].action_id, expected_operation_id=pending['operation_id'])
 
     async def _execute(self, request):
         pending = self._pending[request.request_id]
@@ -63,7 +64,7 @@ class MemoryHostActivities:
         if expires <= current:
             raise StableError(code=ErrorCode.DEADLINE_EXCEEDED, message="Host execution authorization has expired")
         binding = ExecutionTokenBinding(self.session.session_id, task.realm_id, self.epoch_id, task.actor_id,
-            task.root_action_id, "model.invoke" if kind == "MODEL" else "none",
+            self.store.activity_action(task, invocation_id, capability_id, operation['operation_id']), "model.invoke" if kind == "MODEL" else "none",
             sha256_hex(canonical_json({"capability_id": capability_id, "operation_id": operation["operation_id"]})),
             {"calls": 1, "cost_microunits": 0}, frozenset({"model.invoke" if kind == "MODEL" else "capability.invoke", *operation["required_permissions"]}), task.deadline_at_us)
         payload = {"token_version": 1, "token_id": new_uuid7(), "backend_session_id": binding.backend_session_id,
@@ -78,7 +79,8 @@ class MemoryHostActivities:
             deadline_at_us=task.deadline_at_us or 0,
             authority_token=issue_execution_token(payload, service_principal_id=self.trust.service_principal_id, signer=self.signer))
         self._pending[invocation_id] = {"task": task, "binding": binding, "capability_id": capability_id,
-            "content": content, "payload_hash": request.payload_hash, "operation_kind": request.operation_kind, "execute": execute}
+            "content": content, "payload_hash": request.payload_hash, "operation_kind": request.operation_kind,
+            "operation_id": operation['operation_id'], "execute": execute}
         handle = None
         try:
             # submit currently has no suspension before returning the actual

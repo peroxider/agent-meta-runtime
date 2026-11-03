@@ -8,6 +8,7 @@ profile, protected store, request, firm reservation and original-wire billing.
 from dataclasses import replace
 import ipaddress
 import json
+import ssl
 
 from ..domain.canonical import now_us
 from ..domain.errors import ErrorCode, StableError
@@ -27,10 +28,18 @@ from .store.provider_accounting import read_provider
 from .store.provider_admission import frozen_configuration
 
 
+def validate_test_tls_anchor(raw):
+    try:
+        if type(raw) is not bytes or not 0 < len(raw) <= 65536:
+            raise ValueError('test anchor size')
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=raw.decode('ascii'))
+    except (ValueError,UnicodeError,ssl.SSLError):
+        raise StableError(code=ErrorCode.INVALID_ARGUMENT,message='controlled Provider test TLS anchor is invalid') from None
+
+
 class ControlledConfiguredProviderHost:
     def __init__(self, store, *, data_dir, trust, epoch_id, signer, test_ca_pem, allow_insecure=False):
-        if type(test_ca_pem) is not bytes or not 0 < len(test_ca_pem) <= 65536:
-            raise StableError(code=ErrorCode.INVALID_ARGUMENT,message='controlled Provider requires an explicit bounded test TLS anchor')
+        validate_test_tls_anchor(test_ca_pem)
         self.store,self.data_dir,self.trust = store,data_dir,trust
         self.epoch_id,self.signer = epoch_id,signer
         self._ca,self._allow_insecure = test_ca_pem,allow_insecure

@@ -10,6 +10,7 @@ from ..domain.canonical import now_us
 from ..domain.errors import ErrorCode, StableError
 from ..domain.execution_tokens import ExecutionTokenBinding, MAX_TOKEN_TTL_US, issue_execution_token
 from ..domain.ids import new_uuid7
+from ..domain.provider_accounting import ProviderTerminalObservation
 from ..ports.host_execution import HostCallValue
 from ..ports.provider_transport import ProviderWorkerInterrupted
 
@@ -70,7 +71,8 @@ class ProviderHostCalls:
                 value = HostCallValue(error_code=ErrorCode.INVALID_RESULT, raise_error=True)
         receipt = self.store.finish_invocation(invocation_id, content=value.content, error=value.error_code,
             usage=dict(value.usage) if value.usage is not None else None,
-            provider_outcome="CONFIRMED" if outcome.state == "RESPONSE" else outcome.state)
+            provider_outcome="CONFIRMED" if outcome.state == "RESPONSE" else outcome.state,
+            provider_observation=ProviderTerminalObservation(outcome.state,outcome.error_code,outcome.http_status,outcome.retry_after_us))
         if interrupted is not None:
             raise interrupted
         if receipt.get("provider_overrun"):

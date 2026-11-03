@@ -69,12 +69,44 @@ def nonce_hash(nonce: bytes) -> str:
 
 
 def process_start_identity(pid: int) -> str | None:
-    """OS process-start identity (Linux: ``starttime`` from /proc).
+    """OS process-start identity (Linux ticks / Windows creation FILETIME).
 
     Returns ``None`` when the process does not exist; used together with the
     PID to detect PID reuse before any signal is sent.
     """
 
+    if type(pid) is not int or pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        process = kernel.OpenProcess(0x100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+        if not process:
+            return None
+        try:
+            # GetProcessTimes' exit FILETIME is undefined for a live process.
+            # Use the retained process object's signalled state, not a PID or
+            # a possibly still-open handle, to establish liveness.
+            if kernel.WaitForSingleObject(process, 0) != 258:  # WAIT_TIMEOUT
+                return None
+            created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+            if not kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                    ctypes.byref(system), ctypes.byref(user)):
+                return None
+            value = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return str(value) if value else None
+        finally:
+            kernel.CloseHandle(process)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except (FileNotFoundError, ProcessLookupError, NotADirectoryError):

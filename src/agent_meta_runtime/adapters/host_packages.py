@@ -32,10 +32,11 @@ class BoundHarness:
 
 
 class InstalledHarnessCatalog:
-    def __init__(self, conn, *, cas, realm_id, service_id, run_command, validate_package):
+    def __init__(self, conn, *, cas, realm_id, service_id, run_command, validate_package, drain_resources=None):
         self.conn, self.cas, self.realm_id = conn, cas, realm_id
         self.service_id, self.run_command = service_id, run_command
         self.validate_package = validate_package
+        self.drain_resources = drain_resources
         self.bindings, self.loaders, self.instances = {}, {}, {}
         self.healthy = set()
         self.restore_outcomes = {}
@@ -208,24 +209,34 @@ class InstalledHarnessCatalog:
         return self.restore_outcomes.get(composition_id) is False
 
     async def drain(self, request):
-        old = request["old_serving_revision"]
-        if old == 0 or old == request["new_serving_revision"]:
+        # After a failed drain the serving pointer has already moved; the
+        # realized pointer still identifies the unretired generation. Preserve
+        # both when a later transition supersedes an incomplete one.
+        retiring = sorted({request["old_serving_revision"], request.get("old_realized_revision", 0)}
+            - {0, request["new_serving_revision"]})
+        if not retiring:
             return {}
-        row = self.conn.execute("SELECT composition_id FROM compositions WHERE realm_id=? AND revision=?", (self.realm_id, old)).fetchone()
-        if row is None:
-            return {}
-        composition_id = row[0]
+        compositions = []
+        for revision in retiring:
+            row = self.conn.execute("SELECT composition_id FROM compositions WHERE realm_id=? AND revision=?", (self.realm_id, revision)).fetchone()
+            if row is not None:
+                compositions.append(row[0])
         deadline = asyncio.get_running_loop().time() + 30
-        while self.conn.execute("SELECT 1 FROM tasks WHERE serving_composition_id=? AND status IN ('ACCEPTED','RUNNING') LIMIT 1", (composition_id,)).fetchone():
-            if asyncio.get_running_loop().time() >= deadline:
-                raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="old Harness still has live Tasks")
-            await asyncio.sleep(.02)
+        for composition_id in compositions:
+            while self.conn.execute("SELECT 1 FROM tasks WHERE serving_composition_id=? AND status IN ('ACCEPTED','RUNNING') LIMIT 1", (composition_id,)).fetchone():
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="old Harness still has live Tasks")
+                await asyncio.sleep(.02)
+            if self.drain_resources is not None:
+                await self.drain_resources(composition_id, request)
         def release(txn):
-            txn._conn.execute("UPDATE capability_instances SET status='RELEASED',updated_at_us=? WHERE composition_id=? AND realm_id=?", (txn.recorded_at_us, composition_id, self.realm_id))
+            for composition_id in compositions:
+                txn._conn.execute("UPDATE capability_instances SET status='RELEASED',updated_at_us=? WHERE composition_id=? AND realm_id=?", (txn.recorded_at_us, composition_id, self.realm_id))
             return {}
         self.run_command(release)
-        self.healthy = {key for key in self.healthy if key[0] != composition_id}
-        self.bindings.pop(composition_id, None)
+        self.healthy = {key for key in self.healthy if key[0] not in compositions}
+        for composition_id in compositions:
+            self.bindings.pop(composition_id, None)
         return {}
 
     def prepare_restart(self, instance_id):

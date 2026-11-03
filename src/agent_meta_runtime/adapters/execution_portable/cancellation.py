@@ -96,29 +96,26 @@ def _cancel_posix(
 
 
 def _cancel_windows(
-    request_dir: Path, pid: int, start_identity: str
+    request_dir: Path, pid: int, start_identity: str, windows_job=None, reap=None
 ) -> tuple[bool, dict[str, Any]]:  # pragma: no cover - exercised on Windows
     """Windows ladder: control cancel → TerminateJobObject (kill-on-close)."""
 
-    import ctypes
-
     steps: list[str] = []
+    if windows_job is None:
+        return False, {'steps':steps,'reason':'OWNED_JOB_UNAVAILABLE'}
+    if not _identity_alive(pid, start_identity) or not windows_job.contains(pid):
+        return windows_job.active_processes == 0, {'steps':steps,'reason':'WORKER_IDENTITY_UNAVAILABLE'}
     write_control_cancel(request_dir)
     steps.append("control_cancel")
-    if _wait_exit(pid, start_identity, GRACEFUL_WAIT_S):
+    if windows_job.wait_empty(GRACEFUL_WAIT_S, reap):
         return True, {"steps": steps}
-    PROCESS_TERMINATE = 0x0001
-    handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
-        PROCESS_TERMINATE, False, pid
-    )
-    if handle:
-        try:
-            if ctypes.windll.kernel32.TerminateJobObject(handle, 1):  # type: ignore[attr-defined]
-                steps.append("TerminateJobObject")
-                if _wait_exit(pid, start_identity, TERM_WAIT_S):
-                    return True, {"steps": steps}
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+    # The retained Job handle identifies this exact owned tree even if its
+    # original leader exited during the graceful wait. Never treat a process
+    # handle as a Job or choose another process from a reused PID.
+    windows_job.terminate()
+    steps.append('TerminateJobObject')
+    if windows_job.wait_empty(TERM_WAIT_S, reap):
+        return True, {'steps':steps}
     return False, {"steps": steps}
 
 
@@ -129,6 +126,7 @@ def cancel_process_tree(
     *,
     mode: str = "GRACEFUL",
     reap: Callable[[], None] | None = None,
+    windows_job=None,
 ) -> tuple[bool, dict[str, Any]]:
     """Run the cancellation ladder; returns ``(terminal_confirmed, details)``.
 
@@ -140,7 +138,10 @@ def cancel_process_tree(
     """
 
     if os.name == "nt":  # pragma: no cover - exercised on Windows
-        confirmed, details = _cancel_windows(request_dir, pid, start_identity)
+        try:
+            confirmed, details = _cancel_windows(request_dir, pid, start_identity, windows_job, reap)
+        except OSError:
+            confirmed, details = False, {'steps':[], 'reason':'OWNED_JOB_CONFIRMATION_UNAVAILABLE'}
     else:
         confirmed, details = _cancel_posix(request_dir, pid, start_identity, reap)
     if mode == "FORCE" and confirmed:
