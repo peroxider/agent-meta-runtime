@@ -16,6 +16,7 @@ from ...domain.context_contract import (ContextSnapshot, FrozenContextSource, bu
     context_document, context_profile_references, policy_schema_references)
 from ...domain.ids import new_uuid7
 from ...domain.provider_accounting import ProviderReservation
+from ...domain.context_tokenizer import context_tokenizer_descriptor, measured_count, MAX_RENDERED_CONTEXT_BYTES
 from ...ports.repositories import FactAppendRequest, OutboxRequest
 from ...domain.semantics import TASK_TERMINAL_STATUSES, TaskBudget
 from .authority import _GRANT_COLUMNS, _grant_from_row, _reserve_use_row
@@ -28,12 +29,13 @@ from .provider_admission import authorize_configuration
 
 
 class HostExecutionStore:
-    def __init__(self, conn, *, catalog, run_command, realm_id, service_id, profile_hash=TRUSTED_HOST_PROFILE_HASH, run_project=None, run_token=None):
+    def __init__(self, conn, *, catalog, run_command, realm_id, service_id, profile_hash=TRUSTED_HOST_PROFILE_HASH, run_project=None, run_token=None, context_tokenizer=None):
         self.conn, self.catalog, self.run_command = conn, catalog, run_command
         self.realm_id, self.service_id = realm_id, service_id
         self.profile_hash = profile_hash
         self.run_project = run_project or run_command
         self.run_token = run_token or run_command
+        self._context_tokenizer = context_tokenizer
 
     def stage(self, content):
         path = self.catalog.cas.put(content)
@@ -485,10 +487,25 @@ class HostExecutionStore:
 
     def save_projection(self, task, request):
         self.check(task.task_id)
-        expected = build_projection_input(task)
-        if request != expected:
+        if not isinstance(task.context, ContextSnapshot):
+            raise StableError(code=ErrorCode.FAILED_PRECONDITION, message='frozen Context profile is unavailable')
+        raw = dict(task.context.artifacts)
+        profile, _ = context_profile_references(raw[task.context.profile_artifact_id])
+        descriptor = context_document(raw[profile['tokenizer_artifact_id']])
+        tokenizer_id = context_tokenizer_descriptor(descriptor)
+        count = len
+        native = tokenizer_id != 'utf8-bytes/v1'
+        if native:
+            implementation = self._context_tokenizer
+            if (implementation is None or implementation.tokenizer_id != tokenizer_id
+                    or implementation.descriptor_content != canonical_json(descriptor)):
+                raise StableError(code=ErrorCode.FAILED_PRECONDITION, message='Root-owned Context tokenizer is unavailable')
+            count = lambda content: measured_count(implementation.count, content)
+        expected = build_projection_input(task, token_counter=count if native else None)
+        if request is not None and request != expected:
             raise StableError(code=ErrorCode.INVALID_RESULT, message="Context projection differs from its frozen policy and source snapshot")
-        if request.tokenizer_id != "utf8-bytes/v1" or request.budget_tokens > 1024 * 1024:
+        request = expected
+        if request.budget_tokens > 1024 * 1024:
             raise StableError(code=ErrorCode.FEATURE_UNAVAILABLE, message="unsupported Host tokenizer or context ceiling")
         # The complete ordered refs were independently reconstructed above;
         # a package cannot submit new live sources or invent their provenance.
@@ -500,13 +517,15 @@ class HostExecutionStore:
         stages = []
         for section in request.sections:
             section.content.decode("utf-8", errors="strict")
-            if section.token_count != len(section.content):
+            if section.token_count != count(section.content):
                 raise StableError(code=ErrorCode.INVALID_RESULT, message="projection token accounting differs from selected tokenizer")
             staged = self.stage(section.content)
             stages.append(staged)
             sections.append(Section(section.section_id, section.renderer_artifact_id, staged["artifact_id"], section.token_count))
         rendered = render_sections([section.content for section in request.sections])
-        total = len(rendered)  # includes delimiters, independently counted
+        if len(rendered) > MAX_RENDERED_CONTEXT_BYTES:
+            raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message='rendered Context exceeds byte ceiling')
+        total = count(rendered)  # includes delimiters, independently counted
         identity = {"task_id": task.task_id, "policy": request.policy_artifact_id, "sources": [dict(kind=r.kind, ref=r.ref, content_hash=r.content_hash) for r in request.source_refs],
             "sections": [dict(section_id=s.section_id, renderer_artifact_id=s.renderer_artifact_id, output_artifact_id=s.output_artifact_id, token_count=s.token_count) for s in sections],
             "redaction": request.redaction_policy_artifact_id, "tokenizer": request.tokenizer_id, "budget": request.budget_tokens}

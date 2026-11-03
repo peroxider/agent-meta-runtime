@@ -223,6 +223,20 @@ async def cmd_info(client: AgentMetaClient, args: argparse.Namespace) -> int:
 async def cmd_start(args: argparse.Namespace) -> int:
     from ..daemon import RuntimeDaemon
 
+    context_tokenizer = None
+    context_path = getattr(args, 'context_tokenizer_json', None)
+    if context_path is not None:
+        from ...adapters.context_tokenizer import load_glm53_context_tokenizer
+        from ...domain.context_tokenizer import GLM53_VOCABULARY_BYTES
+        try:
+            if not context_path.is_file() or context_path.is_symlink() or context_path.is_junction():
+                raise ValueError('ordinary tokenizer input required')
+            with context_path.open('rb') as stream:
+                raw = stream.read(GLM53_VOCABULARY_BYTES + 1)
+        except (OSError, ValueError):
+            raise StableError(code=ErrorCode.INVALID_ARGUMENT, message='native Context tokenizer input is unavailable') from None
+        context_tokenizer = load_glm53_context_tokenizer(raw)
+        raw = b''
     test_ca = None
     if args.controlled_provider_test_ca is not None:
         try:
@@ -242,11 +256,12 @@ async def cmd_start(args: argparse.Namespace) -> int:
     if args.dry_run:
         return _emit_result(args, {"dry_run": True, "data_dir": str(args.data_dir.resolve()),
                                   "foreground": True, "trusted_publishers": sorted(args.trusted_publisher),
-                                  "provider_execution": "CONTROLLED_TEST_ONLY" if test_ca is not None else "UNAVAILABLE"})
+                                  "provider_execution": "CONTROLLED_TEST_ONLY" if test_ca is not None else "UNAVAILABLE",
+                                  **({'context_tokenizer': context_tokenizer.tokenizer_id} if context_tokenizer is not None else {})})
     daemon = RuntimeDaemon(args.data_dir, config_path=args.config,
         allow_insecure_credentials=args.insecure_dev_credential_file,
         trusted_publishers=args.trusted_publisher, execution_backend=args.execution_backend,
-        controlled_provider_test_ca=test_ca)
+        controlled_provider_test_ca=test_ca, context_tokenizer=context_tokenizer)
     try:
         status = await daemon.start()
         _emit_result(args, status)
@@ -819,6 +834,8 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--config", type=Path, default=None)
     start.add_argument("--trusted-publisher", action="append", default=[], help="explicitly trusted publisher SHA-256 fingerprint")
     start.add_argument("--execution-backend", choices=("trusted_in_process", "in_memory"), default=None, help="select the Host execution backend; overrides execution.host_backend")
+    start.add_argument('--context-tokenizer-json', type=Path, default=None,
+        help='explicit pinned GLM tokenizer JSON for local Context text counting; requires the optional native engine')
     start.add_argument("--controlled-provider-test-ca", type=Path, default=None,
         help="explicit native test mode: TLS CA file for loopback-only Provider execution with TEST prices; never real Provider support")
     start.set_defaults(func=cmd_start)

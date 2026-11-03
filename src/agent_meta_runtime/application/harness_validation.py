@@ -23,10 +23,11 @@ from ..domain.harness import (
 from ..domain.harness_source import audit_harness_sources
 from ..domain.ids import validate_id
 from ..domain.context_contract import context_profile_references, policy_schema_references
+from ..domain.context_tokenizer import context_tokenizer_descriptor
 from ..domain.provider_profile import load_profile
 
 RESOLVED_CONTRACT_VERSIONS = {
-    "public_api": "1.15.0", "harness_contract": "1.1.0", "capability_contract": "1.1.0",
+    "public_api": "1.16.0", "harness_contract": "1.1.0", "capability_contract": "1.1.0",
 }
 
 
@@ -176,6 +177,7 @@ def validate_harness_package(
                         profile, refs = context_profile_references(read(context_ref))
                         for ref in refs:
                             reference("context_resource", ref)
+                        context_tokenizer_descriptor(json.loads(read(profile['tokenizer_artifact_id'])))
                         policy, schemas = policy_schema_references(read(profile["policy_artifact_id"]))
                         for ref in schemas:
                             reference("context_normalizer", ref)

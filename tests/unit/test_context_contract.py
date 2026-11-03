@@ -20,11 +20,11 @@ def ref(raw):
     return "artifact://sha256/" + sha256_hex(raw)
 
 
-def task_fixture(*, value=None, facts=(), budget=2048, overflow="REJECT", operations=()):
+def task_fixture(*, value=None, facts=(), budget=2048, overflow="REJECT", operations=(), tokenizer_descriptor=None):
     profile, artifacts = build_context_artifacts(input_schema={"type": "object", "required": ["value"],
         "properties": {"value": {"type": "string"}, "password": {"type": "string"}}, "additionalProperties": False},
         selected_operation_ids=[op["operation_id"] for op in operations], provider_id="test", budget_tokens=budget,
-        input_overflow=overflow)
+        input_overflow=overflow, tokenizer_descriptor=tokenizer_descriptor)
     artifacts = dict(artifacts)
     for operation in operations:
         for direction in ("input", "output"):

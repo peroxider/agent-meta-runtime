@@ -6,7 +6,8 @@ from ..domain.context_contract import (
     policy_schema_references, rendered_sections,
 )
 from ..domain.context_projection import SECTION_DELIMITER
+from ..domain.context_tokenizer import glm53_context_tokenizer_descriptor
 
 __all__ = ["ContextSnapshot", "FrozenContextSource", "SECTION_IDS", "SECTION_DELIMITER",
     "build_context_artifacts", "build_projection_input", "context_document", "context_profile_references",
-    "policy_schema_references", "rendered_sections"]
+    "policy_schema_references", "rendered_sections", "glm53_context_tokenizer_descriptor"]

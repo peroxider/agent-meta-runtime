@@ -55,7 +55,7 @@ from .local_api.staging import ChunkedStaging
 class RuntimeDaemon:
     def __init__(self, data_dir: Path, *, config_path: Path | None = None,
                  allow_insecure_credentials: bool = False, trusted_publishers=(), execution_backend=None,
-                 controlled_provider_test_ca: bytes | None = None):
+                 controlled_provider_test_ca: bytes | None = None, context_tokenizer=None):
         self.data_dir = Path(data_dir).resolve()
         self.instance_id = uuid.uuid4().hex
         self._config_path = config_path
@@ -67,6 +67,7 @@ class RuntimeDaemon:
         if controlled_provider_test_ca is not None and (type(controlled_provider_test_ca) is not bytes or not 0 < len(controlled_provider_test_ca) <= 65536):
             raise StableError(code=ErrorCode.INVALID_ARGUMENT,message='controlled Provider test anchor is invalid')
         self._provider_test_ca = controlled_provider_test_ca
+        self._context_tokenizer = context_tokenizer
         self._providers = None
         self._scratch = None
         if not all(isinstance(item, str) and len(item) == 64 and set(item) <= set("0123456789abcdef") for item in trusted_publishers):
@@ -164,7 +165,8 @@ class RuntimeDaemon:
                 run_command=lambda mutator: self._run_control(mutator, permission="task.execute"),
                 realm_id=self.realm_id, service_id=self._service_id, profile_hash=profile_hash,
                 run_project=lambda mutator: self._run_control(mutator, permission="runtime.project"),
-                run_token=lambda mutator: self._run_control(mutator, permission="runtime.token.issue"))
+                run_token=lambda mutator: self._run_control(mutator, permission="runtime.token.issue"),
+                context_tokenizer=self._context_tokenizer)
             if memory or self._provider_test_ca is not None:
                 trust = load_service_execution_trust(self._conn, cas, realm_id=self.realm_id, now_us=now_us())
                 signer = service_signing_authority(self.data_dir, expected_public_key=trust.service_public_key, allow_insecure=self._allow_insecure)

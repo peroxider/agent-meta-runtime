@@ -15,6 +15,7 @@ from .context_projection import BUDGET_LADDER, SECTION_DELIMITER, SourceRef, lad
 from .errors import ErrorCode, StableError
 from .harness import is_artifact_id
 from .host_schema import validate_host_value
+from .context_tokenizer import (context_tokenizer_descriptor, measured_count, MAX_RENDERED_CONTEXT_BYTES, GLM53_TOKENIZER_ID)
 
 
 SECTION_IDS = tuple(item[0] for item in BUDGET_LADDER)
@@ -182,9 +183,9 @@ def _schema_redact(schema, redact):
     return result
 
 
-def _fit_input(value, limit, policy):
+def _fit_input(value, limit, policy, measure=len):
     full = canonical_json(value)
-    if len(full) <= limit:
+    if measure(full) <= limit:
         return full
     field = policy["truncate_field"]
     if policy["task_input_overflow"] != "TAIL_TRUNCATE" or not isinstance(value, dict) or not isinstance(value.get(field), str):
@@ -194,7 +195,7 @@ def _fit_input(value, limit, policy):
     while lo <= hi:
         middle = (lo + hi) // 2
         raw = canonical_json({**value, field: text[:middle]})
-        if len(raw) <= limit:
+        if measure(raw) <= limit:
             fitted, lo = raw, middle + 1
         else:
             hi = middle - 1
@@ -203,19 +204,19 @@ def _fit_input(value, limit, policy):
     return fitted
 
 
-def _fit_summary(value, limit):
+def _fit_summary(value, limit, measure=len):
     value = json.loads(canonical_json(value))
-    while len(canonical_json(value)) > limit and value:
+    while measure(canonical_json(value)) > limit and value:
         bindings = value.get("state_bindings")
         if isinstance(bindings, dict) and bindings:
             del bindings[sorted(bindings)[-1]]
         else:
             del value[sorted(value)[-1]]
     raw = canonical_json(value)
-    return raw if len(raw) <= limit else b""
+    return raw if measure(raw) <= limit else b""
 
 
-def build_projection_input(task):
+def build_projection_input(task, *, token_counter=None):
     """Compile the external policy over this exact immutable Task snapshot."""
     from .host_contract import ProjectionInput, RenderedSection
     snapshot = task.context
@@ -227,14 +228,21 @@ def build_projection_input(task):
     raw = Resources(snapshot.artifacts)
     profile, _ = context_profile_references(raw[snapshot.profile_artifact_id])
     policy, _ = policy_schema_references(raw[profile["policy_artifact_id"]])
-    tokenizer = _shape(context_document(raw[profile["tokenizer_artifact_id"]]), "context-tokenizer/v1", {"tokenizer_id", "version"})
+    tokenizer = context_document(raw[profile["tokenizer_artifact_id"]])
+    tokenizer_id = context_tokenizer_descriptor(tokenizer)
     provider = _shape(context_document(raw[profile["provider_profile_artifact_id"]]), "context-provider-profile/v1", {"provider_id", "tokenizer_id", "tokenizer_artifact_id"})
-    if type(tokenizer["version"]) is not int or tokenizer != {"schema": "context-tokenizer/v1", "tokenizer_id": "utf8-bytes/v1", "version": 1} or provider["tokenizer_id"] != tokenizer["tokenizer_id"] or provider["tokenizer_artifact_id"] != profile["tokenizer_artifact_id"] or not isinstance(provider["provider_id"], str) or not provider["provider_id"]:
+    if provider["tokenizer_id"] != tokenizer_id or provider["tokenizer_artifact_id"] != profile["tokenizer_artifact_id"] or not isinstance(provider["provider_id"], str) or not provider["provider_id"]:
         raise _fail("the Provider profile's exact tokenizer is unavailable")
+    native = tokenizer_id != 'utf8-bytes/v1'
+    if native and not callable(token_counter):
+        raise _fail("the Root-owned native Context tokenizer is unavailable")
+    count = (lambda content: measured_count(token_counter, content)) if native else len
     redact = _redactor(context_document(raw[profile["redaction_policy_artifact_id"]]))
     for section in SECTION_IDS:
-        renderer = _shape(context_document(raw[profile["renderer_artifact_ids"][section]]), "context-renderer/v1", {"renderer_id", "section_id", "version"})
-        if type(renderer["version"]) is not int or renderer != {"schema": "context-renderer/v1", "renderer_id": "jcs-ladder/v1", "section_id": section, "version": 1}:
+        renderer = context_document(raw[profile["renderer_artifact_ids"][section]])
+        expected = {"schema": "context-renderer/v2" if native else "context-renderer/v1",
+            "renderer_id": "jcs-ladder-prefix-tokens/v1" if native else "jcs-ladder/v1", "section_id": section, "version": 2 if native else 1}
+        if type(renderer) is not dict or type(renderer.get("version")) is not int or renderer != expected:
             raise _fail("a declared Context renderer is unavailable")
     sources = {kind: [source for source in snapshot.sources if source.kind == kind] for kind in ("constitution", "runtime", "fact")}
     if len(sources["constitution"]) != 1 or len(sources["runtime"]) != 1:
@@ -273,28 +281,41 @@ def build_projection_input(task):
     result, carry = [], 0
     for index, (section, quota) in enumerate(zip(SECTION_IDS, ladder_quotas(policy["budget_tokens"]))):
         capacity = quota + carry
-        delimiter = len(SECTION_DELIMITER) if index else 0
+        delimiter = len(SECTION_DELIMITER) if index and not native else 0
         limit = max(0, capacity - delimiter)
+        if native:
+            prefix = SECTION_DELIMITER.join(item.content for item in result)
+            before = count(prefix)
+            def measure(content):
+                joined = prefix + SECTION_DELIMITER + content if index else content
+                # BPE token counts need not add across section boundaries.
+                # Negative increments are conservatively charged as zero.
+                return max(0, count(joined) - before)
+        else:
+            measure = len
         if section in bodies:
             content = bodies[section]
-            if len(content) > limit:
+            if measure(content) > limit:
                 raise _fail("required Context section exceeds its quota")
         elif section == "task_input":
-            content = _fit_input(input_value, limit, policy)
+            content = _fit_input(input_value, limit, policy, measure)
         elif section == "state_summary":
-            content = _fit_summary(runtime_value, limit)
+            content = _fit_summary(runtime_value, limit, measure)
         else:
             selected = []
             for fact in facts:
-                if len(canonical_json([*selected, fact])) > limit:
+                if measure(canonical_json([*selected, fact])) > limit:
                     break
                 selected.append(fact)
-            content = canonical_json(selected) if limit >= 2 else b""
-        consumed = delimiter + len(content)
+            content = canonical_json(selected) if measure(canonical_json(selected)) <= limit else b""
+        consumed = delimiter + measure(content)
         if consumed > capacity:
             raise _fail("Context delimiter exceeds its quota")
         carry = capacity - consumed
-        result.append(RenderedSection(section, profile["renderer_artifact_ids"][section], content, len(content)))
+        result.append(RenderedSection(section, profile["renderer_artifact_ids"][section], content, count(content)))
+    rendered = SECTION_DELIMITER.join(item.content for item in result)
+    if len(rendered) > MAX_RENDERED_CONTEXT_BYTES or count(rendered) > policy['budget_tokens']:
+        raise _fail("rendered Context exceeds its byte or token ceiling")
     refs = [source.source_ref() for source in snapshot.sources]
     refs.extend(SourceRef("artifact", ref, ref.rsplit("/", 1)[1]) for ref in raw)
     refs.extend((SourceRef("artifact", task.input_artifact_id, sha256_hex(task.input_content)),
@@ -304,19 +325,22 @@ def build_projection_input(task):
 
 
 def rendered_sections(projection):
+    if projection.manifest.tokenizer_id not in ('utf8-bytes/v1', GLM53_TOKENIZER_ID):
+        raise _fail('Context rendered tokenizer identity is unsupported')
     bodies = projection.rendered_content.split(SECTION_DELIMITER)
     if len(bodies) != len(projection.manifest.sections):
         raise _fail("Context rendered section framing differs from its manifest", ErrorCode.INTEGRITY_ERROR)
     result = {}
     for section, body in zip(projection.manifest.sections, bodies):
-        if section.output_artifact_id != "artifact://sha256/" + sha256_hex(body) or section.token_count != len(body):
+        if (section.output_artifact_id != "artifact://sha256/" + sha256_hex(body)
+                or projection.manifest.tokenizer_id == 'utf8-bytes/v1' and section.token_count != len(body)):
             raise _fail("Context rendered section hash or count differs", ErrorCode.INTEGRITY_ERROR)
         result[section.section_id] = body
     return MappingProxyType(result)
 
 
 def build_context_artifacts(*, input_schema, selected_operation_ids, provider_id,
-                            budget_tokens=8192, input_overflow="REJECT", truncate_field="value"):
+                            budget_tokens=8192, input_overflow="REJECT", truncate_field="value", tokenizer_descriptor=None):
     """Author a generic v1 Context profile; caller chooses application schemas."""
     artifacts = {}
     def add(value):
@@ -338,11 +362,15 @@ def build_context_artifacts(*, input_schema, selected_operation_ids, provider_id
         "truncate_field": truncate_field, "selected_operation_ids": sorted(selected_operation_ids),
         "task_input_schema_artifact_id": add(input_schema), "fact_schema_artifact_id": fact_schema,
         "runtime_schema_artifact_id": runtime_schema, "fact_depth": 4, "require_facts": False})
-    tokenizer = add({"schema": "context-tokenizer/v1", "tokenizer_id": "utf8-bytes/v1", "version": 1})
+    descriptor = tokenizer_descriptor if tokenizer_descriptor is not None else {"schema": "context-tokenizer/v1", "tokenizer_id": "utf8-bytes/v1", "version": 1}
+    tokenizer_id = context_tokenizer_descriptor(descriptor)
+    tokenizer = add(descriptor)
     redaction = add({"schema": "context-redaction-policy/v1", "redact_keys": sorted(_MIN_REDACT_KEYS), "patterns": sorted(_PATTERNS), "replacement": "[REDACTED]"})
-    renderers = {section: add({"schema": "context-renderer/v1", "renderer_id": "jcs-ladder/v1", "section_id": section, "version": 1}) for section in SECTION_IDS}
+    native = tokenizer_id != 'utf8-bytes/v1'
+    renderers = {section: add({"schema": "context-renderer/v2" if native else "context-renderer/v1",
+        "renderer_id": "jcs-ladder-prefix-tokens/v1" if native else "jcs-ladder/v1", "section_id": section, "version": 2 if native else 1}) for section in SECTION_IDS}
     profile = add({"schema": "context-profile/v1", "policy_artifact_id": policy, "redaction_policy_artifact_id": redaction,
         "tokenizer_artifact_id": tokenizer, "provider_profile_artifact_id": add({"schema": "context-provider-profile/v1",
-            "provider_id": provider_id, "tokenizer_id": "utf8-bytes/v1", "tokenizer_artifact_id": tokenizer}), "renderer_artifact_ids": renderers})
+            "provider_id": provider_id, "tokenizer_id": tokenizer_id, "tokenizer_artifact_id": tokenizer}), "renderer_artifact_ids": renderers})
     policy_schema_references(artifacts[policy])
     return profile, MappingProxyType(artifacts)

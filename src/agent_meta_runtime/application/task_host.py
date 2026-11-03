@@ -49,7 +49,7 @@ class _TaskFacade:
     def __init__(self, token):
         self.__token = token
 
-    async def project_context(self, request):
+    async def project_context(self, request=None):
         return await _session(self.__token).project_context(request)
 
     async def invoke_model(self, projection):
@@ -142,7 +142,7 @@ class TaskSession:
         if children:
             await asyncio.gather(*children, return_exceptions=True)
 
-    async def project_context(self, request):
+    async def project_context(self, request=None):
         # Even a cached projection can synchronously commit a journal command.
         # Yield outside the transaction so repeated facade calls cannot starve
         # control-plane Hello, cancellation or other Task scheduling.

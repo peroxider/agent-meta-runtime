@@ -98,7 +98,7 @@ def test_cli_info_json_envelope(tmp_path, capsys):
         )
         assert code == 0
         envelope = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-        assert envelope["api_version"] == "1.15"
+        assert envelope["api_version"] == "1.16"
         assert envelope["ok"] is True
         assert envelope["result"]["ready"] == envelope["result"]["core_ready"]
 

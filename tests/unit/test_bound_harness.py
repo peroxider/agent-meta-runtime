@@ -20,7 +20,7 @@ from test_daemon_lifecycle import _authority
 from test_public_package_contract import Bundle
 
 
-def live_bundle(health="READY", *, model_max_uses=None, version="0.1.0", descriptor_revision=1, controlled_provider=False, provider_declaration=None, provider_normalizer='default'):
+def live_bundle(health="READY", *, model_max_uses=None, version="0.1.0", descriptor_revision=1, controlled_provider=False, provider_declaration=None, provider_normalizer='default', context_descriptor=None, root_projection=False, projection_echo=False, forge_native_count=False):
     bundle = Bundle()
     provider_profile = bundle.doc({"schema": "fixture-unavailable-provider-profile/v1"}) if controlled_provider else None
     if provider_declaration is not None:
@@ -45,7 +45,12 @@ async def run_task(task, host):
     assert view['composition'] == json.loads(task.composition_content)
     assert view['meta_revision'] == task.accepted_meta_revision
     assert len(view['backend_profile_hash']) == 64
-    projection = await host.project_context(build_projection_input(task))
+    projection = await host.project_context({'None' if root_projection else 'build_projection_input(task)'})
+    if {forge_native_count!r}:
+        await host.project_context(build_projection_input(task, token_counter=lambda content: 0))
+    if {projection_echo!r}:
+        repeated = await host.project_context()
+        assert repeated is projection
     if json.loads(task.input_content) == 'actual Task input':
         for _ in range(99):
             replayed = await host.project_context(build_projection_input(task))
@@ -56,6 +61,8 @@ async def run_task(task, host):
     return terminal_result(response)
 async def model(request):
     assert request.history_content == b'[]'
+    if {projection_echo!r}:
+        return ModelResponse((TextPart(str(request.projection.manifest.total_tokens)),), 'STOP', ProviderUsage(None, None, 0))
     if json.loads(request.task.input_content) == 'pending':
         await asyncio.Event().wait()
     if json.loads(request.task.input_content) == 'replay-confirmed':
@@ -77,7 +84,7 @@ def create():
         provider={f'ProviderAdapter({prepare_callback}, normalize_provider)' if controlled_provider else 'None'})
 """.encode()
     files = {"probe.py": code}
-    context_profile, context_artifacts = build_context_artifacts(input_schema={"type": "string"}, selected_operation_ids=[], provider_id="fixture")
+    context_profile, context_artifacts = build_context_artifacts(input_schema={"type": "string"}, selected_operation_ids=[], provider_id="fixture", tokenizer_descriptor=context_descriptor)
     bundle.blobs.update(context_artifacts)
     provenance = bundle.doc({"schema": "fixture-provenance/v1", "source_files": {"probe.py": sha256_hex(code)}})
     metadata = replace(bundle.meta, version=version, entrypoint="probe:create", build_provenance_artifact_id=provenance,
@@ -106,6 +113,8 @@ def create():
             "slots": {"model": {"capability_id": descriptor["capability_id"], "descriptor_revision": descriptor_revision, "artifact_id": package,
                 "placement": "in_process", "criticality": "REQUIRED", "degradation_policy": "REJECT_TASK", "health_probe": {"operation_id": "probe.model"}}}}),
         "grant_requests_artifact_id": bundle.doc({"schema": "harness-grant-requests/v1", "requests": grants})})
+    if context_descriptor is not None or root_projection:
+        bundle.manifest['public_api_range'] = '>=1.16.0 <2.0.0'
     manifest_id = bundle.sign()
     return bundle, manifest_id, grants
 
