@@ -1,0 +1,29 @@
+{
+  "schema": "scratch-source-export-golden/v1",
+  "source_texts": [
+    "from math import ceil\r\ndef decorate(fn):\r\n    def wrapped(值):\r\n        return fn(值) + 1\r\n    return wrapped\r\n",
+    "@(\n    decorate\n)\ndef chosen(值):\n    return ceil(值)"
+  ],
+  "export_names": [
+    "decorate",
+    "chosen"
+  ],
+  "entrypoint": "scratch_candidate:chosen",
+  "interface_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "expected": {
+    "package_artifact_id": "artifact://sha256/8806f26d6301ed6ee9bd096d1dcd26917a9a4c0bb70836ea21e677721daab335",
+    "provenance_artifact_id": "artifact://sha256/fc5439c3d5f1cd128e21e44b78128a11e15c64e6836a37f2d036a21f641817c4",
+    "source_artifact_ids": [
+      "artifact://sha256/9c1bf35d17f99ef26d82f6ab77b8e448f40ddbb2f2e993a16c91664d121e0de7",
+      "artifact://sha256/8e2b38df0480a1407d97d0882ac42c5774941fc5188a55dfee935cf4d7b77ce5"
+    ],
+    "source_file_sha256": "dca40a68ea235609e5f633019bad8a62c0267c87b8137be20e6f835d53f82137",
+    "generated_source": "from math import ceil\n\ndef decorate(fn):\n    def wrapped(值):\n        return fn(值) + 1\n    return wrapped\n\n@(\n    decorate\n)\ndef chosen(值):\n    return ceil(值)\n",
+    "entrypoint": "scratch_candidate:chosen",
+    "trust_class": "trusted_candidate"
+  }
+}

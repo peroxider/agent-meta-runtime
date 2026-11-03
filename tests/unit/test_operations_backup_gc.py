@@ -106,7 +106,7 @@ def test_backup_restore_round_trip_quarantine_and_fact(tmp_path):
 
     # Restore refuses a non-empty target...
     with pytest.raises(StableError) as occupied:
-        restore_backup(dest, data_dir)
+        restore_backup(dest, data_dir, allow_insecure_credentials=os.name != "nt")
     assert occupied.value.code == ErrorCode.FAILED_PRECONDITION
     # ...and a tampered backup payload (bytes restored afterwards).
     blob = next(
@@ -120,14 +120,14 @@ def test_backup_restore_round_trip_quarantine_and_fact(tmp_path):
     empty.mkdir()
     try:
         with pytest.raises(StableError) as tampered:
-            restore_backup(dest, empty)
+            restore_backup(dest, empty, allow_insecure_credentials=os.name != "nt")
         assert tampered.value.code == ErrorCode.INTEGRITY_ERROR
     finally:
         blob.write_bytes(original)
 
     # Honest restore into a fresh empty directory.
     fresh = tmp_path / "fresh"
-    report = restore_backup(dest, fresh)
+    report = restore_backup(dest, fresh, allow_insecure_credentials=os.name != "nt")
     assert report["realm_id"] == REALM
     assert run_init(fresh, insecure_dev_credential_file=os.name != 'nt').reinitialized
     from agent_meta_runtime.adapters.credentials import operator_signing_authority

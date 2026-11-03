@@ -31,7 +31,7 @@ def test_fresh_bootstrap_certificate_and_actual_service_signer_verify_without_to
         assert trust.certificate_artifact_id == report.details["service_certificate_artifact_id"]
         assert trust.certificate_artifact_id.rsplit("/", 1)[1] in collect_marks(conn)
         cert = json.loads(trust.certificate)["certificate"]
-        assert cert["permissions"] == ["capability.invoke", "model.invoke"]
+        assert cert["permissions"] == ["capability.invoke", "model.invoke", "scratch.create", "scratch.execute", "scratch.inspect", "scratch.release"]
         root_public = bytes.fromhex(json.loads(conn.execute("SELECT public_identity_json FROM principals WHERE kind='OPERATOR_ROOT'").fetchone()[0])["public_key_hex"])
         assert root_public != trust.service_public_key
         signer = service_signing_authority(tmp_path, expected_public_key=trust.service_public_key, allow_insecure=os.name != "nt")

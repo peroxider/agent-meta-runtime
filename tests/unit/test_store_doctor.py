@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,7 @@ from agent_meta_runtime.domain.canonical import sha256_hex
 from agent_meta_runtime.domain.deadline import Deadline
 from agent_meta_runtime.domain.errors import ErrorCode, StableError
 from agent_meta_runtime.ports.repositories import FactAppendRequest
+from agent_meta_runtime.interfaces.cli.init import run_init
 from tests.unit.test_store_uow import ACTOR, _envelope, _mutator
 
 DEADLINE = Deadline.after(5_000_000)
@@ -267,3 +270,29 @@ def test_doctor_reports_missing_cas_blob(healthy_store) -> None:
     report = run_integrity_doctor(tmp_path / "meta.db", cas_root=tmp_path)
     assert not report.ok
     assert any("CAS blob" in f["detail"] for f in report.findings)
+
+
+@pytest.mark.parametrize('mode',['missing','corrupt','metadata'])
+def test_doctor_verifies_bootstrap_artifacts_without_blob_rows(tmp_path,mode):
+    run_init(tmp_path,insecure_dev_credential_file=os.name!='nt')
+    connection=sqlite3.connect(tmp_path/'meta.db')
+    try:
+        artifact,raw=connection.execute('SELECT artifact_id,manifest_json FROM artifacts ORDER BY artifact_id LIMIT 1').fetchone()
+        assert connection.execute('SELECT COUNT(*) FROM artifact_blobs WHERE artifact_id=?',(artifact,)).fetchone()[0]==0
+        path=tmp_path/'artifacts'/json.loads(raw)['storage_relpath']
+        if mode=='metadata':
+            original=artifact
+            artifact='artifact://sha256/'+sha256_hex(b'doctor malformed storage fixture')
+            connection.execute('INSERT INTO artifacts SELECT ?,kind,media_type,size_bytes,schema_version,created_by,created_at_us,parents_json,?,integrity_status FROM artifacts WHERE artifact_id=?',
+                (artifact,b'{}',original))
+            connection.commit()
+        elif mode=='missing':
+            path.unlink()
+        else:
+            path.write_bytes(b'corrupted bootstrap Artifact')
+    finally:
+        connection.close()
+    report=run_integrity_doctor(tmp_path/'meta.db',cas_root=tmp_path)
+    assert not report.ok
+    assert any(finding.get('artifact_id')==artifact and finding['detail']=='CAS inline Artifact verification failed'
+        for finding in report.findings)

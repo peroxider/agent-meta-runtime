@@ -15,8 +15,12 @@ from agent_meta_runtime.interfaces.cli.main import main
 from agent_meta_runtime.adapters.store.doctor import run_integrity_doctor
 
 
+def initialized(path):
+    return run_init(path,insecure_dev_credential_file=os.name!='nt')
+
+
 def test_fresh_init_creates_complete_bootstrap(tmp_path):
-    report = run_init(tmp_path)
+    report = initialized(tmp_path)
     assert report.realm_id == REALM_ID
     assert report.core_ready and not report.serving_ready
     assert report.recovery_code  # shown exactly once on fresh init
@@ -87,8 +91,8 @@ def test_fresh_init_creates_complete_bootstrap(tmp_path):
 
 
 def test_reinit_returns_existing_realm_without_new_secret(tmp_path):
-    first = run_init(tmp_path)
-    second = run_init(tmp_path)
+    first = initialized(tmp_path)
+    second = initialized(tmp_path)
     assert second.reinitialized
     assert second.realm_id == first.realm_id == REALM_ID
     assert second.epoch_id == first.epoch_id
@@ -99,15 +103,15 @@ def test_reinit_returns_existing_realm_without_new_secret(tmp_path):
 def test_reinit_rejects_decryptable_key_that_differs_from_committed_identity(tmp_path, name):
     from agent_meta_runtime.adapters.credentials import open_key_store
 
-    run_init(tmp_path)
-    store, _ = open_key_store(tmp_path)
+    initialized(tmp_path)
+    store, _ = open_key_store(tmp_path,allow_insecure=os.name!='nt')
     replacement = store.create(bytearray(b"x" * 32), purpose=f"{name}.ed25519")
     config_path = tmp_path / "keys/store.json"
     config = json.loads(config_path.read_bytes())
     config["handles"][name] = replacement
     config_path.write_text(json.dumps(config), encoding="utf-8")
     with pytest.raises(StableError) as unavailable:
-        run_init(tmp_path)
+        initialized(tmp_path)
     assert unavailable.value.code == ErrorCode.KEY_UNAVAILABLE
 
 
@@ -115,12 +119,12 @@ def test_init_orphan_cleanup_cannot_unlink_outside_data_directory(tmp_path):
     outside = tmp_path / "preserve.txt"
     outside.write_text("preserve")
     data_dir = tmp_path / "runtime"
-    run_init(data_dir)
+    initialized(data_dir)
     orphan = data_dir / "staging" / "orphan.bin"
     orphan.parent.mkdir(exist_ok=True)
     orphan.write_bytes(b"orphan")
     (orphan.parent / "init-orphans.jcs").write_text(json.dumps({"paths": [str(outside), str(orphan)]}))
-    run_init(data_dir)
+    initialized(data_dir)
     assert outside.read_text() == "preserve"
     assert not orphan.exists()
 
@@ -128,12 +132,13 @@ def test_init_orphan_cleanup_cannot_unlink_outside_data_directory(tmp_path):
 def test_init_rejects_nonempty_dir_without_db(tmp_path):
     (tmp_path / "stray.txt").write_text("not a runtime dir")
     with pytest.raises(StableError) as excinfo:
-        run_init(tmp_path)
+        initialized(tmp_path)
     assert excinfo.value.code == ErrorCode.FAILED_PRECONDITION
 
 
 def test_cli_init_envelope_prints_recovery_code_once(tmp_path, capsys):
-    code = main(["--data-dir", str(tmp_path), "--output", "json", "init"])
+    flags=['--insecure-dev-credential-file'] if os.name!='nt' else []
+    code = main(["--data-dir", str(tmp_path), "--output", "json", *flags, "init"])
     assert code == 0
     envelope = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert envelope["ok"] is True
@@ -141,7 +146,7 @@ def test_cli_init_envelope_prints_recovery_code_once(tmp_path, capsys):
     assert envelope["result"]["serving_ready"] is False
     assert envelope["result"]["recovery_code"]
 
-    code = main(["--data-dir", str(tmp_path), "--output", "json", "init"])
+    code = main(["--data-dir", str(tmp_path), "--output", "json", *flags, "init"])
     assert code == 0
     envelope2 = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert envelope2["result"]["reinitialized"] is True

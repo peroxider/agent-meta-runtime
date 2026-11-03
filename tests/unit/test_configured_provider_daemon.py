@@ -19,10 +19,10 @@ from test_provider_configuration import configured_environment, REALM
 from test_provider_https import edge, SECRET
 
 
-@pytest.mark.parametrize('mode',['success','unknown_usage','overrun','disconnect','missing_credential','zero_claim','invalid_normalizer','cancel'])
+@pytest.mark.parametrize('mode',['success','unknown_usage','overrun','disconnect','missing_credential','zero_claim','invalid_normalizer','cancel','rate'])
 def test_public_task_uses_frozen_approval_and_root_wire_pricing(tmp_path,edge,mode):
     server,_,_,_,_,_,ca,_=edge
-    server.mode='disconnect' if mode=='disconnect' else 'hold' if mode=='cancel' else 'messages'
+    server.mode='disconnect' if mode=='disconnect' else 'hold' if mode=='cancel' else 'rate' if mode=='rate' else 'messages'
     message={'id':'msg-synthetic','type':'message','role':'assistant','model':'synthetic-model',
         'content':[{'type':'text','text':'synthetic terminal'}],'stop_reason':'end_turn','stop_sequence':None}
     if mode!='unknown_usage':
@@ -64,12 +64,20 @@ def test_public_task_uses_frozen_approval_and_root_wire_pricing(tmp_path,edge,mo
             assert journal['provider']['reservation']['configuration_fact_id']==configured.resource['configuration_fact_id']
             observation=daemon._providers._worker.observation(journal['request_id'])
             assert observation['exit_confirmed'] and observation['worker_pid']
+            public=execution['invocations'][0]['provider']
+            assert public['configuration_fact_id']==configured.resource['configuration_fact_id']
+            assert public['settlement']==journal['provider']['settlement']
+            assert public['terminal']==journal['provider_terminal']
             if mode in ('disconnect','cancel'):
                 assert terminal['status']==('CANCELLED' if mode=='cancel' else 'FAILED_RECOVERY')
                 assert usage['cost_microunits'] is None
                 assert journal['provider']['settlement']['liability_microunits']==135
                 assert journal['provider']['settlement']['outcome']=='UNKNOWN'
                 server.release.set()
+            elif mode=='rate':
+                assert terminal['error']==ErrorCode.RESOURCE_EXHAUSTED and usage['cost_microunits'] is None
+                assert public['terminal']['http_status']==429 and public['terminal']['retry_after_us']==2_000_000
+                assert public['settlement']['liability_microunits']==135 and len(server.seen)==1
             elif mode=='overrun':
                 assert terminal['error']==ErrorCode.RESOURCE_EXHAUSTED and usage['cost_microunits']==140
                 assert journal['provider']['settlement']['overrun']

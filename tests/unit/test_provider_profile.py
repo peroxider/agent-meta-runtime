@@ -171,6 +171,39 @@ def test_basic_serial_function_tool_history_remains_supported_by_the_profile():
     assert profile.preflight(replace(plan,body=canonical_json(body)))[0]>0
 
 
+@pytest.mark.parametrize('name',['thinking','cache_control','server_tool'])
+def test_protocol_words_in_business_schema_and_arguments_are_data(name):
+    ref,blobs,plan,_=profile_case()
+    profile,_=load_profile(ref,blobs.__getitem__)
+    body={**json.loads(plan.body),
+        'tools':[{'name':'cap.store','input_schema':{'type':'object','properties':{
+            name:{'type':'object','properties':{'type':{'type':'string'}}}}}}],
+        'messages':[
+            {'role':'assistant','content':[{'type':'tool_use','id':'call-1','name':'cap.store',
+                'input':{name:{'type':'ephemeral','value':'ordinary application data'}}}]},
+            {'role':'user','content':[{'type':'tool_result','tool_use_id':'call-1','content':'stored'}]}]}
+    tokens,output,cost=profile.preflight(replace(plan,body=canonical_json(body)))
+    assert tokens==profile.count_input(canonical_json(body)) and output==8
+    assert cost==profile.pricing.cost(tokens,8)
+
+
+@pytest.mark.parametrize('name',['thinking','cache_control','server_tool'])
+@pytest.mark.parametrize('position',['tool_definition','assistant_block','user_block'])
+def test_protocol_extensions_at_structural_positions_remain_refused(name,position):
+    ref,blobs,plan,_=profile_case()
+    profile,_=load_profile(ref,blobs.__getitem__)
+    definition={'name':'cap.store','input_schema':{'type':'object'}}
+    assistant={'type':'tool_use','id':'call-1','name':'cap.store','input':{'value':1}}
+    result={'type':'tool_result','tool_use_id':'call-1','content':'stored'}
+    target={'tool_definition':definition,'assistant_block':assistant,'user_block':result}[position]
+    target[name]={'type':'enabled'}
+    body={**json.loads(plan.body),'tools':[definition],'messages':[
+        {'role':'assistant','content':[assistant]},{'role':'user','content':[result]}]}
+    with pytest.raises(StableError) as caught:
+        profile.preflight(replace(plan,body=canonical_json(body)))
+    assert caught.value.code==ErrorCode.FAILED_PRECONDITION
+
+
 @pytest.mark.parametrize('change',[{'service_tier':'unknown-price'}, {'content':[{'type':'server_tool_use','name':'web_search'}]}])
 def test_unknown_wire_billing_features_cannot_release_the_known_maximum_hold(change):
     ref,blobs,_,_=profile_case()

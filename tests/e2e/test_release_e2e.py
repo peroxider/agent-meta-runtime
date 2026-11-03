@@ -10,6 +10,8 @@ module was ever imported.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -116,13 +118,16 @@ def test_doc_proof_references_exist() -> None:
             assert path.is_file(), f"{doc.name} references missing proof: {match.group(1)}"
 
 
-def test_release_e2e_offline_empty_dir(tmp_path: Path) -> None:
+def test_release_e2e_offline_empty_dir(tmp_path: Path, capsys) -> None:
     data_dir = tmp_path / "primary"
     data_dir.mkdir()
 
     # 1. Independent init on an empty directory (CLI, offline, no daemon).
-    rc = cli_main(["--data-dir", str(data_dir), "--output", "json", "init"])
+    flags=['--insecure-dev-credential-file'] if os.name!='nt' else []
+    rc = cli_main(["--data-dir", str(data_dir), "--output", "json", *flags, "init"])
+    initialized=json.loads(capsys.readouterr().out)
     assert rc == 0, "CLI init failed on an empty data directory"
+    assert initialized['ok'] and initialized['result']['recovery_code']
     assert (data_dir / "meta.db").is_file()
 
     # 2. Restart: real server over the existing store; GetInfo over the wire.
@@ -130,7 +135,7 @@ def test_release_e2e_offline_empty_dir(tmp_path: Path) -> None:
 
     # 3. Integrity doctor passes on the live store.
     report = run_integrity_doctor(
-        data_dir / "meta.db", cas_root=data_dir / "artifacts"
+        data_dir / "meta.db", cas_root=data_dir
     )
     assert report.ok, report.findings
 
@@ -139,7 +144,7 @@ def test_release_e2e_offline_empty_dir(tmp_path: Path) -> None:
     outcome = create_backup(conn, data_dir)
     backup_dir = Path(outcome.destination)
     assert backup_dir.is_dir()
-    restore_backup(backup_dir, tmp_path / "restored")
+    restore_backup(backup_dir, tmp_path / "restored", allow_insecure_credentials=os.name != 'nt')
     rconn = connect_store(tmp_path / "restored" / "meta.db")
     try:
         preflight_upgrade(rconn, tmp_path / "restored")

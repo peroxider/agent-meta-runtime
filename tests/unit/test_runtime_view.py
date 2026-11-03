@@ -13,6 +13,8 @@ from agent_meta_runtime.adapters.store import (
     get_historical_view,
     load_task,
     start_task,
+    StateCreateRequest,
+    create_state,
 )
 from agent_meta_runtime.domain.errors import StableError
 from agent_meta_runtime.domain.semantics import TaskBudget, TaskStatus
@@ -99,50 +101,18 @@ def test_historical_view_never_approximates(semantic_env):
 
 def test_historical_state_bindings_bound_by_revision(semantic_env):
     conn, realm, composition, input_artifact, surface_artifact = semantic_env
-    conn.execute(
-        "INSERT INTO state_revisions(state_revision_id, state_id, owner_id,"
-        " schema_id, parent_revision_id, artifact_id, created_by, created_at_us)"
-        " VALUES ('state-revision://r1', 'state://s1', ?, 'schema://x', NULL, ?, ?, 1)",
-        (ACTOR, artifact_id("input"), ACTOR),
-    )
-    conn.execute(
-        "INSERT INTO managed_states(state_id, owner_id, schema_id,"
-        " current_revision_id, cas_revision, status, updated_at_us)"
-        " VALUES ('state://s1', ?, 'schema://x', 'state-revision://r1', 1, 'ACTIVE', 1)",
-        (ACTOR,),
-    )
-    conn.commit()
-    # Revision 1: a state-less marker command. Revision 2: the task accept,
-    # whose transaction records the state-ref history boundary.
+    # Revision 1 has no State. Revision 2 creates a real State birth Fact and
+    # its history boundary, rather than borrowing an unrelated Task Fact.
     result = execute_command_result(conn, _marker_fact_mutator())
     assert result.meta_revision == 1
-    accept_result = execute_command_result(
-        conn,
-        accept_task(
-            TaskAcceptRequest(
-                task_id=None,
-                actor_id=ACTOR,
-                input_artifact_id=input_artifact,
-                serving_composition_id=composition,
-                serving_revision=1,
-                capability_surface_revision=1,
-                capability_surface_artifact_id=surface_artifact,
-                budget=TaskBudget(),
-            )
-        ),
-    )
-    assert accept_result.meta_revision == 2
-    conn.execute(
-        "INSERT INTO state_ref_history(state_id, meta_revision,"
-        " state_revision_id, source_fact_id)"
-        " VALUES ('state://s1', 2, 'state-revision://r1', ?)",
-        (accept_result.fact_ids[0],),
-    )
-    conn.commit()
+    created = execute_command_result(conn, create_state(StateCreateRequest(
+        owner_id=ACTOR, schema_id='schema://x', artifact_id=input_artifact, state_id='state://s1')))
+    assert created.meta_revision == 2
+    expected = {'state://s1': created.receipt['state_revision_id']}
     current = get_current_view(conn, realm)
-    assert current.state_revision_bindings == {"state://s1": "state-revision://r1"}
+    assert current.state_revision_bindings == expected
     historical = get_historical_view(conn, realm, 2)
-    assert historical.state_revision_bindings == {"state://s1": "state-revision://r1"}
+    assert historical.state_revision_bindings == expected
     # Revision 1 predates the binding: it must not leak forward.
     earlier = get_historical_view(conn, realm, 1)
     assert earlier.state_revision_bindings == {}

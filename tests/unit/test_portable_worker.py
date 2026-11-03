@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -27,6 +29,15 @@ def test_worker_identity_triple() -> None:
     assert identity["pid"] == os.getpid()
     assert identity["nonce_hash"] == worker.nonce_hash(nonce)
     assert len(nonce) == 16
+
+
+def test_process_start_identity_rejects_exited_process_with_retained_parent_handle():
+    with subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.2)'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0) as process:
+        assert worker.process_start_identity(process.pid)
+        process.wait(timeout=5)
+        assert worker.process_start_identity(process.pid) is None
 
 
 def test_request_directory_requires_uuid(tmp_path) -> None:
@@ -152,20 +163,47 @@ def fast_ladder(monkeypatch):
     monkeypatch.setattr(cancellation, "TERM_WAIT_S", 0.1)
 
 
-def _spawn_sleeper():
-    return subprocess.Popen(
-        ["sleep", "30"], start_new_session=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-
-def test_cancellation_ladder_kills_process_group(tmp_path, fast_ladder) -> None:
-    child = _spawn_sleeper()
+@pytest.fixture()
+def sleeper(tmp_path):
+    job = None
+    if os.name == 'nt':
+        from agent_meta_runtime.adapters.owned_worker import OwnedWindowsJob
+        job = OwnedWindowsJob(kind='portable')
+        marker = tmp_path/'actual-pid'
+        code = ('import os,sys,time; from pathlib import Path; '
+            'from agent_meta_runtime.adapters.owned_worker import join_owner_job; '
+            'join_owner_job(sys.argv[1]); Path(sys.argv[2]).write_text(str(os.getpid())); time.sleep(30)')
+        args = [sys.executable, '-I', '-c', code, job.name, str(marker)]
+    else:
+        args = [sys.executable, '-I', '-c', 'import time;time.sleep(30)']
+    child = subprocess.Popen(args, start_new_session=os.name!='nt',
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        identity = worker.process_start_identity(child.pid)
+        pid = child.pid
+        if job is not None:
+            deadline = time.monotonic()+5
+            while not marker.exists():
+                assert child.poll() is None and time.monotonic()<deadline
+                time.sleep(.02)
+            pid = int(marker.read_text())
+            assert job.contains(pid)
+        yield child, pid, job
+    finally:
+        if job is not None:
+            job.close()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_cancellation_ladder_kills_process_group(tmp_path, fast_ladder, sleeper) -> None:
+    child, pid, job = sleeper
+    try:
+        identity = worker.process_start_identity(pid)
         assert identity is not None
         confirmed, details = cancellation.cancel_process_tree(
-            tmp_path, child.pid, identity, mode="GRACEFUL", reap=child.poll
+            tmp_path, pid, identity, mode="GRACEFUL", reap=child.poll, windows_job=job
         )
         assert confirmed is True
         assert "control_cancel" in details["steps"]
@@ -175,32 +213,67 @@ def test_cancellation_ladder_kills_process_group(tmp_path, fast_ladder) -> None:
         child.kill()
 
 
-def test_cancellation_refuses_recycled_pid(tmp_path, fast_ladder) -> None:
-    child = _spawn_sleeper()
+def test_cancellation_refuses_recycled_pid(tmp_path, fast_ladder, sleeper) -> None:
+    child, pid, job = sleeper
     try:
         # Wrong start identity: the ladder must never signal this PID.
         confirmed, _ = cancellation.cancel_process_tree(
-            tmp_path, child.pid, "999999999", mode="GRACEFUL"
+            tmp_path, pid, "999999999", mode="GRACEFUL", windows_job=job
         )
         # Identity mismatch is treated as "already gone" — but the real
         # process with a different identity must still be alive.
-        assert worker.process_start_identity(child.pid) is not None
+        assert worker.process_start_identity(pid) is not None
         assert child.poll() is None
-        assert confirmed is True  # observed "exit" of the mismatched identity
+        assert confirmed is (os.name != 'nt')  # Windows can still observe the owned tree alive.
     finally:
         child.kill()
         child.wait(timeout=5)
 
 
-def test_force_mode_marks_details(tmp_path, fast_ladder) -> None:
-    child = _spawn_sleeper()
+def test_force_mode_marks_details(tmp_path, fast_ladder, sleeper) -> None:
+    child, pid, job = sleeper
     try:
-        identity = worker.process_start_identity(child.pid)
+        identity = worker.process_start_identity(pid)
         confirmed, details = cancellation.cancel_process_tree(
-            tmp_path, child.pid, identity, mode="FORCE", reap=child.poll
+            tmp_path, pid, identity, mode="FORCE", reap=child.poll, windows_job=job
         )
         assert confirmed is True
         assert details["forced"] is True
         child.wait(timeout=5)
     finally:
         child.kill()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows retained Job tree API')
+def test_windows_force_cancel_confirms_descendant_exit_after_leader_exits(tmp_path, fast_ladder):
+    from agent_meta_runtime.adapters.owned_worker import OwnedWindowsJob, WorkerProcessLifetime
+    marker = tmp_path/'tree-pids'
+    code = ("import os,sys,time,json,subprocess; from pathlib import Path; "
+        "from agent_meta_runtime.adapters.owned_worker import join_owner_job; "
+        "join_owner_job(sys.argv[1]); "
+        "child=subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(30)'],creationflags=subprocess.CREATE_NO_WINDOW); "
+        "Path(sys.argv[2]).write_text(json.dumps([os.getpid(),child.pid])); "
+        "stop=Path(sys.argv[3]); "
+        "exec('while not stop.exists(): time.sleep(.01)'); os._exit(0)")
+    with OwnedWindowsJob(kind='portable') as job:
+        with subprocess.Popen([sys.executable,'-I','-c',code,job.name,str(marker),str(tmp_path/'control.cancel')],
+                creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as parent:
+            deadline = time.monotonic()+5
+            while not marker.exists():
+                assert parent.poll() is None and time.monotonic()<deadline
+                time.sleep(.02)
+            pid, descendant = json.loads(marker.read_text())
+            assert job.contains(pid) and job.contains(descendant)
+            identity = worker.process_start_identity(pid)
+            observed = WorkerProcessLifetime(descendant)
+            try:
+                confirmed, details = cancellation.cancel_process_tree(tmp_path,pid,identity,mode='FORCE',
+                    reap=parent.poll,windows_job=job)
+                # Observe the original process object through its retained
+                # handle. Raw PID lookup after exit can name a reused PID or
+                # race the final OS exit notification.
+                assert confirmed and details['forced']
+                assert job.active_processes == 0 and observed.wait(5)
+            finally:
+                observed.close()
+            parent.wait(timeout=5)

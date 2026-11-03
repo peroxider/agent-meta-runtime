@@ -9,6 +9,7 @@ with the exact traceability ID as the assertion tag.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -597,7 +598,7 @@ def conformance_bootstrap_offline(tmp_path) -> dict:
     from agent_meta_runtime.interfaces.cli.init import run_init
 
     data_dir = Path(tmp_path) / "data"
-    run_init(data_dir)
+    run_init(data_dir,insecure_dev_credential_file=os.name!='nt')
     ok = (data_dir / "meta.db").is_file() and (data_dir / "keys").is_dir()
     conn = sqlite3.connect(data_dir / "meta.db")
     try:
@@ -773,7 +774,7 @@ def _init_data_dir(tmp_path, name: str) -> Path:
     from agent_meta_runtime.interfaces.cli.init import run_init
 
     data_dir = Path(tmp_path) / name
-    run_init(data_dir)
+    run_init(data_dir,insecure_dev_credential_file=os.name!='nt')
     return data_dir
 
 
@@ -788,7 +789,7 @@ def operations_backup_restore(tmp_path) -> dict:
         outcome = create_backup(conn, data_dir, destination)
         sealed = (destination / "backup-manifest.json").is_file()
         fresh = Path(tmp_path) / "fresh"
-        report = restore_backup(destination, fresh)
+        report = restore_backup(destination, fresh, allow_insecure_credentials=os.name != "nt")
         restored = sqlite3.connect(fresh / "meta.db")
         try:
             quarantine = restored.execute(
@@ -856,7 +857,12 @@ def gc_lifecycle(tmp_path) -> dict:
             == "MISSING"
         )
         trash_existed = trash_dir.is_dir()
-        purged = purge_expired_trash(conn, data_dir, retention_us=1)
+        # Windows wall clocks need not advance by one microsecond here.
+        # Test retention against an explicit clock, not scheduler timing.
+        from unittest.mock import patch
+        metadata = json.loads((trash_dir / "metadata.json").read_text())
+        with patch('agent_meta_runtime.adapters.store.gc.now_us',return_value=metadata['quarantined_at_us']+2):
+            purged = purge_expired_trash(conn, data_dir, retention_us=1)
         return {
             "plan_marks_only_orphans": plan_marks_only_orphans,
             "plan_is_artifact": built["plan_artifact_id"].startswith(

@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+import subprocess
+import sys
 
 import pytest
 
@@ -18,6 +20,17 @@ from agent_meta_runtime.adapters.execution_portable import (
 from agent_meta_runtime.domain.errors import ErrorCode, StableError
 from agent_meta_runtime.protocols._v1 import execution_backend_pb2 as eb
 from agent_meta_runtime.protocols._v1 import transport_pb2 as transport
+
+
+async def test_worker_boot_failure_is_bounded_even_with_frozen_ledger_clock(tmp_path, monkeypatch):
+    backend = PortableBackend(tmp_path, clock=lambda: 1)
+    def exited(*args):
+        return subprocess.Popen([sys.executable, '-I', '-c', 'pass'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    monkeypatch.setattr(backend, '_spawn_worker', exited)
+    with pytest.raises(StableError) as error:
+        await backend.submit(make_request(str(uuid.uuid4())))
+    assert error.value.code == ErrorCode.BACKEND_UNAVAILABLE
 
 
 def make_request(rid, *, kind="test.echo", payload=None, rev="REVERSIBLE", session="sess"):

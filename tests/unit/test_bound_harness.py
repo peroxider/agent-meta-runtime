@@ -282,16 +282,22 @@ def test_actual_task_budget_authority_cancel_and_deadline(tmp_path, case, expect
                 first = await client.submit_task(realm_id="realm://main", actor_id=authority.actor_id, input_artifact_id=uploaded["artifact_id"])
                 result, terminal = await client.wait_task(first.task_id, timeout_s=3)
                 assert terminal and result["status"] == "SUCCEEDED", result
-            deadline = time.time_ns() // 1000 + 200_000 if case == "deadline" else time.time_ns() // 1000 - 1 if case == "expired_in_queue" else None
+            # This case proves expiry after dispatch. A 200 ms window can
+            # expire during IPC/admission under load and exercises the separate
+            # expired-in-queue case instead. Require the causal precondition.
+            deadline = time.time_ns() // 1000 + 5_000_000 if case == "deadline" else time.time_ns() // 1000 - 1 if case == "expired_in_queue" else None
             task = await client.submit_task(realm_id="realm://main", actor_id=authority.actor_id, input_artifact_id=uploaded["artifact_id"],
                 budget={"max_steps": 0} if case == "budget" else None, deadline_at_us=deadline)
-            if case == "cancel":
-                end = asyncio.get_running_loop().time() + 2
-                while not daemon._conn.execute("SELECT 1 FROM invocations WHERE status='RUNNING'").fetchone():
+            if case in ("cancel", "deadline"):
+                end = asyncio.get_running_loop().time() + 3
+                while not daemon._conn.execute("SELECT 1 FROM invocations WHERE action_id=? AND status='RUNNING'", (task.root_action_id,)).fetchone():
                     assert asyncio.get_running_loop().time() < end
                     await asyncio.sleep(.005)
+            if case == "deadline":
+                assert time.time_ns() // 1000 < deadline, 'dispatch was not observed before the deadline'
+            if case == "cancel":
                 await client.cancel_task(realm_id="realm://main", actor_id=authority.actor_id, task_id=task.task_id)
-            terminal, done = await client.wait_task(task.task_id, timeout_s=3)
+            terminal, done = await client.wait_task(task.task_id, timeout_s=8 if case == "deadline" else 3)
             assert done and terminal["status"] == expected and terminal["error"] == error, terminal
             rows = daemon._conn.execute("SELECT status,error_json FROM invocations WHERE action_id=?", (task.root_action_id,)).fetchall()
             if case in ("cancel", "deadline"):

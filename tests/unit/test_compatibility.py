@@ -149,7 +149,7 @@ def test_compare_schema_output_covariance():
 
 
 def test_registry_and_trust_matrix_shapes():
-    assert len(EFFECT_REGISTRY) == 11
+    assert len(EFFECT_REGISTRY) == 12
     assert "external.irreversible" in EFFECT_REGISTRY
     assert "state.write" in EFFECT_REGISTRY
     assert TRUST_PLACEMENT["untrusted_candidate"] == frozenset({"managed"})

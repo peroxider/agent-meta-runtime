@@ -213,7 +213,7 @@ def test_backup_restore_retains_published_provider_items_and_private_realm_direc
     assert len([path for path in paths if path.startswith('keys/providers/')])==2
     assert not any('.provisioning-' in path for path in paths)
     restored=tmp_path/'restored'
-    restore_backup(backup,restored)
+    restore_backup(backup,restored, allow_insecure_credentials=os.name != "nt")
     recovered=open_provider_store(restored,**options())
     for folder in (restored/'keys',restored/'keys/providers',recovered.root):
         require_private_path(folder)

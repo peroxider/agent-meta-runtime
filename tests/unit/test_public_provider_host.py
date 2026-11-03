@@ -28,7 +28,7 @@ def test_signed_public_provider_adapter_fails_before_invocation_when_profile_is_
             installed = await upload_install(client, authority, bundle, manifest)
             report = await client.validate_harness_package(manifest)
             assert report["valid"], report["issues"]
-            assert report["resolved_contract_versions"]["public_api"] == "1.9.0"
+            assert report["resolved_contract_versions"]["public_api"] == "1.15.0"
             await client.activate_harness(realm_id="realm://main", actor_id=authority.actor_id,
                 harness_id=installed.resource["harness_id"], composition_body_artifact_id=bundle.manifest["composition_template_artifact_id"],
                 grant_requests=grants)
