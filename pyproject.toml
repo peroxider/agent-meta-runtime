@@ -14,7 +14,7 @@ keywords = ["agent", "runtime", "meta-runtime", "agent-meta-runtime"]
 dependencies = ["protobuf>=6.31.1,<8", "cryptography>=43"]
 
 [project.optional-dependencies]
-ipython = ["ipykernel>=6"]
+ipython = ["ipykernel>=7.4,<8", "jupyter-client>=8.10,<9"]
 otel = []
 dev = [
   "pytest>=8",
@@ -26,6 +26,7 @@ dev = [
 [project.scripts]
 agent-meta = "agent_meta_runtime.interfaces.cli:main"
 agent-meta-provider-credential = "agent_meta_runtime.interfaces.cli.provider_credentials:main"
+agent-meta-restore = "agent_meta_runtime.interfaces.cli.restore:main"
 
 [tool.hatch.version]
 path = "src/agent_meta_runtime/__init__.py"
