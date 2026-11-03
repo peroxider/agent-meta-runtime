@@ -140,7 +140,7 @@ def _normalize(schema, value, depth=0):
 def _redactor(document):
     redaction = _shape(document, "context-redaction-policy/v1", {"redact_keys", "patterns", "replacement"})
     keys, patterns = redaction["redact_keys"], redaction["patterns"]
-    if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys) or not _MIN_REDACT_KEYS <= set(keys) or not isinstance(patterns, list) or not all(isinstance(name, str) for name in patterns) or set(patterns) != set(_PATTERNS) or redaction["replacement"] != "[REDACTED]":
+    if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys) or not _MIN_REDACT_KEYS <= set(keys) or not isinstance(patterns, list) or not all(isinstance(name, str) for name in patterns) or len(patterns)!=len(set(patterns)) or set(patterns) != set(_PATTERNS) or redaction["replacement"] != "[REDACTED]":
         raise _fail("Context redaction minimum policy is unavailable")
     hidden = {key.casefold() for key in keys}
     def redact(value, depth=0):
@@ -263,6 +263,8 @@ def build_projection_input(task):
             raise _fail("selected Context operation is absent from the frozen Surface", ErrorCode.AUTHORITY_DENIED)
         operation = available[name]
         item = {key: operation[key] for key in ("operation_id", "contract_version", "description", "effects", "idempotency", "retry_semantics", "required_permissions")}
+        if 'resource_contract' in operation:
+            item['resource_contract'] = operation['resource_contract']
         for direction in ("input", "output"):
             ref = "artifact://sha256/" + operation[direction + "_schema_hash"]
             item[direction + "_schema"] = _schema_redact(context_document(raw[ref]), redact)

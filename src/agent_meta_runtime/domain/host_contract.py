@@ -23,6 +23,7 @@ from .loop import (
     TextPart, ToolCallPart, ToolResultPart, validate_response,
 )
 from .semantics import TaskBudget
+from .resource_contract import ResourceAdapter
 
 
 def _invalid(message: str) -> StableError:
@@ -363,9 +364,15 @@ class HarnessAdapter:
     tools: Mapping[str, Callable[[CapabilityInvocation], Awaitable[InvocationResult]]]
     probe: Callable[[HealthProbeInvocation], Awaitable[HealthStatus]]
     provider: ProviderAdapter | None = None
+    resource_tools: Mapping[str, ResourceAdapter] | None = None
 
     def __post_init__(self):
         model_valid = callable(self.invoke_model) if self.provider is None else type(self.provider) is ProviderAdapter and self.invoke_model is None
         if not callable(self.run_task) or not model_valid or not callable(self.probe) or not all(isinstance(key, str) and callable(value) for key, value in self.tools.items()):
             raise ValueError("Harness adapter requires callable operations")
         object.__setattr__(self, "tools", MappingProxyType(dict(self.tools)))
+        resources = dict(self.resource_tools or {})
+        if (not all(isinstance(key, str) and type(value) is ResourceAdapter for key, value in resources.items())
+                or set(resources) & set(self.tools)):
+            raise ValueError('resource operations require unambiguous typed adapters')
+        object.__setattr__(self, 'resource_tools', MappingProxyType(resources))

@@ -18,6 +18,29 @@ def amount(value):
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderTerminalObservation:
+    """Bounded transport facts only: never headers, diagnostics or raw bodies."""
+    state: str
+    error_code: str | None = None
+    http_status: int | None = None
+    retry_after_us: int | None = None
+
+    def __post_init__(self):
+        if (not isinstance(self.state,str) or self.state not in ('NOT_SENT','RESPONSE','UNKNOWN')
+                or self.error_code is not None and (not isinstance(self.error_code,str) or self.error_code not in ErrorCode.ALL)
+                or self.state=='UNKNOWN' and self.error_code!=ErrorCode.EXTERNAL_EFFECT_UNKNOWN
+                or self.state=='NOT_SENT' and self.error_code is None
+                or self.http_status is not None and (type(self.http_status) is not int or not 100<=self.http_status<=599)
+                or self.retry_after_us is not None and (type(self.retry_after_us) is not int
+                    or not 0<=self.retry_after_us<=3_600_000_000 or self.http_status is None or self.http_status<300
+                    or self.error_code is None)):
+            raise StableError(code=ErrorCode.INVALID_RESULT,message='invalid bounded Provider terminal observation')
+
+    def document(self):
+        return {'schema':'provider-terminal-observation/v1',**asdict(self)}
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderReservation:
     profile_artifact_id: str
     pricing_artifact_id: str

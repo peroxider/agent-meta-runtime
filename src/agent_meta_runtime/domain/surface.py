@@ -97,9 +97,10 @@ class SurfaceOperation:
     required_permissions: tuple[str, ...]
     scope: Mapping[str, Any]
     availability_reason: str
+    resource_contract: str | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        value = {
             "operation_id": self.operation_id,
             "contract_version": self.contract_version,
             "input_schema_hash": self.input_schema_hash,
@@ -112,6 +113,9 @@ class SurfaceOperation:
             "scope": dict(self.scope),
             "availability_reason": self.availability_reason,
         }
+        if self.resource_contract is not None:
+            value['resource_contract'] = self.resource_contract
+        return value
 
 
 def surface_cache_key(

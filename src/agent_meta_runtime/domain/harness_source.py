@@ -22,7 +22,7 @@ def _runtime_private(name):
         or any(part.startswith("_") for part in name.split(".")))
 
 
-def audit_harness_sources(files):
+def audit_harness_sources(files, *, allow_literal_dynamic_imports=True):
     """Stable path/line issues; never imports, executes or extracts code."""
     issues = set()
     modules = [(path, content) for path, content in sorted(files.items()) if path.endswith(".py")]
@@ -123,6 +123,8 @@ def audit_harness_sources(files):
                 if called & {"eval", "exec", "compile", "builtins.eval", "builtins.exec", "builtins.compile", "globals", "locals", "vars"}:
                     issue("opaque_import", node)
                 if called & _LOADERS:
+                    if not allow_literal_dynamic_imports:
+                        issue("dynamic_import", node)
                     argument = node.args[0] if node.args else next((item.value for item in node.keywords if item.arg == "name"), None)
                     if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str) or argument.value.startswith("."):
                         issue("dynamic_import", node)

@@ -8,7 +8,9 @@ from .canonical import canonical_json
 from .errors import ErrorCode, StableError
 
 
-def validate_host_value(schema, value, *, depth=0):
+def validate_host_value(schema, value, *, depth=0, _enum_cache=None):
+    if _enum_cache is None:
+        _enum_cache = {}
     if depth > 48:
         raise StableError(code=ErrorCode.RESOURCE_EXHAUSTED, message="Host schema nesting exceeds ceiling")
     if type(schema) is bool:
@@ -23,24 +25,35 @@ def validate_host_value(schema, value, *, depth=0):
         "string": lambda v: isinstance(v, str), "integer": lambda v: type(v) is int,
         "number": lambda v: type(v) in (int, float), "boolean": lambda v: type(v) is bool, "null": lambda v: v is None}
     kind = schema.get("type")
-    if kind is not None and (not isinstance(kind, str) or kind not in kinds):
+    alternatives = kind if isinstance(kind, list) else [kind]
+    if kind is not None and (not alternatives or not all(isinstance(item,str) and item in kinds for item in alternatives)
+            or len(set(alternatives)) != len(alternatives)):
         raise StableError(code=ErrorCode.FEATURE_UNAVAILABLE, message="operation schema type is unsupported")
-    invalid = kind is not None and not kinds[kind](value)
+    invalid = kind is not None and not any(kinds[item](value) for item in alternatives)
     encoded = canonical_json(value)
     if "enum" in schema:
-        invalid |= not isinstance(schema["enum"], list) or encoded not in [canonical_json(v) for v in schema["enum"]]
+        if not isinstance(schema['enum'], list):
+            invalid = True
+        else:
+            key = (id(schema), 'enum')
+            if key not in _enum_cache:
+                _enum_cache[key] = {canonical_json(v) for v in schema['enum']}
+            invalid |= encoded not in _enum_cache[key]
     if "const" in schema:
-        invalid |= encoded != canonical_json(schema["const"])
+        key = (id(schema), 'const')
+        if key not in _enum_cache:
+            _enum_cache[key] = canonical_json(schema['const'])
+        invalid |= encoded != _enum_cache[key]
     if isinstance(value, dict):
         properties, required, additional = schema.get("properties", {}), schema.get("required", []), schema.get("additionalProperties", True)
         if not isinstance(properties, dict) or not isinstance(required, list) or not all(isinstance(k, str) for k in required):
             raise StableError(code=ErrorCode.CONTRACT_INCOMPATIBLE, message="operation object schema is malformed")
         invalid |= bool(set(required) - set(value))
         for name, item in value.items():
-            validate_host_value(properties[name] if name in properties else additional, item, depth=depth + 1)
+            validate_host_value(properties[name] if name in properties else additional, item, depth=depth + 1, _enum_cache=_enum_cache)
     if isinstance(value, list):
         for item in value:
-            validate_host_value(schema.get("items", True), item, depth=depth + 1)
+            validate_host_value(schema.get("items", True), item, depth=depth + 1, _enum_cache=_enum_cache)
     for lower, upper, measured in (("minItems", "maxItems", len(value) if isinstance(value, list) else None),
         ("minLength", "maxLength", len(value) if isinstance(value, str) else None),
         ("minimum", "maximum", value if type(value) in (int, float) else None)):

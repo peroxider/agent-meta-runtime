@@ -32,6 +32,7 @@ EFFECT_REGISTRY: frozenset[str] = frozenset(
     {
         "none",
         "model.invoke",
+        "artifact.put",
         "filesystem.read",
         "filesystem.write",
         "network.request",
@@ -542,6 +543,9 @@ def validate(
             base_op = base_ops.get(cand_op.get("operation_id"))
             if base_op is None:
                 continue
+            if base_op.get('resource_contract') != cand_op.get('resource_contract'):
+                issue('SCHEMA_BREAKING', f'/slots/{name}', 'resource.contract_changed',
+                    old=base_op.get('resource_contract'), new=cand_op.get('resource_contract'))
             for direction in ("input", "output"):
                 base_schema = base_op.get(f"_{direction}_schema")
                 cand_schema = cand_op.get(f"_{direction}_schema")

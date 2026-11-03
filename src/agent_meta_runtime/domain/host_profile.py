@@ -12,7 +12,12 @@ TRUSTED_HOST_BACKEND_FEATURES = MappingProxyType({name: "UNSUPPORTED" for name i
 TRUSTED_HOST_PROFILE_CONTENT = canonical_json({
     "schema": "host-execution-profile/v1", "placement": "in_process",
     "publisher_trust": "EXPLICIT", "isolation": "NONE", "cancellation": "COOPERATIVE",
-    "model_cost": "EXPLICIT_ZERO_ONLY", "tool_idempotency": "PURE",
+    "model_cost": "EXPLICIT_ZERO_ONLY", "tool_idempotency": "PURE_OR_META_KEYED_V1",
+    "meta_resources": "TASK_SCOPED_PLAN_V1",
+    "scratch_resources": "CREATE_EXECUTE_BINDINGS_INSPECT_RELEASE_V1_OPTIONAL_IPYKERNEL_CERTIFICATE",
+    "scratch_binding_tracking": "CPYTHON312_CELL_MAIN_THREAD_NAME_WRITES_UNKNOWN_HEAP_MUTATION",
+    "scratch_source_export": "ROOT_AUTHORIZED_SOURCE_CLOSURE_TO_TRUSTED_CANDIDATE_V1",
+    "scratch_retirement": "ROOT_OWNED_COMPOSITION_DRAIN_V1",
     "context_tokenizer": "utf8-bytes/v1", "context_ceiling_bytes": 1024 * 1024,
     "context_contract": "context-profile/v1", "context_verification": "RECOMPUTE_FROZEN_SOURCES",
     "projection_manifest": "required-fields/v1",
@@ -25,7 +30,12 @@ INMEMORY_HOST_BACKEND_FEATURES = MappingProxyType({**dict(TRUSTED_HOST_BACKEND_F
     "process": "SUPPORTED", "activity": "SUPPORTED", "channel": "SUPPORTED", "persistent_idempotency": "EMULATED"})
 INMEMORY_HOST_PROFILE_CONTENT = canonical_json({
     "schema": "host-execution-profile/v1", "placement": "in_process", "publisher_trust": "EXPLICIT",
-    "isolation": "NONE", "cancellation": "COOPERATIVE", "model_cost": "EXPLICIT_ZERO_ONLY", "tool_idempotency": "PURE",
+    "isolation": "NONE", "cancellation": "COOPERATIVE", "model_cost": "EXPLICIT_ZERO_ONLY", "tool_idempotency": "PURE_OR_META_KEYED_V1",
+    "meta_resources": "TASK_SCOPED_PLAN_V1",
+    "scratch_resources": "CREATE_EXECUTE_BINDINGS_INSPECT_RELEASE_V1_OPTIONAL_IPYKERNEL_CERTIFICATE",
+    "scratch_binding_tracking": "CPYTHON312_CELL_MAIN_THREAD_NAME_WRITES_UNKNOWN_HEAP_MUTATION",
+    "scratch_source_export": "ROOT_AUTHORIZED_SOURCE_CLOSURE_TO_TRUSTED_CANDIDATE_V1",
+    "scratch_retirement": "ROOT_OWNED_COMPOSITION_DRAIN_V1",
     "context_tokenizer": "utf8-bytes/v1", "context_ceiling_bytes": 1024 * 1024, "context_contract": "context-profile/v1",
     "context_verification": "RECOMPUTE_FROZEN_SOURCES", "projection_manifest": "required-fields/v1",
     "harness_lifecycle": "OWNERSHIP_AND_GRANT_GENERATIONS_V1", "execution_backend": "backend://inmemory",

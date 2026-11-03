@@ -23,6 +23,15 @@ __all__ = [
 ]
 
 ENTITY_EVENT_TYPES: dict[str, frozenset[str]] = {
+    "scratch": frozenset(
+        {
+            "scratch_session_reserved",
+            "scratch_session_transitioned",
+            "scratch_cell_reserved",
+            "scratch_cell_dispatched",
+            "scratch_cell_observed",
+        }
+    ),
     "runtime": frozenset(
         {
             "runtime_initialized",
@@ -72,6 +81,7 @@ ENTITY_EVENT_TYPES: dict[str, frozenset[str]] = {
     "state": frozenset(
         {
             "state_revision_created",
+            "state_accessed",
             "migration_started",
             "migration_completed",
             "migration_failed",
@@ -110,6 +120,17 @@ ENTITY_EVENT_TYPES: dict[str, frozenset[str]] = {
             "provider_cost_reserved",
             "provider_cost_settled",
             "provider_dispatch_authorized",
+            "provider_terminal_observed",
+            "resource_call_reserved",
+            "resource_call_committed",
+            "resource_call_failed",
+            "scratch_dispatch_authorized",
+            "scratch_lifecycle_authorized",
+            "scratch_output_published",
+            "scratch_bindings_observed",
+            "scratch_inspection_published",
+            "scratch_handle_expired",
+            "scratch_candidate_exported",
             "late_completion_observed",
         }
     ),
@@ -121,6 +142,8 @@ ENTITY_EVENT_TYPES: dict[str, frozenset[str]] = {
             "execution_orphan_quarantined",
             "external_effect_unknown",
             "terminal_acknowledged",
+            "workspace_cleanup_planned",
+            "workspace_cleanup_completed",
         }
     ),
     "evolution": frozenset(
@@ -158,6 +181,7 @@ EVENT_ENTITY: dict[str, str] = {
 # payload; other state-change events record reason_code only.
 TRANSITION_EVENTS: frozenset[str] = frozenset(
     {
+        "scratch_session_transitioned",
         "readiness_changed",
         "instance_transitioned",
         "instance_degraded",
@@ -195,6 +219,7 @@ REASON_CODE_EVENTS: frozenset[str] = TRANSITION_EVENTS | frozenset(
 
 # Registry entity → allowed id-scheme prefixes for causal edge validation.
 ENTITY_ID_SCHEMES: dict[str, frozenset[str]] = {
+    "scratch": frozenset({"scratch-session"}),
     "runtime": frozenset({"realm", "epoch"}),
     "artifact": frozenset({"artifact"}),
     "capability": frozenset({"capability"}),

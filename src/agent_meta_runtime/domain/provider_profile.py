@@ -188,16 +188,9 @@ class ProviderProfile:
                 or len(plan.body) > self.maximum_request_bytes):
             raise _fail("Provider request differs from frozen profile")
         _messages_profile(value)
-        # This profile has no cache/reasoning/server-tool billing semantics.
-        pending = [value]
-        while pending:
-            item = pending.pop()
-            if isinstance(item, dict):
-                if set(item) & {"cache_control", "thinking", "server_tool"}:
-                    raise _fail("Provider request requires unsupported billing semantics", ErrorCode.FAILED_PRECONDITION)
-                pending.extend(item.values())
-            elif isinstance(item, list):
-                pending.extend(item)
+        # Closed protocol objects above reject cache/reasoning/server-tool
+        # extensions at their wire positions. Tool arguments and JSON Schema
+        # property names are application data, not protocol feature switches.
         tokens = self.count_input(plan.body)
         if tokens + value["max_tokens"] > self.context_window_tokens:
             raise _fail("Provider context window exhausted", ErrorCode.RESOURCE_EXHAUSTED)
