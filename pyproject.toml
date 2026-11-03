@@ -17,6 +17,7 @@ dependencies = ["protobuf>=6.31.1,<8", "cryptography>=43"]
 ipython = ["ipykernel>=7.4,<8", "jupyter-client>=8.10,<9"]
 context-tokenizer = ["tokenizers==0.23.3"]
 otel = []
+agentos = ["grpcio>=1.84", "googleapis-common-protos>=1.62"]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.24",

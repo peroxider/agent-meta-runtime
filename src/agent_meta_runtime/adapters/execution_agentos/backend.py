@@ -28,7 +28,7 @@ from ...protocols.backend_wire import (
 )
 from ..execution_portable.backend import PortableBackend
 
-__all__ = ["AgentOSClient", "AgentOSFakeProvider"]
+__all__ = ["AgentOSClient", "AgentOSFakeProvider", "parse_request_frame"]
 
 _METHOD_PREFIX = "agent_meta.execution_backend.v1.Backend."
 
@@ -42,6 +42,58 @@ _OPERATIONS: dict[str, str] = {
     "AcknowledgeTerminal": "acknowledge_terminal",
     "CloseSession": "close_session",
 }
+
+_REQUEST_MESSAGE_TYPES: dict[str, Any] = {
+    "negotiate": eb.ClientHello,
+    "submit": eb.ExecutionRequest,
+    "cancel": eb.CancelRequest,
+    "reconcile": eb.ReconcileRequest,
+    "acknowledge_terminal": eb.TerminalAck,
+    "close_session": eb.BackendSession,
+    # Await/Inspect carry the ExecutionHandle directly.
+    "await_activity": eb.ExecutionHandle,
+    "inspect": eb.ExecutionHandle,
+}
+
+
+def parse_request_frame(
+    raw: bytes,
+) -> tuple[transport.RpcEnvelope, str | None, Any | None, StableError | None]:
+    """Parse one framed request envelope.
+
+    Returns ``(envelope, operation, request_message, error)``. For frames that
+    are responses, name an unknown method, or carry no payload, the first
+    three result elements after the envelope are ``None`` and ``error`` is the
+    mapped ``StableError`` (INTERNAL / INVALID_ARGUMENT) the provider must
+    answer with.
+    """
+
+    request = transport.RpcEnvelope()
+    request.ParseFromString(raw)
+    if request.is_response:
+        return request, None, None, StableError(
+            code=ErrorCode.INTERNAL,
+            message="provider received a response envelope",
+        )
+    if not request.method.startswith(_METHOD_PREFIX):
+        return request, None, None, StableError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"unknown method: {request.method}",
+        )
+    operation = _OPERATIONS.get(request.method.removeprefix(_METHOD_PREFIX))
+    if operation is None:
+        return request, None, None, StableError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message=f"unknown method: {request.method}",
+        )
+    if not request.HasField("payload"):
+        return request, None, None, StableError(
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="request envelope carries no payload",
+        )
+    message = _REQUEST_MESSAGE_TYPES[operation]()
+    message.ParseFromString(bytes(request.payload))
+    return request, operation, message, None
 
 
 class AgentOSFakeProvider:
@@ -79,47 +131,14 @@ class AgentOSFakeProvider:
         ``RpcError`` frames (INTERNAL / INVALID_ARGUMENT) rather than raising.
         """
 
-        request = transport.RpcEnvelope()
-        request.ParseFromString(raw)
-        if request.is_response:
-            return self._error_frame(request, StableError(
-                code=ErrorCode.INTERNAL,
-                message="provider received a response envelope",
-            )).SerializeToString()
-        operation = _OPERATIONS.get(request.method.removeprefix(_METHOD_PREFIX))
-        if operation is None or not request.method.startswith(_METHOD_PREFIX):
-            return self._error_frame(request, StableError(
-                code=ErrorCode.INVALID_ARGUMENT,
-                message=f"unknown method: {request.method}",
-            )).SerializeToString()
-        if not request.HasField("payload"):
-            return self._error_frame(request, StableError(
-                code=ErrorCode.INVALID_ARGUMENT,
-                message="request envelope carries no payload",
-            )).SerializeToString()
+        request, operation, message, error = parse_request_frame(raw)
+        if error is not None:
+            return self._error_frame(request, error).SerializeToString()
         try:
-            handler = getattr(self._core, operation)
-            payload = bytes(request.payload)
-            if operation == "negotiate":
-                message = eb.ClientHello()
-            elif operation == "submit":
-                message = eb.ExecutionRequest()
-            elif operation == "cancel":
-                message = eb.CancelRequest()
-            elif operation == "reconcile":
-                message = eb.ReconcileRequest()
-            elif operation == "acknowledge_terminal":
-                message = eb.TerminalAck()
-            elif operation == "close_session":
-                message = eb.BackendSession()
-            else:
-                # Await/Inspect carry the ExecutionHandle directly.
-                message = eb.ExecutionHandle()
-            message.ParseFromString(payload)
             if operation == "await_activity":
-                result = await handler(message, request.deadline_at_us)
+                result = await self._core.await_activity(message, request.deadline_at_us)
             else:
-                result = await handler(message)
+                result = await getattr(self._core, operation)(message)
             response = build_envelope(
                 method=request.method,
                 payload=result.SerializeToString(),

@@ -117,6 +117,24 @@ class PortableRequestLedger:
             (request_id, ordinal, event_type, canonical_json(event), now_us),
         )
 
+    def append_event(
+        self, request_id: str, *, event_type: str, event: dict[str, Any], now_us: int
+    ) -> None:
+        """Public append-only audit event (e.g. bridge kernel-call mappings)."""
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise StableError(code=ErrorCode.NOT_FOUND, message="unknown request")
+            self._append_event(request_id, event_type, event, now_us)
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
     # -- submit --------------------------------------------------------------------
     def submit(
         self,
